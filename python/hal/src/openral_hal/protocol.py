@@ -17,7 +17,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
+# PY310-HUMBLE PATCH: ``enum.StrEnum`` is 3.11+; this fork targets the ROS 2
+# Humble interpreter (3.10). ``str, Enum`` is the pre-3.11 spelling and is
+# behaviourally identical for this use — members compare equal to their string
+# values and serialise as strings.
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from openral_core.schemas import Action, JointState, RobotDescription
@@ -32,7 +36,7 @@ __all__ = [
 ]
 
 
-class EStopRecovery(StrEnum):
+class EStopRecovery(str, Enum):
     """Recovery policy after a lifecycle node forwards an e-stop to a HAL."""
 
     RESETTABLE = "resettable"

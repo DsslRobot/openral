@@ -106,7 +106,14 @@ from openral_hal.so100_follower import (
     so100_with_sensors,
 )
 from openral_hal.so100_mujoco import SO100MujocoHAL
-from openral_hal.so100_sim import SO100DigitalTwin, SO100DigitalTwinConfig
+
+# PY310-HUMBLE PATCH: ``so100_sim`` is imported lazily below instead of here.
+# It is the only module in this package that imports ``lerobot`` at module
+# scope, and lerobot requires Python >= 3.12 in every published version — so an
+# eager import makes ``import openral_hal`` fail outright on the ROS 2 Humble
+# interpreter, taking ``openral_runner`` and ``openral_rskill_ros`` down with
+# it. Deferring it keeps the whole HAL importable while leaving
+# ``SO100DigitalTwin`` working for anyone who installs ``openral-hal[so100]``.
 from openral_hal.ur import (
     UR5e_DESCRIPTION,
     UR5eHAL,
@@ -179,3 +186,15 @@ __all__ = [
     "ur5e_with_sensors",
     "ur10e_with_sensors",
 ]
+
+
+# PY310-HUMBLE PATCH: lazy re-export of the SO-100 digital twin. See the note at
+# the ``so100_mujoco`` import above — ``so100_sim`` pulls ``lerobot``, which is
+# Python >= 3.12 only. Attribute access keeps the public surface identical to
+# upstream; only the import timing moves.
+def __getattr__(name: str) -> object:
+    if name in ("SO100DigitalTwin", "SO100DigitalTwinConfig"):
+        from openral_hal import so100_sim
+
+        return getattr(so100_sim, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

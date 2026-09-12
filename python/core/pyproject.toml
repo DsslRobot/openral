@@ -3,9 +3,12 @@ name = "openral-core"
 version = "0.3.1"  # x-release-please-version
 description = "OpenRAL Pydantic schemas — normative contract for the OpenRAL layer interfaces"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.10,<3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
+    # PY310-HUMBLE PATCH: explicit because schemas.py imports `Self` from here
+    # (`typing.Self` is 3.11+). Already present transitively via pydantic.
+    "typing-extensions>=4.10",
     "pydantic>=2.7,<3",  # reason: normative schema framework
     "PyYAML>=6.0",       # reason: rSkill manifest (rskill.yaml) loader
     "numpy>=1.24",       # reason: openral_core.geometry look-at math (import-on-demand, not loaded by __init__)

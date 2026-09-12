@@ -19,11 +19,15 @@ from typing import (
     ClassVar,
     Literal,
     NamedTuple,
-    Self,
     TypeAlias,
     TypeVar,
     get_args,
 )
+
+# PY310-HUMBLE PATCH: ``typing.Self`` is 3.11+; this fork targets the ROS 2
+# Humble interpreter (3.10). ``typing_extensions`` backports it identically and
+# is already a hard transitive dependency via pydantic.
+from typing_extensions import Self
 
 from pydantic import (
     AliasChoices,

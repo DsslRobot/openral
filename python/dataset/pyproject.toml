@@ -3,7 +3,7 @@ name = "openral-dataset"
 version = "0.3.1"  # x-release-please-version
 description = "OpenRAL dataset bridge — RolloutRecorder + LeRobotDataset v3 / rosbag2 sinks for every skill execution"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.10,<3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     # x-release-please-start-version
@@ -16,14 +16,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# lerobot is heavy (transformers, torch, MuJoCo). It is a hard dep of the
-# LeRobotDatasetSink, but kept out of the base install so consumers can use
-# RolloutRecorder + Rosbag2Sink (PR3) without paying the lerobot tax. The
-# sink raises ROSConfigError with this install hint when lerobot is absent.
-lerobot = [
-    "lerobot[dataset]>=0.6.0",                # reason: LeRobotDataset (lerobot 0.6.0 moved `datasets`/pandas/pyarrow behind the `dataset` extra) — LeRobotDataset v3.0 writer (codebase_version="3.0")
-    "pyarrow>=17",                   # reason: meta/episodes/*.parquet writes (lerobot dep but explicit per CLAUDE.md §5.1)
-]
+# PY310-HUMBLE PATCH: the `lerobot` extra (LeRobotDatasetSink) is removed in this
+# fork. lerobot requires Python >= 3.12 in every published version, and `uv lock`
+# resolves every extra of every workspace member — so leaving it declared makes
+# the whole workspace unsolvable on the ROS 2 Humble interpreter, even though
+# nothing here installs it. RolloutRecorder and Rosbag2Sink are unaffected and
+# remain the recording path this project uses.
 # PR3 ROS-side deps (mcap is PyPI; rosbag2_py + rclpy are system-installed
 # via apt — same convention as elsewhere in the workspace, lazy-imported
 # by Rosbag2Sink with a typed install hint if missing).
