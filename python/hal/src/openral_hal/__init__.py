@@ -48,6 +48,10 @@ Public surface:
   ``bensonlee5/anvil-openarm-mujoco`` via
   ``openral_hal._anvil_openarm_v2_assets`` (``openarm:anvil_v2_bimanual``).
 - ``SimTransport``: typed in-memory ros2_control transport for unit tests.
+- ``LunarBotSRBHAL``: bridges the safety-checked chunk path to Space Robotics
+  Bench (an externally-owned Isaac Sim simulator reached over ROS 2, not
+  OpenRAL's own in-process physics) for the ``lunar_bot`` mobile manipulator.
+  BODY_TWIST only in this first slice; see ``robots/lunar_bot/robot.yaml``.
 - ``GalaxeaA1HAL`` / ``GALAXEA_A1_DESCRIPTION``: real Galaxea A1 via an
   isolated ROS 1 Noetic sidecar (vendor SDK operator-provided).
 
@@ -77,6 +81,7 @@ from openral_hal.franka_panda_real import (
 from openral_hal.g1 import G1_DESCRIPTION, G1MujocoHAL
 from openral_hal.galaxea_a1 import GALAXEA_A1_DESCRIPTION, GalaxeaA1HAL
 from openral_hal.h1 import H1_DESCRIPTION, H1MujocoHAL
+from openral_hal.lunar_bot_srb import LunarBotSRBHAL
 from openral_hal.openarm import OPENARM_DESCRIPTION, OpenArmMujocoHAL
 from openral_hal.openarm_real import OPENARM_REAL_DESCRIPTION, OpenArmRealHAL
 from openral_hal.panda_mobile import (
@@ -160,6 +165,7 @@ __all__ = [
     "HALHealthProvider",
     "HALHealthReport",
     "LifecycleEStopHAL",
+    "LunarBotSRBHAL",
     "OpenArmMujocoHAL",
     "OpenArmRealHAL",
     "PandaMobileHAL",

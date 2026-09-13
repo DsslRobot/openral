@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>openral_hal_lunar_bot</name>
+  <version>0.1.0</version>
+  <description>
+    OpenRAL HAL lifecycle node for the lunar_bot embodiment (4WIS/4WID
+    rover chassis + 7-DoF RealMan RM-75 arm + EG2-4C2 gripper). Wraps
+    LunarBotSRBHAL (from openral-hal) as a ROS 2 managed lifecycle node
+    that bridges the safety-checked chunk path to Space Robotics Bench
+    (SRB), an externally-owned Isaac Sim simulator reached over ROS 2 —
+    not OpenRAL's own in-process physics, hence a bespoke transport-attach
+    subclass (openral_hal.lifecycle.ManifestHALLifecycleNode) rather than
+    the generic per-robot lifecycle_node wrapper. First integration slice:
+    BODY_TWIST only — publishes geometry_msgs/Twist on SRB's
+    .../action/cmd_vel, subscribes sensor_msgs/JointState from SRB's
+    .../robot/joint_states and republishes it on the standard
+    /joint_states topic. Subscribes /openral/safe_action and
+    /openral/estop via the shared lifecycle base.
+  </description>
+  <maintainer email="contact@openral.dev">OpenRAL Contributors</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>openral_msgs</depend>
+  <depend>lifecycle_msgs</depend>
+
+  <!-- Python runtime: the OpenRAL Python workspace must be on PYTHONPATH -->
+  <exec_depend>python3-openral-hal</exec_depend>
+  <exec_depend>python3-openral-observability</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
