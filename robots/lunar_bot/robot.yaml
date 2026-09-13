@@ -110,11 +110,17 @@ joints:
     velocity_limit: 41.4458
     effort_limit: 48.512
   # -- Arm (7-DoF RealMan RM-75) -- lunarbot.py's "arm" ImplicitActuatorCfg,
-  # per-joint effort/velocity limits. Driven via CARTESIAN_TWIST (see the
-  # module header comment); these per-joint limits aren't checked by the
-  # CARTESIAN_TWIST kernel path today (that path bounds EE speed, not joint
-  # velocity directly) but stay declared since a future JOINT_* mode on this
-  # arm would need them.
+  # per-joint effort/velocity limits. Driven via CARTESIAN_TWIST and (as of
+  # 2026-09-13) JOINT_POSITION -- both through SRB's single switchable arm
+  # action term, whose own controller picks which sub-command actually
+  # drives the joints each step (see the module header comment).
+  # `position_limits` is deliberately NOT declared here -- no real RM-75
+  # joint-range spec was available to source it from (CLAUDE.md's "truth
+  # over plausibility": don't invent a number), so the safety kernel's
+  # JOINT_POSITION per-joint check (which DOES exist and DOES run --
+  # unlike CARTESIAN_TWIST/BODY_TWIST before this session's fixes) resolves
+  # to +/-inf for these 7 joints today. A real gap, not a silent one: flag
+  # before relying on JOINT_POSITION for anything safety-relevant.
   - name: "joint1"
     joint_type: "revolute"
     parent_link: "chassis_base_link"
@@ -221,6 +227,7 @@ capabilities:
   supported_control_modes:
     - "body_twist"
     - "cartesian_twist"
+    - "joint_position"
     - "gripper_binary"
   embodiment_tags:
     - "lunar_bot"

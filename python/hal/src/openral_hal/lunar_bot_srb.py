@@ -9,27 +9,47 @@ install, and is wired to a real transport after construction via
 alone, before any ROS node exists (see ``ros_control.py``'s own
 ``attach_transport`` docstring for why).
 
-Drives all three of LunarBot's actuator surfaces, unifying base + arm +
+Drives all four of LunarBot's actuator surfaces, unifying base + arm +
 gripper into one HAL so this is a genuine mobile manipulator rather than
-three independent single-actuator slices:
+independent single-actuator slices:
 
 * BODY_TWIST → SRB's ``.../action/cmd_vel`` (``geometry_msgs/Twist``,
   the base's ``FourWheelSteerActionCfg``). Real m/s and rad/s directly —
   SRB's own action-term config already applies the (empirically verified)
   sign, so this HAL forwards the commanded values unconverted.
-* CARTESIAN_TWIST → SRB's ``.../differential_inverse_kinematics``
-  (``geometry_msgs/Twist``, the 7-DoF arm's relative-mode differential IK).
-  **Not a direct unit passthrough** — see ``_ARM_LINEAR_MPS_PER_RAW_UNIT``/
+* CARTESIAN_TWIST and JOINT_POSITION both → SRB's
+  ``.../switchable_arm`` (``std_msgs/Float32MultiArray``, 14 floats: a
+  mode flag, the 6-component IK twist, and 7 joint-position targets — see
+  ``SwitchableArmAction`` in the SRB fork). The arm's own controller picks
+  which sub-command actually drives the joints each step, exactly like a
+  real manipulator's controller supports switching control modes on
+  demand (per the user's explicit direction on this) — not two
+  independent SRB action terms that would silently fight over the same 7
+  joints every physics step. CARTESIAN_TWIST is **not a direct unit
+  passthrough** — see ``_ARM_LINEAR_MPS_PER_RAW_UNIT``/
   ``_ARM_ANGULAR_RADPS_PER_RAW_UNIT`` below for why and how this HAL
-  converts.
+  converts; JOINT_POSITION **is** a direct radians passthrough (SRB's
+  sub-term uses ``joint_pos_scale=1.0``, no HAL-side conversion needed).
 * GRIPPER_BINARY → SRB's ``.../binary_joint_position``
   (``std_msgs/Bool``, the EG2-4C2 gripper). **Inverted from the naive
   reading** — see ``_gripper_open_to_srb_bool`` below.
 
-None of these three chunk over time on SRB's side (a plain ``Twist``/
-``Bool`` is an instantaneous command, not a trajectory), so ``send_action``
-requires ``horizon == 1`` for all three — a multi-step chunk would have no
-well-defined meaning over this transport.
+None of these chunk over time on SRB's side (a plain ``Twist``/``Bool``/
+``Float32MultiArray`` command is instantaneous, not a trajectory), so
+``send_action`` requires ``horizon == 1`` for all of them — a multi-step
+chunk would have no well-defined meaning over this transport.
+
+JOINT_POSITION has one real wrinkle: the C++ safety kernel's structural
+check requires a JOINT_* chunk's ``n_dof`` to equal the envelope's
+``n_dof`` (LunarBot's full 21 joints), not just the 7 arm joints being
+commanded (``cpp/openral_safety_kernel/src/validator.cpp``'s
+``is_joint_mode`` branch — a pre-existing, unrelated-to-this-HAL kernel
+requirement, not something introduced here). So a JOINT_POSITION dispatch
+to this HAL must carry a full 21-wide ``action.joint_targets`` row (steering/
+wheel/gripper slots zero-padded — safe, since none of those declare a
+position limit that excludes 0.0) with ``action.joint_names`` set to the 7
+arm joint names (ADR-0102) so this HAL knows which of the 21 slots to
+actually forward to SRB's joint-position sub-command.
 """
 
 from __future__ import annotations
@@ -68,10 +88,12 @@ def _default_publish(topic: str, msg: dict[str, object]) -> None:  # pragma: no 
 
 # ── Arm (CARTESIAN_TWIST) raw-unit calibration ──────────────────────────────
 #
-# SRB's arm_ik action term (Isaac Lab's DifferentialInverseKinematicsAction,
-# use_relative_mode=True, scale=0.1) does NOT speak physical m/s or rad/s on
-# the wire: `process_actions()` scales the raw Twist by 0.1 and treats the
-# result as a per-control-step POSITION delta added to the end-effector's
+# SRB's switchable-arm action term's IK sub-mode (the same differential-IK
+# math Isaac Lab's DifferentialInverseKinematicsAction uses,
+# use_relative_mode=True, ik_scale=0.1) does NOT speak physical m/s or rad/s
+# on the wire: `process_actions()` scales the raw twist by ik_scale and
+# treats the result as a per-control-step POSITION delta added to the
+# end-effector's
 # CURRENT measured pose (confirmed by reading Isaac Lab's own
 # task_space_actions.py / differential_ik.py, not guessed from the topic's
 # message type). Since the ROS bridge holds the last published Twist as a
@@ -102,6 +124,12 @@ def _default_publish(topic: str, msg: dict[str, object]) -> None:  # pragma: no 
 # measured; it is not a guarantee against every possible configuration.
 _ARM_LINEAR_MPS_PER_RAW_UNIT = 0.5
 _ARM_ANGULAR_RADPS_PER_RAW_UNIT = 0.6
+
+# Arm joint order for the JOINT_POSITION sub-command -- must match
+# SwitchableArmActionCfg's own joint_names list in lunarbot.py exactly
+# (both are "joint1".."joint7", declared explicitly rather than a single
+# regex, precisely so this ordering is guaranteed rather than incidental).
+_ARM_JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7")
 
 
 # ── Gripper (GRIPPER_BINARY) direction convention ───────────────────────────
@@ -136,8 +164,9 @@ class LunarBotSRBHAL(HALBase):
             exposes for ``lunar_bot``'s ``FourWheelSteerActionCfg`` action
             term (verified live in the research repo's
             ``docs/srb_integration_notes.md`` §3.2).
-        arm_ik_topic: SRB topic ``send_action`` publishes CARTESIAN_TWIST
-            commands on (the 7-DoF arm's differential-IK action term).
+        arm_topic: SRB topic ``send_action`` publishes CARTESIAN_TWIST and
+            JOINT_POSITION commands on (the 7-DoF arm's single switchable
+            action term -- see ``SwitchableArmAction`` in the SRB fork).
         hand_topic: SRB topic ``send_action`` publishes GRIPPER_BINARY
             commands on (the EG2-4C2 gripper's binary joint-position
             action term).
@@ -159,7 +188,7 @@ class LunarBotSRBHAL(HALBase):
         description: RobotDescription,
         *,
         cmd_vel_topic: str = "/srb/env0/action/cmd_vel",
-        arm_ik_topic: str = "/srb/env0/robot/robot/differential_inverse_kinematics",
+        arm_topic: str = "/srb/env0/robot/robot/switchable_arm",
         hand_topic: str = "/srb/env0/robot/robot/binary_joint_position",
         joint_state_topic: str = "/srb/env0/robot/joint_states",
         publish_fn: _PublishFn | None = None,
@@ -174,7 +203,7 @@ class LunarBotSRBHAL(HALBase):
             )
         self.description = description
         self._cmd_vel_topic = cmd_vel_topic
-        self._arm_ik_topic = arm_ik_topic
+        self._arm_topic = arm_topic
         self._hand_topic = hand_topic
         self._joint_state_topic = joint_state_topic
         self._publish_fn: _PublishFn = publish_fn or _default_publish
@@ -188,6 +217,18 @@ class LunarBotSRBHAL(HALBase):
         # check beyond connect() liveness".
         self._stamp_fn: Callable[[], float] | None = None
         self._joint_names: list[str] = [j.name for j in description.joints]
+        # Where each of the 7 arm joints sits within the whole-robot 21-wide
+        # joint order -- resolved from the manifest, not hardcoded, so a
+        # future robot.yaml joint reordering can't silently desync this.
+        missing = [jn for jn in _ARM_JOINT_NAMES if jn not in self._joint_names]
+        if missing:
+            raise ROSConfigError(
+                f"RobotDescription '{description.name}' is missing arm joints {missing}; "
+                "cannot resolve JOINT_POSITION indices for LunarBotSRBHAL."
+            )
+        self._arm_joint_indices: list[int] = [
+            self._joint_names.index(jn) for jn in _ARM_JOINT_NAMES
+        ]
 
     # ── Transport wiring ─────────────────────────────────────────────────────
 
@@ -233,9 +274,9 @@ class LunarBotSRBHAL(HALBase):
         return self._cmd_vel_topic
 
     @property
-    def arm_ik_topic(self) -> str:
-        """The SRB ``geometry_msgs/Twist`` (arm) topic this HAL publishes to."""
-        return self._arm_ik_topic
+    def arm_topic(self) -> str:
+        """The SRB ``Float32MultiArray`` (arm) topic this HAL publishes to."""
+        return self._arm_topic
 
     @property
     def hand_topic(self) -> str:
@@ -303,8 +344,8 @@ class LunarBotSRBHAL(HALBase):
         Args:
             action: The ``Action`` produced by a Skill. Must have
                 ``control_mode`` in ``{BODY_TWIST, CARTESIAN_TWIST,
-                GRIPPER_BINARY}`` and ``horizon == 1`` (none of the three
-                chunk over time on SRB's side).
+                JOINT_POSITION, GRIPPER_BINARY}`` and ``horizon == 1``
+                (none of the four chunk over time on SRB's side).
 
         Raises:
             ROSRuntimeError: If not connected.
@@ -316,12 +357,14 @@ class LunarBotSRBHAL(HALBase):
             self._send_body_twist(action)
         elif action.control_mode is ControlMode.CARTESIAN_TWIST:
             self._send_cartesian_twist(action)
+        elif action.control_mode is ControlMode.JOINT_POSITION:
+            self._send_joint_position(action)
         elif action.control_mode is ControlMode.GRIPPER_BINARY:
             self._send_gripper_binary(action)
         else:
             raise ROSConfigError(
                 f"LunarBotSRBHAL supports body_twist / cartesian_twist / "
-                f"gripper_binary; got {action.control_mode!r}."
+                f"joint_position / gripper_binary; got {action.control_mode!r}."
             )
 
     def _require_single_step(self, action: Action, *, payload_name: str) -> None:
@@ -360,7 +403,8 @@ class LunarBotSRBHAL(HALBase):
         )
 
     def _send_cartesian_twist(self, action: Action) -> None:
-        """Publish a CARTESIAN_TWIST action to SRB's arm-IK topic.
+        """Publish a CARTESIAN_TWIST action to SRB's switchable-arm topic
+        (mode flag 0.0 -- IK/twist sub-mode).
 
         Converts from the physical m/s / rad/s the safety kernel validated
         (``max_ee_speed_m_s`` / ``max_ee_angular_speed_rad_s``) into SRB's
@@ -372,10 +416,12 @@ class LunarBotSRBHAL(HALBase):
         raw_linear = tuple(v / _ARM_LINEAR_MPS_PER_RAW_UNIT for v in (vx, vy, vz))
         raw_angular = tuple(w / _ARM_ANGULAR_RADPS_PER_RAW_UNIT for w in (wx, wy, wz))
         msg: dict[str, object] = {
-            "linear": {"x": raw_linear[0], "y": raw_linear[1], "z": raw_linear[2]},
-            "angular": {"x": raw_angular[0], "y": raw_angular[1], "z": raw_angular[2]},
+            "mode": 0.0,
+            "ik_linear": raw_linear,
+            "ik_angular": raw_angular,
+            "joint_targets": (0.0,) * len(_ARM_JOINT_NAMES),
         }
-        self._publish_fn(self._arm_ik_topic, msg)
+        self._publish_fn(self._arm_topic, msg)
         log.debug(
             "hal.send_action",
             robot=self.description.name,
@@ -384,6 +430,57 @@ class LunarBotSRBHAL(HALBase):
             physical_angular_rad_s=(wx, wy, wz),
             raw_linear=raw_linear,
             raw_angular=raw_angular,
+        )
+
+    def _send_joint_position(self, action: Action) -> None:
+        """Publish a JOINT_POSITION action to SRB's switchable-arm topic
+        (mode flag 1.0 -- joint-position sub-mode).
+
+        The safety kernel's structural check requires a JOINT_* chunk's
+        ``n_dof`` to equal the envelope's full 21 (LunarBot's whole joint
+        count), not just the 7 arm joints being commanded here (see the
+        module docstring) -- so ``action.joint_targets[0]`` is a full
+        21-wide row (steering/wheel/gripper slots zero-padded by the
+        caller) and ``action.joint_names`` names the 7 arm joints this HAL
+        should extract from it. Direct radians passthrough: SRB's
+        joint-position sub-term uses ``joint_pos_scale=1.0``.
+        """
+        self._require_control_mode(action, ControlMode.JOINT_POSITION)
+        self._require_single_step(action, payload_name="joint_targets")
+        row = action.joint_targets[0]  # type: ignore[index]
+        # The wire-level row is ALWAYS the full 21-wide RobotDescription.joints
+        # vector, never just the 7 arm values -- the C++ kernel's structural
+        # check forces chunk.n_dof == envelope.n_dof for every JOINT_* mode
+        # (validator.cpp's is_joint_mode branch), so a 7-wide chunk would be
+        # rejected as kNdofMismatch before this HAL ever saw it. This holds
+        # whether or not action.joint_names is set -- that field only NAMES
+        # which of the 21 slots are the ones actually being commanded
+        # (ADR-0102); it never changes the row's width.
+        if len(row) != len(self._joint_names):
+            raise ROSConfigError(
+                f"LunarBotSRBHAL: JOINT_POSITION row has {len(row)} values but "
+                f"robot '{self.description.name}' has {len(self._joint_names)} joints "
+                "(the safety kernel's structural check requires the full-width vector)."
+            )
+        if action.joint_names and list(action.joint_names) != list(_ARM_JOINT_NAMES):
+            raise ROSConfigError(
+                f"LunarBotSRBHAL: JOINT_POSITION action.joint_names must be "
+                f"{list(_ARM_JOINT_NAMES)!r} (the 7 arm joints, ADR-0102) when set; "
+                f"got {list(action.joint_names)!r}."
+            )
+        arm_targets = tuple(row[i] for i in self._arm_joint_indices)
+        msg: dict[str, object] = {
+            "mode": 1.0,
+            "ik_linear": (0.0, 0.0, 0.0),
+            "ik_angular": (0.0, 0.0, 0.0),
+            "joint_targets": arm_targets,
+        }
+        self._publish_fn(self._arm_topic, msg)
+        log.debug(
+            "hal.send_action",
+            robot=self.description.name,
+            control_mode=action.control_mode,
+            arm_joint_targets=arm_targets,
         )
 
     def _send_gripper_binary(self, action: Action) -> None:

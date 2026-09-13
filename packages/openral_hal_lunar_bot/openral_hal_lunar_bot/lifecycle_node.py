@@ -92,7 +92,7 @@ if _ROS2_AVAILABLE:
             self._lunar_bot_transport = _LunarBotSRBTransport(
                 self,
                 cmd_vel_topic=hal.cmd_vel_topic,
-                arm_ik_topic=hal.arm_ik_topic,
+                arm_topic=hal.arm_topic,
                 hand_topic=hal.hand_topic,
                 joint_state_topic=hal.joint_state_topic,
             )
@@ -104,7 +104,7 @@ if _ROS2_AVAILABLE:
             _log.info(
                 "lunar_bot_hal.transport_attached",
                 cmd_vel_topic=hal.cmd_vel_topic,
-                arm_ik_topic=hal.arm_ik_topic,
+                arm_topic=hal.arm_topic,
                 hand_topic=hal.hand_topic,
                 joint_state_topic=hal.joint_state_topic,
             )
@@ -124,11 +124,14 @@ if _ROS2_AVAILABLE:
         live on the same node as the rest of the HAL lifecycle plumbing
         (QoS / executor / shutdown all in one place, matching
         ``ROSPublishingHAL``'s own rationale for taking a host node instead
-        of opening its own). One ``Twist`` publisher each for the base
-        (``cmd_vel``) and arm (``arm_ik``), plus one ``Bool`` publisher for
-        the gripper (``hand``) — ``publish()`` dispatches on the ``topic``
-        argument to pick the right one, so ``LunarBotSRBHAL`` stays
-        transport-agnostic (it only ever calls ``publish(topic, msg)``).
+        of opening its own). One ``Twist`` publisher for the base
+        (``cmd_vel``), one ``Float32MultiArray`` publisher for the arm
+        (``arm`` -- SRB's ``SwitchableArmAction``, 14 floats: mode flag +
+        6-component IK twist + 7 joint-position targets), and one ``Bool``
+        publisher for the gripper (``hand``) — ``publish()`` dispatches on
+        the ``topic`` argument to pick the right one, so ``LunarBotSRBHAL``
+        stays transport-agnostic (it only ever calls ``publish(topic,
+        msg)``).
         """
 
         def __init__(
@@ -136,7 +139,7 @@ if _ROS2_AVAILABLE:
             node: "LunarBotHALLifecycleNode",
             *,
             cmd_vel_topic: str,
-            arm_ik_topic: str,
+            arm_topic: str,
             hand_topic: str,
             joint_state_topic: str,
         ) -> None:
@@ -145,7 +148,7 @@ if _ROS2_AVAILABLE:
             from geometry_msgs.msg import Twist
             from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
             from sensor_msgs.msg import JointState as RosJointState
-            from std_msgs.msg import Bool
+            from std_msgs.msg import Bool, Float32MultiArray
 
             qos = QoSProfile(
                 reliability=QoSReliabilityPolicy.RELIABLE,
@@ -155,10 +158,10 @@ if _ROS2_AVAILABLE:
             self._node = node
             self._time = time
             self._cmd_vel_topic = cmd_vel_topic
-            self._arm_ik_topic = arm_ik_topic
+            self._arm_topic = arm_topic
             self._hand_topic = hand_topic
             self._cmd_vel_pub = node.create_publisher(Twist, cmd_vel_topic, qos)
-            self._arm_ik_pub = node.create_publisher(Twist, arm_ik_topic, qos)
+            self._arm_pub = node.create_publisher(Float32MultiArray, arm_topic, qos)
             self._hand_pub = node.create_publisher(Bool, hand_topic, qos)
             self._latest_state: dict[str, object] = {}
             self._last_arrival_s: float = 0.0
@@ -176,15 +179,22 @@ if _ROS2_AVAILABLE:
 
         def publish(self, topic: str, msg: dict[str, object]) -> None:
             from geometry_msgs.msg import Twist, Vector3
-            from std_msgs.msg import Bool
+            from std_msgs.msg import Bool, Float32MultiArray
 
             if topic == self._hand_topic:
                 self._hand_pub.publish(Bool(data=bool(msg["data"])))
                 return
-            pub = self._cmd_vel_pub if topic == self._cmd_vel_topic else self._arm_ik_pub
+            if topic == self._arm_topic:
+                mode = float(msg["mode"])  # type: ignore[arg-type]
+                ik_linear = msg["ik_linear"]  # type: ignore[index]
+                ik_angular = msg["ik_angular"]  # type: ignore[index]
+                joint_targets = msg["joint_targets"]  # type: ignore[index]
+                data = [mode, *ik_linear, *ik_angular, *joint_targets]  # type: ignore[misc]
+                self._arm_pub.publish(Float32MultiArray(data=[float(v) for v in data]))
+                return
             lin = msg["linear"]  # type: ignore[index]
             ang = msg["angular"]  # type: ignore[index]
-            pub.publish(
+            self._cmd_vel_pub.publish(
                 Twist(
                     linear=Vector3(x=lin["x"], y=lin["y"], z=lin["z"]),  # type: ignore[index]
                     angular=Vector3(x=ang["x"], y=ang["y"], z=ang["z"]),  # type: ignore[index]
@@ -199,7 +209,7 @@ if _ROS2_AVAILABLE:
 
         def destroy(self) -> None:
             self._node.destroy_publisher(self._cmd_vel_pub)
-            self._node.destroy_publisher(self._arm_ik_pub)
+            self._node.destroy_publisher(self._arm_pub)
             self._node.destroy_publisher(self._hand_pub)
             self._node.destroy_subscription(self._state_sub)
 
