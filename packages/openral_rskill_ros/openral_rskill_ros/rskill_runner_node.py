@@ -31,6 +31,7 @@ single-process invocation is a thin wrapper that sends a goal to this server.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import math
 import os
 import sys
@@ -2020,6 +2021,34 @@ def _ros_action_adapter_cls(builder: str | None) -> type:
     return ROSActionRskill
 
 
+def _import_procedural_entrypoint(entrypoint: str) -> type:
+    """Resolve a ``kind: "procedural"`` manifest's ``"module.path:ClassName"``
+    entrypoint string, the same convention ``openral_hal.build_hal`` uses for
+    ``hal.real``/``hal.sim``.
+
+    Raises:
+        ROSConfigError: If the string is malformed, the module is not
+            importable, or the attribute is absent.
+    """
+    if ":" not in entrypoint:
+        raise ROSConfigError(
+            f"procedural entrypoint {entrypoint!r} is malformed; expected 'module.path:Attribute'."
+        )
+    module_path, _, attr = entrypoint.partition(":")
+    try:
+        module = importlib.import_module(module_path)
+    except ModuleNotFoundError as exc:
+        raise ROSConfigError(
+            f"procedural entrypoint {entrypoint!r}: module {module_path!r} is not importable ({exc})."
+        ) from exc
+    try:
+        return getattr(module, attr)
+    except AttributeError as exc:
+        raise ROSConfigError(
+            f"procedural entrypoint {entrypoint!r}: module {module_path!r} has no attribute {attr!r}."
+        ) from exc
+
+
 def make_default_skill_resolver(
     ros_node: Any,
     *,
@@ -2156,15 +2185,27 @@ def make_default_skill_resolver(
             skill.configure()
             skill.activate()
             return skill
+        if manifest.kind == "procedural":
+            entrypoint_cls = _import_procedural_entrypoint(manifest.procedural.entrypoint)  # type: ignore[union-attr]
+            skill = entrypoint_cls(
+                manifest=manifest,
+                robot_description=description,
+                prompt=prompt,
+                prompt_metadata_json=prompt_metadata_json,
+                goal_params_json=goal_params_json,
+            )
+            skill.configure()
+            skill.activate()
+            return skill
         if manifest.kind == "wam":
             raise ROSConfigError(
                 f"rSkill {rskill_id!r} declares kind='wam'; the WAM resolver "
                 "branch is not implemented yet (tracked separately). "
-                "VLA / ros_action / ros_service kinds are supported today."
+                "VLA / ros_action / ros_service / procedural kinds are supported today."
             )
         raise ROSConfigError(
             f"rSkill {rskill_id!r} declares unknown kind={manifest.kind!r}; "
-            "expected one of 'vla', 'wam', 'ros_action', 'ros_service'."
+            "expected one of 'vla', 'wam', 'ros_action', 'ros_service', 'procedural'."
         )
 
     return _resolver

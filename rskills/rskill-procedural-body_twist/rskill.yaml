@@ -1,0 +1,93 @@
+# rSkill manifest — deterministic BODY_TWIST (kind: procedural)
+#
+# No learned weights, no external ROS action/service server to wrap: the
+# entrypoint class computes the Action directly, in-process. Fills the gap
+# no existing kind covers -- "vla" requires model_family + weights_uri and
+# routes through the policy-adapter factory; "ros_action"/"ros_service"
+# require a running server this project does not own; "playbook" is a
+# reasoner-side decision procedure that never emits an Action. Exists for
+# procedure-driven / non-learned mission execution (execution_plan.md §5.2's
+# Baseline A) -- any mobile_base robot can use it, not just lunar_bot.
+#
+# Verified end to end against Space Robotics Bench's lunar_bot: dispatched
+# via rskill_runner_node's real ExecuteRskill action, published through
+# ROSPublishingHAL -> /openral/candidate_action -> the C++ safety kernel ->
+# /openral/safe_action -> openral_hal_lunar_bot -> SRB's cmd_vel, moving the
+# robot. See the research repo's docs/phase_b_procedural_kind.md.
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-mobile_base-body_twist"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+# Canonical class tag for any robot with a planar base + body_twist
+# actuator (openral_core.schemas) -- same convention rskill-nav2-navigate-
+# to-pose uses, so any mobile_base robot can target this skill, not a named
+# one.
+embodiment_tags:
+  - "mobile_base"
+
+actuators_required:
+  - kind: "body_twist"
+    control_mode_semantics:
+      mode: "absolute"
+
+# REQUIRED for kind='procedural' (the safety supervisor only checks row 0
+# of every chunk today; one waypoint per chunk keeps every commanded
+# velocity checked).
+chunk_size: 1
+
+# A body-twist hold is sub-second reaction time, not a long-horizon plan --
+# generous headroom over the reasoner's own tick rate.
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Hold a fixed (linear, angular) body-twist velocity for a fixed duration,
+  then finish. Deterministic -- no learned policy, no external ROS server.
+  Base-only (mobile_base embodiment_tags); does not touch an arm or gripper.
+actions:
+  - "navigate"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_body_twist:ProceduralBodyTwistRskill"
+  # Identity default (no motion) -- a misconfigured dispatch is a no-op
+  # rather than an unexpected drive, same rationale as the Nav2 manifest's
+  # default_goal_json.
+  default_goal_json: |
+    {
+      "linear": [0.0, 0.0, 0.0],
+      "angular": [0.0, 0.0, 0.0],
+      "duration_s": 1.0
+    }
+
+# Per-skill JSON Schema surfaced to the Reasoner LLM tool palette. The LLM
+# produces a JSON object matching this schema; the adapter merges it over
+# default_goal_json at configure-time.
+goal_params_schema:
+  type: object
+  description: >
+    Body-twist velocity (m/s, rad/s) to hold for duration_s seconds.
+  properties:
+    linear:
+      type: array
+      items: { type: number }
+      minItems: 3
+      maxItems: 3
+      description: "[vx, vy, vz] in m/s, base_link frame."
+    angular:
+      type: array
+      items: { type: number }
+      minItems: 3
+      maxItems: 3
+      description: "[wx, wy, wz] in rad/s, base_link frame."
+    duration_s:
+      type: number
+      exclusiveMinimum: 0
+      description: "Seconds to hold the twist before the skill finishes."
+  required: ["linear", "angular", "duration_s"]

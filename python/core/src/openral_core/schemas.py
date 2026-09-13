@@ -6106,6 +6106,7 @@ RSkillKind: TypeAlias = Literal[
     "wam",
     "ros_action",
     "ros_service",
+    "procedural",
     "detector",
     "segmenter",
     "vlm",
@@ -6130,6 +6131,22 @@ RSkillKind: TypeAlias = Literal[
   per-row check sees every commanded position.
 * ``"ros_service"`` — wraps an existing ROS 2 service. Same constraints as
   ``"ros_action"``.
+* ``"procedural"`` — a deterministic, non-learned actuator: a scripted or
+  behaviour-tree-style skill with no weights and no external ROS action/
+  service server to wrap (unlike ``"ros_action"``/``"ros_service"``, which
+  drive a running server this project does not own; a ``"procedural"``
+  skill's own Python class computes the ``Action`` directly). Exists for
+  procedure-driven / non-learned mission execution — the operating model
+  that coordinates the same underlying capabilities without a learned
+  policy or an LLM reasoner in the loop. Requires a
+  ``ProceduralIntegration`` block (an ``entrypoint`` import string plus
+  ``default_goal_json``, mirroring ``RosIntegration``'s contract).
+  ``model_family``, ``weights_uri``, ``ros_integration``, ``processors``,
+  ``state_contract``, ``action_contract``, ``n_action_steps``,
+  ``image_preprocessing``, ``starting_pose``, ``detector``, ``segmenter``,
+  and ``reward`` are FORBIDDEN. ``chunk_size`` is pinned to ``1`` for the
+  same reason as the ROS-wrapper kinds — the safety supervisor only checks
+  row 0 of every chunk today. ``actuators_required`` REQUIRED (≥1 entry).
 * ``"detector"`` — perception producer that runs an exported detection model
   (RT-DETR / D-FINE ONNX) on the camera tee and publishes
   ``ObjectsMetadata``; emits no
@@ -6292,6 +6309,63 @@ class RosIntegration(BaseModel):
         if not isinstance(parsed, dict):
             raise ValueError(
                 "RosIntegration.default_goal_json must encode a JSON object, "
+                f"got {type(parsed).__name__}."
+            )
+        return v
+
+
+class ProceduralIntegration(BaseModel):
+    """Wiring for an rSkill implemented as a plain, deterministic Python class.
+
+    Populated when ``RSkillManifest.kind == "procedural"``: a scripted /
+    behaviour-tree-style skill with no learned weights and no external ROS
+    action/service server on the other end (unlike ``RosIntegration``, which
+    wraps a running server this project does not own — Nav2, MoveGroup — a
+    procedural skill's own class computes the ``Action`` directly, in-process).
+    Mirrors ``RosIntegration``'s ``entrypoint`` + ``default_goal_json`` +
+    per-dispatch-merge contract so the reasoner/LLM tool-call path is
+    identical regardless of kind.
+
+    Attributes:
+        entrypoint: ``"module.path:ClassName"`` import string, resolved the
+            same way a HAL's ``hal.real``/``hal.sim`` entrypoint is. The
+            referenced class must implement ``openral_rskill.base.rSkillBase``
+            directly — constructed with the same
+            ``(description, prompt, prompt_metadata_json, goal_params_json)``
+            shape ``ROSActionRskill`` takes, so the runner's call site stays
+            uniform across kinds.
+        default_goal_json: JSON dict literal the skill is invoked with by
+            default. Per-dispatch ``goal_params_json`` (the LLM's structured
+            override) is deep-merged over it at configure time — same
+            contract as ``RosIntegration.default_goal_json``.
+
+    Example:
+        >>> pi = ProceduralIntegration(
+        ...     entrypoint="openral_rskill.procedural_body_twist:ProceduralBodyTwistRskill",
+        ...     default_goal_json='{"linear": [0.0, 0.0, 0.0], "angular": [0.0, 0.0, 0.0], "duration_s": 1.0}',
+        ... )
+        >>> pi.entrypoint
+        'openral_rskill.procedural_body_twist:ProceduralBodyTwistRskill'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint: str = Field(min_length=1, max_length=200)
+    default_goal_json: str = Field(min_length=2, max_length=10_000)
+
+    @field_validator("default_goal_json")
+    @classmethod
+    def _check_default_goal_json_is_object(cls, v: str) -> str:
+        """Reject manifests that ship un-parseable goal JSON."""
+        import json  # noqa: PLC0415  # reason: stdlib, defer to keep import-time cheap
+
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"ProceduralIntegration.default_goal_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "ProceduralIntegration.default_goal_json must encode a JSON object, "
                 f"got {type(parsed).__name__}."
             )
         return v
@@ -7005,6 +7079,10 @@ class RSkillManifest(BaseModel):
     # manifest cannot accidentally carry stale wrapper config.
     ros_integration: RosIntegration | None = None
 
+    # Wiring for a deterministic, non-learned Python class. REQUIRED when
+    # ``kind == "procedural"``; FORBIDDEN otherwise.
+    procedural: ProceduralIntegration | None = None
+
     # Detector model contract. REQUIRED when ``kind == "detector"``;
     # FORBIDDEN otherwise. Carries the class-label list, input resolution, and
     # score threshold the runtime ObjectsDetector reads at configure time.
@@ -7252,6 +7330,49 @@ class RSkillManifest(BaseModel):
                 )
             return self
 
+        if self.kind == "procedural":
+            if self.procedural is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires a "
+                    "`procedural` block (entrypoint, default_goal_json)."
+                )
+            forbidden_procedural = {
+                "model_family": self.model_family,
+                "weights_uri": self.weights_uri,
+                "ros_integration": self.ros_integration,
+                "processors": self.processors,
+                "state_contract": self.state_contract,
+                "action_contract": self.action_contract,
+                "n_action_steps": self.n_action_steps,
+                "image_preprocessing": self.image_preprocessing,
+                "starting_pose": self.starting_pose,
+                "detector": self.detector,
+                "segmenter": self.segmenter,
+                "reward": self.reward,
+            }
+            set_procedural_forbidden = sorted(
+                name for name, value in forbidden_procedural.items() if value is not None
+            )
+            if set_procedural_forbidden:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' forbids "
+                    f"these fields: {set_procedural_forbidden!r}. A procedural skill has "
+                    "no weights, no policy preprocessing, and no external ROS server "
+                    "to wrap."
+                )
+            if self.chunk_size != 1:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires "
+                    f"chunk_size=1, got {self.chunk_size}. The safety supervisor's "
+                    "per-row check only sees row 0 of every chunk today."
+                )
+            if not self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires at least one "
+                    "`actuators_required` entry."
+                )
+            return self
+
         if self.kind == "detector":
             if self.detector is None:
                 raise ValueError(
@@ -7267,6 +7388,7 @@ class RSkillManifest(BaseModel):
                 "model_family": self.model_family,
                 "segmenter": self.segmenter,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "action_contract": self.action_contract,
                 "state_contract": self.state_contract,
                 "processors": self.processors,
@@ -7310,6 +7432,7 @@ class RSkillManifest(BaseModel):
                 "reward": self.reward,
                 "model_family": self.model_family,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "action_contract": self.action_contract,
                 "state_contract": self.state_contract,
                 "processors": self.processors,
@@ -7348,6 +7471,7 @@ class RSkillManifest(BaseModel):
                 "segmenter": self.segmenter,
                 "reward": self.reward,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "action_contract": self.action_contract,
                 "state_contract": self.state_contract,
                 "processors": self.processors,
@@ -7390,6 +7514,7 @@ class RSkillManifest(BaseModel):
                 "segmenter": self.segmenter,
                 "model_family": self.model_family,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "action_contract": self.action_contract,
                 "state_contract": self.state_contract,
                 "processors": self.processors,
@@ -7447,6 +7572,7 @@ class RSkillManifest(BaseModel):
                 "segmenter": self.segmenter,
                 "reward": self.reward,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "processors": self.processors,
                 "image_preprocessing": self.image_preprocessing,
                 "action_contract": self.action_contract,
