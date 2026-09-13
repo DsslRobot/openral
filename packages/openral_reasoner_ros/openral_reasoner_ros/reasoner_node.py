@@ -3980,7 +3980,7 @@ class ReasonerNode(LifecycleNode):
     def _memory_now(self) -> str:
         """An ISO-8601 timestamp from the ROS clock (sim-time-aware) for memory entries."""
         secs = self.get_clock().now().nanoseconds / 1e9
-        return datetime.datetime.fromtimestamp(secs, tz=datetime.UTC).isoformat(timespec="seconds")
+        return datetime.datetime.fromtimestamp(secs, tz=datetime.timezone.utc).isoformat(timespec="seconds")
 
     def _persist_memory(self) -> None:
         """Write the live store back to ``MEMORY.md`` (advisory — a failure logs, never raises)."""

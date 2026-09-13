@@ -2226,6 +2226,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "robot-descriptions" },
     { name = "ruff" },
+    { name = "tomli" },
     { name = "types-protobuf" },
     { name = "types-pyyaml" },
 ]
@@ -2321,6 +2322,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=5" },
     { name = "robot-descriptions", specifier = ">=2.0.0" },
     { name = "ruff", specifier = ">=0.6" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.1" },
     { name = "types-protobuf", specifier = ">=7.34.1.20260518" },
     { name = "types-pyyaml", specifier = ">=6" },
 ]

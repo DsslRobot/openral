@@ -150,7 +150,7 @@ def check_installed_rskills(
             entry = _entry_for_in_tree(manifest_path)
             rows.append(_evaluate_entry(entry, robot, seen_paths))
 
-    generated_at = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     return CompatibilityReport(
         generated_at=generated_at,
         robot_name=robot.name,
@@ -393,7 +393,7 @@ def check_single_rskill(rskill_id: str, robot: RobotDescription) -> Compatibilit
     """
     from openral_rskill.loader import load_rskill_manifest  # noqa: PLC0415
 
-    generated_at = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
     try:
         manifest = load_rskill_manifest(rskill_id)

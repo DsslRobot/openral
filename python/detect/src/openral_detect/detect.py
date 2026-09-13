@@ -113,7 +113,7 @@ def detect_hardware(
         with safety_span(name="detect.probe.network", check_name="network"):
             report_kwargs["network"] = probe_network(warnings=warnings)
 
-    detected_at = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    detected_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     return DetectionReport(
         detected_at=detected_at,
         host_os=f"{platform.system()} {platform.release()}",

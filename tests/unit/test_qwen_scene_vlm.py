@@ -94,7 +94,10 @@ def test_qwen_vlm_extra_declares_sidecar_client_deps(expand_dependency_group) ->
     query_scene service doesn't fail per-request with a bare "No module named
     'zmq'".
     """
-    import tomllib
+    try:
+        import tomllib  # Python 3.11+
+    except ModuleNotFoundError:  # PY310-HUMBLE PATCH: 3.10 has no stdlib tomllib
+        import tomli as tomllib  # type: ignore[no-redef]
 
     with (_REPO / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)

@@ -33,7 +33,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # PY310-HUMBLE PATCH: 3.10 has no stdlib tomllib
+    import tomli as tomllib  # type: ignore[no-redef]
 from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

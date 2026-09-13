@@ -17,7 +17,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import tomllib
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # PY310-HUMBLE PATCH: 3.10 has no stdlib tomllib
+    import tomli as tomllib  # type: ignore[no-redef]
 from openral_cli.install import _CONFLICTS, _GROUPS, _check_conflicts, install_app
 from openral_cli.main import (
     _dispatch_repl_line,

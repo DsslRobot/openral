@@ -13,6 +13,12 @@ import time
 from typing import TYPE_CHECKING
 
 import pytest
+
+# PY310-HUMBLE PATCH: openral_hal no longer carries lerobot as a base
+# dependency (it requires Python >= 3.12; see the research repo's
+# docs/openral_py310_patch.md). Mirrors the guard already used by
+# test_openarm_real_hal.py for the same reason.
+pytest.importorskip("lerobot", reason="openral_hal imports lerobot at package import")
 from openral_core import Action, ControlMode, SafetyEnvelope
 from openral_core.exceptions import ROSWorkspaceViolation
 from openral_core.schemas import WorldState

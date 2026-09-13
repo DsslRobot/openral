@@ -113,7 +113,7 @@ class GraphCheckReport(BaseModel):
 
 
 def _now() -> str:
-    return datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
 def _error(rule: CheckRule, target: str, message: str) -> CheckFinding:
