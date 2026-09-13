@@ -11,9 +11,12 @@
     (SRB), an externally-owned Isaac Sim simulator reached over ROS 2 —
     not OpenRAL's own in-process physics, hence a bespoke transport-attach
     subclass (openral_hal.lifecycle.ManifestHALLifecycleNode) rather than
-    the generic per-robot lifecycle_node wrapper. First integration slice:
-    BODY_TWIST only — publishes geometry_msgs/Twist on SRB's
-    .../action/cmd_vel, subscribes sensor_msgs/JointState from SRB's
+    the generic per-robot lifecycle_node wrapper. Drives all three
+    actuator surfaces: BODY_TWIST (geometry_msgs/Twist on SRB's
+    .../action/cmd_vel), CARTESIAN_TWIST (geometry_msgs/Twist on SRB's
+    .../differential_inverse_kinematics, the 7-DoF arm), and
+    GRIPPER_BINARY (std_msgs/Bool on SRB's .../binary_joint_position, the
+    EG2-4C2 gripper) — subscribes sensor_msgs/JointState from SRB's
     .../robot/joint_states and republishes it on the standard
     /joint_states topic. Subscribes /openral/safe_action and
     /openral/estop via the shared lifecycle base.

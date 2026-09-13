@@ -28,13 +28,22 @@
 # ROS. `hal.sim` in this codebase specifically means OpenRAL's own in-process
 # MuJoCo physics (MujocoArmHAL / SimAttachedHAL), which this is not.
 #
-# First integration slice: BODY_TWIST (mobile base) only, driven through the
+# All three actuator surfaces (base, arm, gripper) are driven through the
 # real candidate_action -> C++ safety kernel -> safe_action path -- see
-# packages/openral_hal_lunar_bot/. CARTESIAN_TWIST (arm, via SRB's
-# differential_inverse_kinematics action) and GRIPPER_BINARY (via SRB's
-# binary_joint_position action) are follow-up work once the base path is
-# proven end to end; declaring them here before the HAL implements them would
-# let the reasoner select a control mode nothing actually serves.
+# packages/openral_hal_lunar_bot/. BODY_TWIST (base, via SRB's cmd_vel)
+# landed first and was proven end to end before CARTESIAN_TWIST (arm, via
+# SRB's differential_inverse_kinematics action) and GRIPPER_BINARY (via
+# SRB's binary_joint_position action) were added on top of it.
+#
+# CARTESIAN_TWIST is NOT a direct m/s passthrough on SRB's side the way
+# BODY_TWIST is -- SRB's arm_ik action term treats its raw Twist as a
+# per-control-step scaled POSITION delta (Isaac Lab's relative-mode
+# differential IK), not a native rate. openral_hal.lunar_bot_srb converts
+# the physical m/s / rad/s this manifest's bounds below constrain into
+# SRB's raw units via an empirically measured (pose-dependent, so
+# deliberately conservative) calibration -- see that module's
+# _ARM_LINEAR_MPS_PER_RAW_UNIT / _ARM_ANGULAR_RADPS_PER_RAW_UNIT constants
+# for the measured data and rationale.
 
 name: "lunar_bot"
 embodiment_kind: "mobile_manipulator"
@@ -101,8 +110,11 @@ joints:
     velocity_limit: 41.4458
     effort_limit: 48.512
   # -- Arm (7-DoF RealMan RM-75) -- lunarbot.py's "arm" ImplicitActuatorCfg,
-  # per-joint effort/velocity limits. Not yet driven (CARTESIAN_TWIST is a
-  # follow-up); declared so the safety kernel has real limits ready for it.
+  # per-joint effort/velocity limits. Driven via CARTESIAN_TWIST (see the
+  # module header comment); these per-joint limits aren't checked by the
+  # CARTESIAN_TWIST kernel path today (that path bounds EE speed, not joint
+  # velocity directly) but stay declared since a future JOINT_* mode on this
+  # arm would need them.
   - name: "joint1"
     joint_type: "revolute"
     parent_link: "chassis_base_link"
@@ -150,8 +162,9 @@ joints:
   # position_limits: (0.0, 1.0) is the OpenRAL HAL contract for a normalised
   # jaw fraction (JointSpec docstring) -- SRB's own mechanical stroke
   # (+/- 0.82 rad, per-joint sign in _GRIPPER_SIGN) is a simulator-internal
-  # detail the HAL translation layer owns, not this envelope. Not yet driven
-  # (GRIPPER_BINARY is a follow-up).
+  # detail the HAL translation layer owns, not this envelope. Driven via
+  # GRIPPER_BINARY (>= 0.5 = open); openral_hal.lunar_bot_srb applies SRB's
+  # own inverted True=close/False=open wire convention on the way out.
   - name: "eg2_joint1"
     joint_type: "revolute"
     parent_link: "Link7"
@@ -205,11 +218,10 @@ capabilities:
   has_vision: true  # front_camera + wrist_camera per lunarbot.py Frame declarations
   has_lidar: false
   has_vision_slam: false
-  # First integration slice: base only. Add "cartesian_twist" /
-  # "gripper_binary" once the HAL's arm-IK / gripper translation exists (see
-  # the module docstring above).
   supported_control_modes:
     - "body_twist"
+    - "cartesian_twist"
+    - "gripper_binary"
   embodiment_tags:
     - "lunar_bot"
     # Canonical class tag for any robot with a planar base + body_twist
@@ -229,6 +241,14 @@ safety:
   # a claimed operational limit.
   max_base_linear_speed_m_s: 0.3
   max_base_angular_speed_rad_s: 0.5
+  # Arm CARTESIAN_TWIST bounds -- same "conservative, provisional, first
+  # integration slice" status as the base bounds above, chosen with extra
+  # margin under openral_hal.lunar_bot_srb's calibration (raw=1.0 measured
+  # at 0.29-0.43 m/s / 0.39-0.46 rad/s depending on pose/direction): at
+  # these declared caps the HAL's raw conversion stays well inside the
+  # measured range at every pose tested, not just on average.
+  max_ee_speed_m_s: 0.2
+  max_ee_angular_speed_rad_s: 0.3
 
 sdk_kind: "open"
 hal:

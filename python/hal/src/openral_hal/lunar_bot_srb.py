@@ -9,15 +9,26 @@ install, and is wired to a real transport after construction via
 alone, before any ROS node exists (see ``ros_control.py``'s own
 ``attach_transport`` docstring for why).
 
-First integration slice: BODY_TWIST only (drives SRB's per-action-term
-``.../action/cmd_vel`` topic, a ``geometry_msgs/Twist``). CARTESIAN_TWIST
-(SRB's ``differential_inverse_kinematics`` action, for the 7-DoF arm) and
-GRIPPER_BINARY (SRB's ``binary_joint_position`` action) are follow-up work
-once this path is proven end to end — see ``robots/lunar_bot/robot.yaml``.
+Drives all three of LunarBot's actuator surfaces, unifying base + arm +
+gripper into one HAL so this is a genuine mobile manipulator rather than
+three independent single-actuator slices:
 
-Body twist has no chunking semantics on SRB's side (a plain ``Twist`` is an
-instantaneous velocity command, not a trajectory), so ``send_action`` only
-accepts ``horizon == 1`` — a multi-step BODY_TWIST chunk would have no
+* BODY_TWIST → SRB's ``.../action/cmd_vel`` (``geometry_msgs/Twist``,
+  the base's ``FourWheelSteerActionCfg``). Real m/s and rad/s directly —
+  SRB's own action-term config already applies the (empirically verified)
+  sign, so this HAL forwards the commanded values unconverted.
+* CARTESIAN_TWIST → SRB's ``.../differential_inverse_kinematics``
+  (``geometry_msgs/Twist``, the 7-DoF arm's relative-mode differential IK).
+  **Not a direct unit passthrough** — see ``_ARM_LINEAR_MPS_PER_RAW_UNIT``/
+  ``_ARM_ANGULAR_RADPS_PER_RAW_UNIT`` below for why and how this HAL
+  converts.
+* GRIPPER_BINARY → SRB's ``.../binary_joint_position``
+  (``std_msgs/Bool``, the EG2-4C2 gripper). **Inverted from the naive
+  reading** — see ``_gripper_open_to_srb_bool`` below.
+
+None of these three chunk over time on SRB's side (a plain ``Twist``/
+``Bool`` is an instantaneous command, not a trajectory), so ``send_action``
+requires ``horizon == 1`` for all three — a multi-step chunk would have no
 well-defined meaning over this transport.
 """
 
@@ -55,6 +66,65 @@ def _default_publish(topic: str, msg: dict[str, object]) -> None:  # pragma: no 
     log.debug("hal.publish", topic=topic, fields=list(msg.keys()))
 
 
+# ── Arm (CARTESIAN_TWIST) raw-unit calibration ──────────────────────────────
+#
+# SRB's arm_ik action term (Isaac Lab's DifferentialInverseKinematicsAction,
+# use_relative_mode=True, scale=0.1) does NOT speak physical m/s or rad/s on
+# the wire: `process_actions()` scales the raw Twist by 0.1 and treats the
+# result as a per-control-step POSITION delta added to the end-effector's
+# CURRENT measured pose (confirmed by reading Isaac Lab's own
+# task_space_actions.py / differential_ik.py, not guessed from the topic's
+# message type). Since the ROS bridge holds the last published Twist as a
+# zero-order-hold buffer and feeds it into process_actions() every step,
+# sustaining a constant raw value DOES produce continuous EE motion whose
+# rate is proportional to the raw magnitude -- functionally a velocity from
+# this HAL's point of view, just realised through repeated small position
+# deltas rather than a native rate controller (unlike the base's cmd_vel,
+# which SRB's own FourWheelSteerActionCfg speaks directly in m/s and rad/s).
+#
+# Measured live 2026-09-13 (SRB `_ground_manipulation env.robot=lunar_bot`,
+# `agent ros`, fresh env at its init pose), holding one raw axis at 1.0 for
+# 2.0s and measuring Link7's TF displacement:
+#
+#   linear.x=1.0  -> 0.431 m/s   | linear.y=1.0  -> 0.293 m/s
+#   angular.z=1.0 -> 0.388 rad/s | angular.x=1.0 -> 0.461 rad/s
+#
+# This is a genuinely POSE-DEPENDENT ratio (a 7-DoF arm's Jacobian
+# conditioning varies across the workspace; ik_method="dls" bounds but does
+# not eliminate this), not a single physical constant like the base's -- so
+# these are deliberately conservative, ROUNDED-UP-FROM-THE-OBSERVED-MAXIMUM
+# provisional bring-up constants (same epistemic status as
+# robot.yaml's own BODY_TWIST bounds: "conservative... not a validated
+# operating envelope"), not a claimed precise calibration. Rounding up
+# (using MORE raw-per-desired-m/s than the observed maximum needed) means a
+# commanded speed at or under the safety envelope's max_ee_speed_m_s /
+# max_ee_angular_speed_rad_s is unlikely to be exceeded at the poses
+# measured; it is not a guarantee against every possible configuration.
+_ARM_LINEAR_MPS_PER_RAW_UNIT = 0.5
+_ARM_ANGULAR_RADPS_PER_RAW_UNIT = 0.6
+
+
+# ── Gripper (GRIPPER_BINARY) direction convention ───────────────────────────
+#
+# OpenRAL's Action.gripper is a normalised jaw fraction in [0, 1]
+# (JointSpec docstring); this HAL treats >= 0.5 as OPEN, < 0.5 as CLOSE --
+# the common parallel-gripper convention, and the first real GRIPPER_BINARY
+# implementation in this project (no prior robot HAL to mirror).
+#
+# SRB's binary_joint_position wire is INVERTED from the naive reading of
+# "True means open": Isaac Lab's BinaryJointAction maps a positive raw
+# value to `open_command_expr` and negative to `close_command_expr`, and
+# SRB's ROS bridge extractor is
+# `lambda msg: [-1.0 if msg.data else 1.0]` (srb/interfaces/interface/ros.py)
+# -- so `Bool(data=True)` -> raw=-1.0 -> CLOSE, `Bool(data=False)` ->
+# raw=+1.0 -> OPEN. Confirmed live 2026-09-13, not just read from source:
+# publishing True moved eg2_joint1 from ~0.82 rad (open) to ~0.0 rad
+# (closed); publishing False reopened it.
+def _gripper_open_to_srb_bool(*, open_: bool) -> bool:
+    """OpenRAL 'is this gripper command OPEN?' -> SRB's inverted wire bool."""
+    return not open_
+
+
 class LunarBotSRBHAL(HALBase):
     """SRB-bridge HAL adapter for the LunarBot mobile manipulator.
 
@@ -66,6 +136,11 @@ class LunarBotSRBHAL(HALBase):
             exposes for ``lunar_bot``'s ``FourWheelSteerActionCfg`` action
             term (verified live in the research repo's
             ``docs/srb_integration_notes.md`` §3.2).
+        arm_ik_topic: SRB topic ``send_action`` publishes CARTESIAN_TWIST
+            commands on (the 7-DoF arm's differential-IK action term).
+        hand_topic: SRB topic ``send_action`` publishes GRIPPER_BINARY
+            commands on (the EG2-4C2 gripper's binary joint-position
+            action term).
         joint_state_topic: SRB topic ``read_state`` reads from. Defaults to
             the topic verified live in the same integration notes.
         publish_fn / state_fn: Inject a test transport (or a
@@ -84,6 +159,8 @@ class LunarBotSRBHAL(HALBase):
         description: RobotDescription,
         *,
         cmd_vel_topic: str = "/srb/env0/action/cmd_vel",
+        arm_ik_topic: str = "/srb/env0/robot/robot/differential_inverse_kinematics",
+        hand_topic: str = "/srb/env0/robot/robot/binary_joint_position",
         joint_state_topic: str = "/srb/env0/robot/joint_states",
         publish_fn: _PublishFn | None = None,
         state_fn: Callable[[], dict[str, object]] | None = None,
@@ -97,6 +174,8 @@ class LunarBotSRBHAL(HALBase):
             )
         self.description = description
         self._cmd_vel_topic = cmd_vel_topic
+        self._arm_ik_topic = arm_ik_topic
+        self._hand_topic = hand_topic
         self._joint_state_topic = joint_state_topic
         self._publish_fn: _PublishFn = publish_fn or _default_publish
         self._state_fn = state_fn
@@ -150,8 +229,18 @@ class LunarBotSRBHAL(HALBase):
 
     @property
     def cmd_vel_topic(self) -> str:
-        """The SRB ``geometry_msgs/Twist`` topic this HAL publishes to."""
+        """The SRB ``geometry_msgs/Twist`` (base) topic this HAL publishes to."""
         return self._cmd_vel_topic
+
+    @property
+    def arm_ik_topic(self) -> str:
+        """The SRB ``geometry_msgs/Twist`` (arm) topic this HAL publishes to."""
+        return self._arm_ik_topic
+
+    @property
+    def hand_topic(self) -> str:
+        """The SRB ``std_msgs/Bool`` (gripper) topic this HAL publishes to."""
+        return self._hand_topic
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -209,29 +298,54 @@ class LunarBotSRBHAL(HALBase):
         )
 
     def send_action(self, action: Action) -> None:
-        """Forward a BODY_TWIST action to SRB's ``cmd_vel`` action topic.
+        """Forward one action to the SRB topic for its control mode.
 
         Args:
             action: The ``Action`` produced by a Skill. Must have
-                ``control_mode == BODY_TWIST`` and ``horizon == 1``.
+                ``control_mode`` in ``{BODY_TWIST, CARTESIAN_TWIST,
+                GRIPPER_BINARY}`` and ``horizon == 1`` (none of the three
+                chunk over time on SRB's side).
 
         Raises:
             ROSRuntimeError: If not connected.
-            ROSConfigError: If ``action.control_mode`` is not BODY_TWIST,
-                ``horizon != 1``, or ``action.body_twist`` is empty.
+            ROSConfigError: If ``action.control_mode`` is unsupported,
+                ``horizon != 1``, or the mode's payload field is empty.
         """
         self._require_connected("send_action")
-        self._require_control_mode(action, ControlMode.BODY_TWIST)
+        if action.control_mode is ControlMode.BODY_TWIST:
+            self._send_body_twist(action)
+        elif action.control_mode is ControlMode.CARTESIAN_TWIST:
+            self._send_cartesian_twist(action)
+        elif action.control_mode is ControlMode.GRIPPER_BINARY:
+            self._send_gripper_binary(action)
+        else:
+            raise ROSConfigError(
+                f"LunarBotSRBHAL supports body_twist / cartesian_twist / "
+                f"gripper_binary; got {action.control_mode!r}."
+            )
+
+    def _require_single_step(self, action: Action, *, payload_name: str) -> None:
         if action.horizon != 1:
             raise ROSConfigError(
-                f"LunarBotSRBHAL: BODY_TWIST has no chunking semantics on SRB's "
-                f"plain-Twist transport; got horizon={action.horizon} (expected 1)."
+                f"LunarBotSRBHAL: {action.control_mode.value} has no chunking "
+                f"semantics on SRB's plain-topic transport; got "
+                f"horizon={action.horizon} (expected 1)."
             )
-        if not action.body_twist:
+        if not getattr(action, payload_name):
             raise ROSConfigError(
-                "LunarBotSRBHAL: BODY_TWIST Action has empty body_twist payload."
+                f"LunarBotSRBHAL: {action.control_mode.value} Action has empty "
+                f"{payload_name} payload."
             )
-        vx, vy, vz, wx, wy, wz = action.body_twist[0]
+
+    def _send_body_twist(self, action: Action) -> None:
+        """Publish a BODY_TWIST action to SRB's base ``cmd_vel`` topic.
+
+        Real m/s / rad/s directly — no HAL-side scale conversion (see the
+        module docstring's cmd_vel bullet).
+        """
+        self._require_control_mode(action, ControlMode.BODY_TWIST)
+        self._require_single_step(action, payload_name="body_twist")
+        vx, vy, vz, wx, wy, wz = action.body_twist[0]  # type: ignore[index]
         msg: dict[str, object] = {
             "linear": {"x": vx, "y": vy, "z": vz},
             "angular": {"x": wx, "y": wy, "z": wz},
@@ -243,6 +357,53 @@ class LunarBotSRBHAL(HALBase):
             control_mode=action.control_mode,
             linear=(vx, vy, vz),
             angular=(wx, wy, wz),
+        )
+
+    def _send_cartesian_twist(self, action: Action) -> None:
+        """Publish a CARTESIAN_TWIST action to SRB's arm-IK topic.
+
+        Converts from the physical m/s / rad/s the safety kernel validated
+        (``max_ee_speed_m_s`` / ``max_ee_angular_speed_rad_s``) into SRB's
+        raw per-step Twist units via the calibration constants above.
+        """
+        self._require_control_mode(action, ControlMode.CARTESIAN_TWIST)
+        self._require_single_step(action, payload_name="cartesian_twist")
+        vx, vy, vz, wx, wy, wz = action.cartesian_twist[0]  # type: ignore[index]
+        raw_linear = tuple(v / _ARM_LINEAR_MPS_PER_RAW_UNIT for v in (vx, vy, vz))
+        raw_angular = tuple(w / _ARM_ANGULAR_RADPS_PER_RAW_UNIT for w in (wx, wy, wz))
+        msg: dict[str, object] = {
+            "linear": {"x": raw_linear[0], "y": raw_linear[1], "z": raw_linear[2]},
+            "angular": {"x": raw_angular[0], "y": raw_angular[1], "z": raw_angular[2]},
+        }
+        self._publish_fn(self._arm_ik_topic, msg)
+        log.debug(
+            "hal.send_action",
+            robot=self.description.name,
+            control_mode=action.control_mode,
+            physical_linear_m_s=(vx, vy, vz),
+            physical_angular_rad_s=(wx, wy, wz),
+            raw_linear=raw_linear,
+            raw_angular=raw_angular,
+        )
+
+    def _send_gripper_binary(self, action: Action) -> None:
+        """Publish a GRIPPER_BINARY action to SRB's gripper topic.
+
+        Thresholds the ``[0, 1]`` jaw-fraction command at 0.5 (>= 0.5 =
+        OPEN) and applies SRB's inverted wire convention (see
+        ``_gripper_open_to_srb_bool`` above).
+        """
+        self._require_control_mode(action, ControlMode.GRIPPER_BINARY)
+        self._require_single_step(action, payload_name="gripper")
+        commanded_open = action.gripper[0] >= 0.5  # type: ignore[index]
+        srb_bool = _gripper_open_to_srb_bool(open_=commanded_open)
+        self._publish_fn(self._hand_topic, {"data": srb_bool})
+        log.debug(
+            "hal.send_action",
+            robot=self.description.name,
+            control_mode=action.control_mode,
+            commanded_open=commanded_open,
+            srb_bool=srb_bool,
         )
 
     # ── Safety ───────────────────────────────────────────────────────────────
