@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+r"""LunarBot sensor bridge — SRB's native ROS topics -> OpenRAL conventions.
+
+SRB (reached over ROS, not OpenRAL in-process physics — see the module
+docstring in ``lifecycle_node.py`` and ``robots/lunar_bot/robot.yaml``'s
+header) already publishes everything this robot senses under
+``srb.interfaces.interface.ros.RosInterface``: per-camera ``Image``/
+``CameraInfo``/``PointCloud2``, an ``Imu``, a ``RayCaster`` lidar
+``PointCloud2``, and the full scene ``/tf`` tree — all keyed by SRB's own
+scene-sensor names (``cam_front``, ``cam_wrist``, ``imu_robot``,
+``lidar_robot``) under the ``srb/env0/...`` frame namespace. None of that
+is on OpenRAL's own conventions (``/openral/cameras/<name>/...``, a
+``chassis_base_link``-rooted TF tree, ``/odom``, ``/imu``), and downstream
+consumers (world-state camera subscriptions, the object detector, Nav2, the
+octomap bridge) only know the OpenRAL side.
+
+This node is the relay, not a resynthesis: every image/camera_info/
+pointcloud/imu topic below is SRB's own already-computed message,
+republished on a new topic with ``header.frame_id`` rewritten to the
+matching ``robots/lunar_bot/robot.yaml`` ``sensors[].frame_id`` — the same
+"thin relay in the bridge node" fallback
+``docs/lunar_bot_capability_set_plan.md`` §3.2 describes for a
+``deploy_binding`` that isn't wired into any launch for this robot yet
+(that mechanism — ``openral_rskill_ros.sensor_leg`` — targets ``openral
+deploy run``/``deploy sim``, neither of which supports ``lunar_bot`` until
+capability-set item 2b lands). Relaying SRB's live ``CameraInfo`` (rather
+than re-deriving static intrinsics from ``PinholeCameraCfg``) also means a
+resolution change in the Hydra launch config can never desync from what
+this node publishes — only ``robot.yaml``'s *documentation* comment would.
+
+TF re-rooting, ``/odom``, and the IMU/lidar/camera frame chain are new
+computation, not a relay: SRB roots every scene transform under
+``srb/env{i}`` (not any OpenRAL-meaningful frame), so this node uses a
+``tf2_ros`` buffer to look up each sensor's pose relative to the robot root
+and rebroadcasts it as ``chassis_base_link -> <manifest frame>`` — the
+composition ``docs/lunar_bot_capability_set_plan.md`` §3.2 item 1 specifies
+(``T(robot <- frame)`` from ``T(env <- robot)`` and ``T(env <- frame)``),
+done automatically by ``tf2_ros.Buffer.lookup_transform`` since both frames
+share the common parent ``srb/env0``. ``map -> odom`` is published as a
+static identity transform: in simulation localisation is ground truth, and
+this frame exists only so Nav2 / the world-state lift / the verifier
+resolve through TF exactly as they would on the real robot (where a
+localizer would author it) — stated plainly, not dressed up as SLAM.
+
+``robot_tf_frame`` (default ``srb/env0/robot``) is the one genuinely open
+question this module cannot resolve by reading source: whether SRB's
+articulation-root TF frame (``Articulation.data.root_pos_w``, broadcast by
+``RosInterface._broadcast_transforms``'s per-articulation loop) is
+numerically the same pose as the ``chassis_base_link`` body — the manifest's
+``frame_base`` names ``chassis_base_link`` as a prim *under*
+``{robot.prim_path}`` (see ``lunarbot.py``'s frame declarations), which is
+consistent with (but does not prove) the two coinciding: USD prim
+containment is an authoring-time grouping, while PhysX's articulation root
+pose is a physics-time property of the root rigid body — they usually
+coincide for a mobile-base robot with no extra virtual root Xform, but this
+is exactly the kind of claim this project verifies live rather than assumes
+(``docs/srb_deploy_backend_plan.md`` §6). Left as a parameter, not a
+hardcoded constant, precisely so a live mismatch is a one-flag fix rather
+than a code change.
+
+Usage::
+
+    ros2 run openral_hal_lunar_bot sensor_bridge_node.py \
+        --ros-args -p robot_yaml:=robots/lunar_bot/robot.yaml
+"""
+
+from __future__ import annotations
+
+import structlog
+
+__all__ = ["main", "rotate_vector_by_quat_xyzw"]
+
+_log = structlog.get_logger(__name__)
+
+try:
+    import rclpy  # noqa: F401
+
+    _ROS2_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only on hosts without ROS 2
+    _ROS2_AVAILABLE = False
+
+#: SRB's per-env TF root (``RosInterface``'s ``srb/env{i}`` frame family).
+DEFAULT_ENV_TF_FRAME = "srb/env0"
+#: The articulation-root TF frame SRB broadcasts for `lunar_bot` -- see the
+#: module docstring's `robot_tf_frame` paragraph for why this is a parameter.
+DEFAULT_ROBOT_TF_FRAME = "srb/env0/robot"
+#: SRB scene-sensor name -> ``robots/lunar_bot/robot.yaml`` `sensors[].name`,
+#: for every sensor whose *pose* (not just its data) this bridge relays onto
+#: the `chassis_base_link`-rooted TF tree.
+SRB_SENSOR_TF_SOURCE = {
+    "front": "cam_front",
+    "wrist": "cam_wrist",
+    "imu": "imu_robot",
+    "lidar": "lidar_robot",
+}
+#: `robots/lunar_bot/robot.yaml` `sensors[].name` this bridge requires present
+#: (item 2's full set — see `docs/lunar_bot_capability_set_plan.md` §3.2).
+REQUIRED_SENSOR_NAMES = ("front", "front_depth", "wrist", "imu", "lidar")
+
+
+def rotate_vector_by_quat_xyzw(
+    vx: float, vy: float, vz: float, qx: float, qy: float, qz: float, qw: float
+) -> tuple[float, float, float]:
+    """Rotate a 3-vector by a unit quaternion (Hamilton, ``[x, y, z, w]``).
+
+    Standard ``v' = v + 2w(u x v) + 2u x (u x v)`` form (``u`` = the
+    quaternion's vector part) — avoids building a full rotation matrix for a
+    single vector. Used to express ``/odom``'s finite-difference world-frame
+    linear velocity in the ``chassis_base_link`` frame REP-105 requires
+    (``Odometry.twist`` is in ``child_frame_id``), by passing the
+    **conjugate** of the body's world orientation.
+
+    Args:
+        vx, vy, vz: The vector to rotate.
+        qx, qy, qz, qw: The rotation, as a unit quaternion.
+
+    Returns:
+        The rotated vector.
+
+    Example:
+        >>> # Identity rotation leaves the vector unchanged.
+        >>> rotate_vector_by_quat_xyzw(1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0)
+        (1.0, 2.0, 3.0)
+        >>> # +90 deg about Z sends +X to +Y.
+        >>> import math
+        >>> rx, ry, rz = rotate_vector_by_quat_xyzw(
+        ...     1.0, 0.0, 0.0, 0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4)
+        ... )
+        >>> round(rx, 9), round(ry, 9), round(rz, 9)
+        (0.0, 1.0, 0.0)
+    """
+    uvx = qy * vz - qz * vy
+    uvy = qz * vx - qx * vz
+    uvz = qx * vy - qy * vx
+    uuvx = qy * uvz - qz * uvy
+    uuvy = qz * uvx - qx * uvz
+    uuvz = qx * uvy - qy * uvx
+    return (
+        vx + 2.0 * qw * uvx + 2.0 * uuvx,
+        vy + 2.0 * qw * uvy + 2.0 * uuvy,
+        vz + 2.0 * qw * uvz + 2.0 * uuvz,
+    )
+
+
+def _conjugate_xyzw(qx: float, qy: float, qz: float, qw: float) -> tuple[float, float, float, float]:
+    """The conjugate (inverse, for a unit quaternion) of ``[x, y, z, w]``."""
+    return (-qx, -qy, -qz, qw)
+
+
+def _make_main() -> None:
+    """Build the sensor bridge node and spin it on a background thread.
+
+    Two non-obvious things had to be verified live (2026-09-14, against a
+    running SRB instance) before this settled, both silent failure modes —
+    the process neither crashes nor logs an error, it just stops making
+    progress:
+
+    1. **Not `rclpy.spin(node)`** (a bare `SingleThreadedExecutor`): stalls
+       this node after ~1-2s — `_on_tick` stops firing and every TF/odom
+       lookup starves. `tf2_ros.TransformListener` puts its `/tf`/
+       `/tf_static` subscriptions on a `ReentrantCallbackGroup` specifically
+       so a TF-dependent callback can run concurrently with the listener's
+       own callback — mixing that with this node's several
+       MutuallyExclusive-group relay subscriptions needs a
+       `MultiThreadedExecutor`, confirmed: swapping in one with 4 threads
+       fixed it in isolation.
+    2. **Not `executor.spin()` called directly on the main thread**, even
+       with the `MultiThreadedExecutor` from (1): stalls identically after
+       ~1s. Spinning the *same* executor on a background thread (main thread
+       just waits) ran the full length of every test with no stall. Root
+       cause not chased further (a main-thread-specific interaction between
+       rclpy's wait-set wakeup and this process's signal handling is the
+       working hypothesis); the fix is verified, not just theorised.
+    """
+    if not _ROS2_AVAILABLE:
+        _log.error("rclpy not found — cannot start the LunarBot sensor bridge without ROS 2.")
+        raise SystemExit(1)
+
+    import threading
+
+    import rclpy
+    from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+
+    from openral_observability import configure_observability
+
+    configure_observability(service_name="openral.hal.lunar_bot.sensor_bridge")
+
+    rclpy.init()
+    node = LunarBotSensorBridgeNode()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+
+    def _run_executor() -> None:
+        try:
+            executor.spin()
+        except ExternalShutdownException:
+            pass
+
+    spin_thread = threading.Thread(
+        target=_run_executor, name="lunar_bot_sensor_bridge_spin", daemon=True
+    )
+    spin_thread.start()
+    try:
+        # A bounded join (not a bare `spin_thread.join()`) so a SIGINT on
+        # this main thread is actually delivered rather than blocked behind
+        # an uninterruptible native wait.
+        while spin_thread.is_alive():
+            spin_thread.join(timeout=1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if _ROS2_AVAILABLE:
+    from geometry_msgs.msg import TransformStamped
+    from nav_msgs.msg import Odometry
+    from rclpy.node import Node
+    from rclpy.qos import (
+        DurabilityPolicy,
+        HistoryPolicy,
+        QoSProfile,
+        ReliabilityPolicy,
+    )
+    from rclpy.time import Time as RclpyTime
+    from sensor_msgs.msg import CameraInfo, Image
+    from sensor_msgs.msg import Imu as RosImu
+    from sensor_msgs.msg import PointCloud2
+    from tf2_ros import ConnectivityException, ExtrapolationException, LookupException
+    from tf2_ros.buffer import Buffer
+    from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
+    from tf2_ros.transform_broadcaster import TransformBroadcaster
+    from tf2_ros.transform_listener import TransformListener
+
+    #: Sensor-data QoS (CLAUDE.md §2: images/pointclouds/IMU — BEST_EFFORT,
+    #: VOLATILE, KEEP_LAST small). Matches what SRB itself publishes closely
+    #: enough to bridge without a reliability mismatch dropping every message
+    #: (a RELIABLE subscriber gets nothing from a BEST_EFFORT publisher).
+    _SENSOR_QOS = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=5,
+    )
+    #: CameraInfo / control-adjacent QoS (CLAUDE.md §2: RELIABLE, VOLATILE,
+    #: KEEP_LAST=1).
+    _INFO_QOS = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
+    class LunarBotSensorBridgeNode(Node):
+        """Relay SRB's sensor topics + re-root its TF tree onto OpenRAL conventions.
+
+        See the module docstring for the full rationale. Every publisher this
+        node owns is created in ``__init__`` from ``robots/lunar_bot/robot.yaml``
+        (``robot_yaml`` parameter) — a manifest missing one of
+        ``REQUIRED_SENSOR_NAMES`` raises ``ROSConfigError`` at construction,
+        never silently drops a sensor.
+
+        Parameters:
+            robot_yaml: Path to ``lunar_bot``'s ``RobotDescription`` YAML.
+            env_tf_frame: SRB's per-env TF root (``DEFAULT_ENV_TF_FRAME``).
+            robot_tf_frame: SRB's articulation-root TF frame for this robot
+                (``DEFAULT_ROBOT_TF_FRAME``) — see the module docstring.
+            bridge_rate_hz: Cadence for the TF/`` /odom`` republish timer.
+                Image/CameraInfo/PointCloud2/Imu relays are event-driven
+                (republished on receipt, not on this timer).
+        """
+
+        def __init__(self, node_name: str = "openral_hal_lunar_bot_sensor_bridge") -> None:
+            """Load the manifest, then wire every relay/TF publisher."""
+            super().__init__(node_name)
+            from openral_core import RobotDescription
+            from openral_core.exceptions import ROSConfigError
+
+            self.declare_parameter("robot_yaml", "robots/lunar_bot/robot.yaml")
+            self.declare_parameter("env_tf_frame", DEFAULT_ENV_TF_FRAME)
+            self.declare_parameter("robot_tf_frame", DEFAULT_ROBOT_TF_FRAME)
+            self.declare_parameter("bridge_rate_hz", 30.0)
+
+            robot_yaml = str(self.get_parameter("robot_yaml").value)
+            description = RobotDescription.from_yaml(robot_yaml)
+            self._sensors = {s.name: s for s in description.sensors}
+            missing = [n for n in REQUIRED_SENSOR_NAMES if n not in self._sensors]
+            if missing:
+                raise ROSConfigError(
+                    f"LunarBotSensorBridgeNode: robot.yaml '{robot_yaml}' is missing "
+                    f"sensors {missing} (needs all of {list(REQUIRED_SENSOR_NAMES)}) — "
+                    "see docs/lunar_bot_capability_set_plan.md §3.2."
+                )
+
+            self._base_frame = description.base_frame
+            self._odom_frame = description.odom_frame
+            self._map_frame = description.map_frame
+            self._env_tf_frame = str(self.get_parameter("env_tf_frame").value)
+            self._robot_tf_frame = str(self.get_parameter("robot_tf_frame").value)
+
+            # ── TF ────────────────────────────────────────────────────────
+            self._tf_buffer = Buffer()
+            self._tf_listener = TransformListener(self._tf_buffer, self)
+            self._tf_broadcaster = TransformBroadcaster(self)
+            self._static_tf_broadcaster = StaticTransformBroadcaster(self)
+            self._publish_static_map_to_odom()
+
+            # ── /odom ─────────────────────────────────────────────────────
+            self._odom_pub = self.create_publisher(Odometry, "/odom", _SENSOR_QOS)
+            self._prev_pose_stamp_s: float | None = None
+            self._prev_pose_xyz: tuple[float, float, float] | None = None
+            self._latest_ang_vel: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+            # ── IMU relay (data) + its TF is handled by _publish_sensor_frames ──
+            imu_frame = self._sensors["imu"].frame_id
+            self._imu_pub = self.create_publisher(RosImu, "/imu", _SENSOR_QOS)
+            self.create_subscription(
+                RosImu,
+                f"/{self._env_tf_frame}/{SRB_SENSOR_TF_SOURCE['imu']}",
+                lambda msg: self._on_imu(msg, frame_id=imu_frame),
+                _SENSOR_QOS,
+            )
+
+            # ── Cameras: image + camera_info relays ──────────────────────
+            self._relay_image(
+                src_topic=f"/{self._env_tf_frame}/cam_front/image_rgb",
+                dst_topic="/openral/cameras/front/image",
+                frame_id=self._sensors["front"].frame_id,
+            )
+            self._relay_camera_info(
+                src_topic=f"/{self._env_tf_frame}/cam_front/camera_info",
+                dst_topic="/openral/cameras/front/camera_info",
+                frame_id=self._sensors["front"].frame_id,
+            )
+            self._relay_image(
+                src_topic=f"/{self._env_tf_frame}/cam_front/image_depth",
+                dst_topic="/openral/cameras/front_depth/image",
+                frame_id=self._sensors["front_depth"].frame_id,
+            )
+            self._relay_camera_info(
+                src_topic=f"/{self._env_tf_frame}/cam_front/camera_info",
+                dst_topic="/openral/cameras/front_depth/camera_info",
+                frame_id=self._sensors["front_depth"].frame_id,
+            )
+            self._relay_pointcloud(
+                src_topic=f"/{self._env_tf_frame}/cam_front/pointcloud",
+                dst_topic="/openral/cameras/front_depth/points",
+                frame_id=self._sensors["front_depth"].frame_id,
+            )
+            self._relay_image(
+                src_topic=f"/{self._env_tf_frame}/cam_wrist/image_rgb",
+                dst_topic="/openral/cameras/wrist/image",
+                frame_id=self._sensors["wrist"].frame_id,
+            )
+            self._relay_camera_info(
+                src_topic=f"/{self._env_tf_frame}/cam_wrist/camera_info",
+                dst_topic="/openral/cameras/wrist/camera_info",
+                frame_id=self._sensors["wrist"].frame_id,
+            )
+
+            # ── Lidar relay (data); its TF is handled by _publish_sensor_frames ──
+            self._relay_pointcloud(
+                src_topic=f"/{self._env_tf_frame}/lidar_robot/pointcloud",
+                dst_topic="/openral/lidar/points",
+                frame_id=self._sensors["lidar"].frame_id,
+            )
+
+            # ── Periodic: sensor-frame TF + /odom (needs a fresh tf2 lookup, not
+            # a subscription callback) ───────────────────────────────────────
+            bridge_rate_hz = float(self.get_parameter("bridge_rate_hz").value)
+            self._timer = self.create_timer(1.0 / bridge_rate_hz, self._on_tick)
+
+            _log.info(
+                "sensor_bridge.started",
+                robot_yaml=robot_yaml,
+                sensors=list(self._sensors),
+                robot_tf_frame=self._robot_tf_frame,
+                bridge_rate_hz=bridge_rate_hz,
+            )
+
+        # ── Setup helpers ────────────────────────────────────────────────
+
+        def _publish_static_map_to_odom(self) -> None:
+            """Broadcast the identity ``map -> odom`` transform, once.
+
+            Simulation ground truth: nothing estimates ``map -> odom`` here
+            (no localizer), so it is identity, published static rather than
+            re-sent every tick — stated as such, not dressed up as SLAM (see
+            the module docstring).
+            """
+            t = TransformStamped()
+            t.header.stamp = self.get_clock().now().to_msg()
+            t.header.frame_id = self._map_frame
+            t.child_frame_id = self._odom_frame
+            t.transform.rotation.w = 1.0
+            self._static_tf_broadcaster.sendTransform(t)
+
+        def _relay_image(self, *, src_topic: str, dst_topic: str, frame_id: str) -> None:
+            pub = self.create_publisher(Image, dst_topic, _SENSOR_QOS)
+
+            def _cb(msg: Image) -> None:
+                msg.header.frame_id = frame_id
+                pub.publish(msg)
+
+            self.create_subscription(Image, src_topic, _cb, _SENSOR_QOS)
+
+        def _relay_camera_info(self, *, src_topic: str, dst_topic: str, frame_id: str) -> None:
+            pub = self.create_publisher(CameraInfo, dst_topic, _INFO_QOS)
+
+            def _cb(msg: CameraInfo) -> None:
+                msg.header.frame_id = frame_id
+                pub.publish(msg)
+
+            self.create_subscription(CameraInfo, src_topic, _cb, _INFO_QOS)
+
+        def _relay_pointcloud(self, *, src_topic: str, dst_topic: str, frame_id: str) -> None:
+            pub = self.create_publisher(PointCloud2, dst_topic, _SENSOR_QOS)
+
+            def _cb(msg: PointCloud2) -> None:
+                msg.header.frame_id = frame_id
+                pub.publish(msg)
+
+            self.create_subscription(PointCloud2, src_topic, _cb, _SENSOR_QOS)
+
+        def _on_imu(self, msg: RosImu, *, frame_id: str) -> None:
+            self._latest_ang_vel = (
+                msg.angular_velocity.x,
+                msg.angular_velocity.y,
+                msg.angular_velocity.z,
+            )
+            msg.header.frame_id = frame_id
+            # SRB's Imu sensor models linear acceleration + angular velocity
+            # only (srb/core/sensor -- no orientation filter); mark
+            # orientation as "not provided" per the sensor_msgs/Imu
+            # convention rather than publishing a fabricated identity quat.
+            msg.orientation_covariance[0] = -1.0
+            self._imu_pub.publish(msg)
+
+        # ── Periodic: TF re-rooting + /odom ─────────────────────────────
+
+        def _on_tick(self) -> None:
+            self._publish_sensor_frames()
+            self._publish_odom()
+
+        def _lookup(self, target_frame: str, source_frame: str) -> TransformStamped | None:
+            try:
+                return self._tf_buffer.lookup_transform(target_frame, source_frame, RclpyTime())
+            except (LookupException, ConnectivityException, ExtrapolationException) as exc:
+                _log.debug(
+                    "sensor_bridge.tf_lookup_failed",
+                    target_frame=target_frame,
+                    source_frame=source_frame,
+                    error=str(exc),
+                )
+                return None
+
+        def _publish_sensor_frames(self) -> None:
+            """Re-root each sensor's SRB pose as ``chassis_base_link -> <manifest frame>``."""
+            stamp = self.get_clock().now().to_msg()
+            for manifest_name, srb_name in SRB_SENSOR_TF_SOURCE.items():
+                tf = self._lookup(self._robot_tf_frame, f"{self._env_tf_frame}/{srb_name}")
+                if tf is None:
+                    continue
+                out = TransformStamped()
+                out.header.stamp = stamp
+                out.header.frame_id = self._base_frame
+                out.child_frame_id = self._sensors[manifest_name].frame_id
+                out.transform = tf.transform
+                self._tf_broadcaster.sendTransform(out)
+
+        def _publish_odom(self) -> None:
+            """Broadcast ``odom -> chassis_base_link`` and ``/odom`` from SRB truth."""
+            tf = self._lookup(self._env_tf_frame, self._robot_tf_frame)
+            if tf is None:
+                return
+            stamp = tf.header.stamp
+            now_s = stamp.sec + stamp.nanosec * 1e-9
+            translation = tf.transform.translation
+            rotation = tf.transform.rotation
+            x, y, z = translation.x, translation.y, translation.z
+
+            out = TransformStamped()
+            out.header.stamp = stamp
+            out.header.frame_id = self._odom_frame
+            out.child_frame_id = self._base_frame
+            out.transform = tf.transform
+            self._tf_broadcaster.sendTransform(out)
+
+            odom = Odometry()
+            odom.header.stamp = stamp
+            odom.header.frame_id = self._odom_frame
+            odom.child_frame_id = self._base_frame
+            odom.pose.pose.position.x = x
+            odom.pose.pose.position.y = y
+            odom.pose.pose.position.z = z
+            odom.pose.pose.orientation = rotation
+
+            if self._prev_pose_stamp_s is not None and self._prev_pose_xyz is not None:
+                dt = now_s - self._prev_pose_stamp_s
+                px, py, pz = self._prev_pose_xyz
+                if dt > 1e-6:
+                    vx_w, vy_w, vz_w = (x - px) / dt, (y - py) / dt, (z - pz) / dt
+                    cqx, cqy, cqz, cqw = _conjugate_xyzw(
+                        rotation.x, rotation.y, rotation.z, rotation.w
+                    )
+                    vx_b, vy_b, vz_b = rotate_vector_by_quat_xyzw(
+                        vx_w, vy_w, vz_w, cqx, cqy, cqz, cqw
+                    )
+                    odom.twist.twist.linear.x = vx_b
+                    odom.twist.twist.linear.y = vy_b
+                    odom.twist.twist.linear.z = vz_b
+            (
+                odom.twist.twist.angular.x,
+                odom.twist.twist.angular.y,
+                odom.twist.twist.angular.z,
+            ) = self._latest_ang_vel
+
+            self._odom_pub.publish(odom)
+            self._prev_pose_stamp_s = now_s
+            self._prev_pose_xyz = (x, y, z)
+
+
+main = _make_main
+
+if __name__ == "__main__":
+    main()

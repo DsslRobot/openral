@@ -230,7 +230,13 @@ capabilities:
   has_tactile: false
   has_force_control: false
   has_vision: true  # front_camera + wrist_camera per lunarbot.py Frame declarations
-  has_lidar: false
+  # Livox Mid-360, landed 2026-09-14 on SRB `feat/mid360-lidar` as the scene
+  # sensor `lidar_robot` (RayCaster, real Livox scan-pattern point density
+  # approximation -- see `sensors.lidar` below and docs/research_findings.md
+  # F23/F24). RTX Lidar (higher fidelity) was attempted on the same branch
+  # and parked on a confirmed upstream Isaac Sim bug; RayCaster is the
+  # permanent implementation, not a placeholder.
+  has_lidar: true
   has_vision_slam: false
   supported_control_modes:
     - "body_twist"
@@ -243,6 +249,62 @@ capabilities:
     # actuator (openral_core.schemas) -- lets generic base-only rSkills
     # target the class without naming this specific robot.
     - "mobile_base"
+
+# LunarBot is `hal.real` (SRB is an external ROS-attached system, see the
+# header comment) -- so these are NOT `deploy_binding`-opened; ``openral_hal_
+# lunar_bot.sensor_bridge_node`` relays SRB's own already-computed ROS topics
+# (image/camera_info/pointcloud/imu, all published live by
+# `srb.interfaces.interface.ros.RosInterface` under `--interface ros`) onto
+# these frame_id/topic conventions rather than opening a device or
+# recomputing intrinsics -- see docs/lunar_bot_capability_set_plan.md §3.2.
+# `intrinsics` below are the values Isaac Sim's own pinhole model produces at
+# `camera_resolution=[640,480]` (fx=fy=width*focal_length/horizontal_aperture,
+# cx=width/2, cy=height/2 -- `PinholeCameraCfg` in SRB's
+# `ground_manipulation/visual_ext.py`), recorded for documentation; the
+# bridge relays SRB's live `CameraInfo` verbatim, so a resolution change
+# there does not desync this manifest's numbers from what is actually
+# published (only this comment's claim about the default would go stale).
+sensors:
+  - name: "front"
+    modality: "rgb"
+    frame_id: "front_camera_optical_frame"
+    parent_frame: "chassis_base_link"
+    rate_hz: 30.0
+    intrinsics: { width: 640, height: 480, fx: 266.667, fy: 266.667, cx: 320.0, cy: 240.0 }
+    encoding: "rgb8"
+  - name: "front_depth"
+    modality: "depth"
+    frame_id: "front_camera_optical_frame"  # same optical centre as `front`
+    parent_frame: "chassis_base_link"
+    rate_hz: 30.0
+    intrinsics: { width: 640, height: 480, fx: 266.667, fy: 266.667, cx: 320.0, cy: 240.0 }
+    encoding: "32FC1"  # metres, direct passthrough of SRB's own depth image
+    range_min_m: 0.05
+    range_max_m: 25.0  # PinholeCameraCfg clipping_range, ground_manipulation/visual_ext.py
+  - name: "wrist"
+    modality: "rgb"
+    frame_id: "wrist_camera_optical_frame"
+    parent_frame: "chassis_base_link"  # re-rooted flat, not through the arm chain (§3.2 item 1)
+    rate_hz: 30.0
+    intrinsics: { width: 640, height: 480, fx: 400.0, fy: 400.0, cx: 320.0, cy: 240.0 }
+    encoding: "rgb8"
+  - name: "imu"
+    modality: "imu"
+    frame_id: "imu_link"
+    parent_frame: "chassis_base_link"
+    rate_hz: 50.0  # descriptive only -- the bridge relays every message received, unrated
+  - name: "lidar"
+    modality: "point_cloud"
+    frame_id: "lidar_link"
+    parent_frame: "chassis_base_link"
+    # Livox Mid-360 datasheet nominal (docs/srb_deploy_backend_plan.md §5);
+    # SRB's RayCaster (F23/F24 -- not the real non-repetitive scan pattern,
+    # a comparable-density LidarPatternCfg approximation) publishes at the
+    # env's control rate, not literally 10 Hz -- see that section for the
+    # fidelity caveat this number records.
+    rate_hz: 10.0
+    n_channels: 40  # srb/core/env/mobile/env.py _MID360_CHANNELS
+    range_max_m: 40.0  # _MID360_MAX_RANGE_M
 
 safety:
   deadman_required: true
