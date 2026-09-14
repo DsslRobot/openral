@@ -378,6 +378,27 @@ safety:
 # integration-test bound" status as the safety envelope above, not a
 # claimed final footprint.
 footprint_radius: 0.82
+# `footprint_polygon` -- required, not optional, once discovered live
+# (item 9/Nav2-MoveIt integration pass): Nav2's shared base params
+# (`nav2_panda_mobile.yaml`) set MPPI's `CostCritic.consider_footprint:
+# true`, which needs an actual polygon -- `footprint_radius` alone (Nav2's
+# "[]" sentinel, `nav2_footprint_param()`) made `controller_server` throw
+# "no robot footprint provided" on `configure`, aborting the whole Nav2
+# lifecycle bringup. lunar_bot was the first radius-only mobile base in
+# this project; panda_mobile always had a polygon, so this path was never
+# exercised before. Rectangle from the same real wheel_positions as
+# `footprint_radius` above, each corner pushed out by `wheel_radius`
+# (0.1453 m) so the polygon's own extent is consistent with that radius's
+# margin, not a tighter, inconsistent one: front/rear x = wheel x +/-
+# wheel_radius (0.4925+0.1453=0.6378, -(0.5225+0.1453)=-0.6678); y =
+# wheel y +/- wheel_radius (+/-(0.42705+0.1453)=+/-0.57235). Same
+# provisional-underestimate caveat as `footprint_radius` (mast/arm
+# overhang not included). CCW, base frame (+X forward, +Y left).
+footprint_polygon:
+  - [0.6378, 0.57235]
+  - [-0.6678, 0.57235]
+  - [-0.6678, -0.57235]
+  - [0.6378, -0.57235]
 # `(v, omega)` is the entire commanded space (four_wheel_steer.py
 # FourWheelSteerAction.action_dim == 2) -- no strafing, despite the
 # independent-steering wheels -- so "differential" (-> Nav2 MPPI

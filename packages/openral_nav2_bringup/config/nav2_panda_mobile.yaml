@@ -1,3 +1,22 @@
+# Every `plugin:` value below is pluginlib's REGISTERED lookup name, which
+# is NOT uniformly `<pkg>::<Class>` (the C++ type) nor uniformly
+# `<pkg>/<Class>` -- it's whatever each package's own `*_plugin.xml`
+# declares: a `<class>` tag with an explicit `name="..."` attribute means
+# THAT string (usually `/`-separated -- confirmed for `nav2_bt_navigator`,
+# `nav2_navfn_planner`, `nav2_behaviors`); a `<class>` tag with no `name`
+# falls back to `type` itself (the `::`-separated C++ type string --
+# confirmed for `nav2_controller`, `nav2_mppi_controller`,
+# `nav2_costmap_2d`, `nav2_smoother`, `nav2_waypoint_follower`,
+# `nav2_route`). Found live (item 5/6 Nav2-MoveIt integration pass):
+# every value here previously used the `::` form uniformly, which crashed
+# `planner_server` on `configure` for the packages that actually need
+# `/` -- pluginlib's registered-name lookup does not fall back to the
+# type string. Cross-checked against `nav2_bringup`'s own shipped
+# reference params (`/opt/ros/humble/share/nav2_bringup/params/
+# nav2_multirobot_params_all.yaml`), not guessed twice. `nav2_visual.yaml`
+# is DERIVED from this file (`tools/gen_nav2_visual.py`) and was
+# regenerated in the same pass; re-run that script after any future edit
+# here, per its own docstring.
 amcl:
   ros__parameters:
     alpha1: 0.2
@@ -52,9 +71,9 @@ bt_navigator:
     action_server_result_timeout: 900.0
     navigators: ["navigate_to_pose", "navigate_through_poses"]
     navigate_to_pose:
-      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+      plugin: "nav2_bt_navigator/NavigateToPoseNavigator"
     navigate_through_poses:
-      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+      plugin: "nav2_bt_navigator/NavigateThroughPosesNavigator"
     # 'default_nav_through_poses_bt_xml' and 'default_nav_to_pose_bt_xml' are use defaults:
     # nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml
     # nav2_bt_navigator/navigate_through_poses_w_replanning_and_recovery.xml
@@ -393,7 +412,7 @@ planner_server:
     planner_plugins: ["GridBased"]
     costmap_update_timeout: 1.0
     GridBased:
-      plugin: "nav2_navfn_planner::NavfnPlanner"
+      plugin: "nav2_navfn_planner/NavfnPlanner"
       tolerance: 0.5
       use_astar: false
       # Without this, NavfnPlanner treats unknown costmap cells as
@@ -425,15 +444,15 @@ behavior_server:
     cycle_frequency: 10.0
     behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
     spin:
-      plugin: "nav2_behaviors::Spin"
+      plugin: "nav2_behaviors/Spin"
     backup:
-      plugin: "nav2_behaviors::BackUp"
+      plugin: "nav2_behaviors/BackUp"
     drive_on_heading:
-      plugin: "nav2_behaviors::DriveOnHeading"
+      plugin: "nav2_behaviors/DriveOnHeading"
     wait:
-      plugin: "nav2_behaviors::Wait"
+      plugin: "nav2_behaviors/Wait"
     assisted_teleop:
-      plugin: "nav2_behaviors::AssistedTeleop"
+      plugin: "nav2_behaviors/AssistedTeleop"
     local_frame: odom
     global_frame: map
     robot_base_frame: base_link
