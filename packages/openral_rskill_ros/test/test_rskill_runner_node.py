@@ -1192,9 +1192,7 @@ def test_acquire_skill_reconfigures_on_goal_params_change() -> None:
     from rclpy.action import ActionClient
 
     with _compose_harness(resolver=_tracking_resolver) as (executor, runtime, _safety, _observed):
-        client = ActionClient(
-            runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill"
-        )
+        client = ActionClient(runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill")
         _spin_for(executor, 0.3)
         assert client.wait_for_server(timeout_sec=2.0)
 
@@ -1216,7 +1214,7 @@ def test_acquire_skill_reconfigures_on_goal_params_change() -> None:
 
 
 def test_acquire_skill_still_caches_identical_dispatch() -> None:
-    """A byte-identical repeat dispatch must still reuse the resident skill (no cache regression)."""
+    """A byte-identical repeat dispatch must still reuse the resident skill (no regression)."""
     calls: list[str] = []
 
     def _tracking_resolver(*, goal_params_json: str = "", **_k: Any) -> Any:
@@ -1227,9 +1225,7 @@ def test_acquire_skill_still_caches_identical_dispatch() -> None:
     from rclpy.action import ActionClient
 
     with _compose_harness(resolver=_tracking_resolver) as (executor, runtime, _safety, _observed):
-        client = ActionClient(
-            runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill"
-        )
+        client = ActionClient(runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill")
         _spin_for(executor, 0.3)
         assert client.wait_for_server(timeout_sec=2.0)
 
@@ -1240,7 +1236,8 @@ def test_acquire_skill_still_caches_identical_dispatch() -> None:
             _await_result(handle, executor)
 
     assert calls == ['{"x": 1}'], (
-        f"an identical repeat dispatch must reuse the resident skill, not re-resolve -- got {calls!r}"
+        f"an identical repeat dispatch must reuse the resident skill, not re-resolve "
+        f"-- got {calls!r}"
     )
 
 
@@ -1264,9 +1261,7 @@ def test_second_goal_accepted_after_estop_reset_service_alone() -> None:
 
     with _compose_harness() as (executor, runtime, safety, _observed):
         del safety
-        client = ActionClient(
-            runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill"
-        )
+        client = ActionClient(runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill")
         _spin_for(executor, 0.3)
         assert client.wait_for_server(timeout_sec=2.0)
 
