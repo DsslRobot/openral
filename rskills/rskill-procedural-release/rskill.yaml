@@ -1,0 +1,48 @@
+# rSkill manifest — open the EG2-4C2 gripper (kind: procedural).
+# execution_plan.md §8.3 item 3.
+#
+# Shares its entrypoint class with rskill-procedural-grasp
+# (openral_rskill.procedural_gripper.GripperRskill) -- both command the same
+# GRIPPER_BINARY actuator every step and differ only in which joint-state
+# reading counts as done vs failed. This manifest fixes mode="open".
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-release"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "gripper_binary"
+    control_mode_semantics:
+      mode: "absolute"
+      gripper_convention: "normalized_open_unit"
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Open the EG2-4C2 parallel gripper and hold until the jaw reaches the open
+  stroke or the attempt times out. Deterministic -- no learned policy, no
+  external ROS server, no vision.
+actions:
+  - "release"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_gripper:GripperRskill"
+  default_goal_json: |
+    {
+      "mode": "open",
+      "timeout_s": 5.0,
+      "stable_steps": 3,
+      "velocity_eps_rad_s": 0.01
+    }

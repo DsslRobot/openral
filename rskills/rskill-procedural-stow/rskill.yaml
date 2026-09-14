@@ -1,0 +1,55 @@
+# rSkill manifest — stow the RM-75 arm (kind: procedural).
+# execution_plan.md §8.3 item 3.
+#
+# Same entrypoint class as rskill-procedural-move_joints -- "stow" IS
+# move_joints dispatched with no goal_params_json override, so
+# default_goal_json (the fixed stow pose below) is used verbatim. No
+# separate stow-specific behaviour exists; this manifest only fixes the
+# default target and drops the goal schema (the reasoner is not expected to
+# override a stow pose).
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-stow"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "joint_position"
+    control_mode_semantics:
+      mode: "absolute"
+      joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Fold the 7-DoF RM-75 arm into its stow pose (SRB lunarbot.py's own
+  ArticulationCfg.InitialStateCfg joint_pos -- "folded-but-visible") and hold
+  until converged or timeout. Deterministic -- no learned policy, no external
+  ROS server. Use at the end of a mission segment to leave the robot in a
+  safe/compact posture.
+actions:
+  - "reach"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_move_joints:MoveJointsRskill"
+  # The stow pose, verbatim from SRB's lunarbot.py ArticulationCfg.
+  # InitialStateCfg.joint_pos (joint1..joint7) -- the one and only target
+  # this skill commands; no goal_params_schema is published because there
+  # is nothing for the reasoner to override.
+  default_goal_json: |
+    {
+      "joint_targets": [0.0, -0.6, 0.0, 1.2, 0.0, 0.6, 0.0],
+      "tolerance_rad": 0.05,
+      "timeout_s": 15.0
+    }

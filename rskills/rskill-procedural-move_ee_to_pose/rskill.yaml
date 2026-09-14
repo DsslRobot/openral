@@ -1,0 +1,110 @@
+# rSkill manifest — deterministic CARTESIAN_TWIST servo to a TCP pose
+# (kind: procedural). execution_plan.md §8.3 item 3.
+#
+# No learned weights, no external ROS action/service server: the entrypoint
+# class closes the loop on live TF (tcp_frame vs the target pose), same
+# rationale as rskill-procedural-body_twist / -move_joints. Which pose to
+# target is entirely the caller's decision (from locate_object / world
+# state) -- this skill only knows how to servo the gripper TCP to whatever
+# pose it is given; it encodes no mission semantics.
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-move_ee_to_pose"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "cartesian_twist"
+    control_mode_semantics:
+      mode: "absolute"
+      reference_frame: "chassis_base_link"
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Servo the gripper TCP (tcp_frame -- Link7 + the arm's TCP offset) toward a
+  target pose via closed-loop CARTESIAN_TWIST, holding until both position
+  and orientation are within tolerance or the servo times out / stalls.
+  Deterministic proportional controller -- no learned policy, no external
+  ROS server. Use when you have a Cartesian target (e.g. from
+  locate_object); for a joint-space goal use rskill-procedural-move_joints
+  instead.
+actions:
+  - "reach"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_move_ee_to_pose:MoveEEToPoseRskill"
+  # Identity-ish default (chassis_base_link origin, identity rotation) --
+  # not a meaningful "no-op" target for a pose skill, only satisfies
+  # configure-time validation. The reasoner is expected to override
+  # 'position'/'quaternion_xyzw' on every real dispatch.
+  default_goal_json: |
+    {
+      "frame_id": "chassis_base_link",
+      "position": [0.0, 0.0, 0.0],
+      "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+      "pos_tolerance_m": 0.02,
+      "rot_tolerance_rad": 0.05,
+      "max_linear_speed_m_s": 0.15,
+      "max_angular_speed_rad_s": 0.2,
+      "timeout_s": 20.0,
+      "stall_timeout_s": 4.0
+    }
+
+# Per-skill JSON Schema surfaced to the Reasoner LLM tool palette.
+goal_params_schema:
+  type: object
+  description: >
+    Target TCP pose to servo the gripper to, expressed in frame_id.
+  properties:
+    frame_id:
+      type: string
+      description: "tf2 frame the target pose is expressed in (default chassis_base_link)."
+    position:
+      type: array
+      items: { type: number }
+      minItems: 3
+      maxItems: 3
+      description: "[x, y, z] target TCP position in metres."
+    quaternion_xyzw:
+      type: array
+      items: { type: number }
+      minItems: 4
+      maxItems: 4
+      description: "[x, y, z, w] target TCP orientation."
+    pos_tolerance_m:
+      type: number
+      exclusiveMinimum: 0
+      description: "Position convergence tolerance (metres)."
+    rot_tolerance_rad:
+      type: number
+      exclusiveMinimum: 0
+      description: "Orientation convergence tolerance (radians)."
+    max_linear_speed_m_s:
+      type: number
+      exclusiveMinimum: 0
+      description: "Speed cap; must stay under the kernel's max_ee_speed_m_s envelope."
+    max_angular_speed_rad_s:
+      type: number
+      exclusiveMinimum: 0
+      description: "Angular speed cap; must stay under max_ee_angular_speed_rad_s."
+    timeout_s:
+      type: number
+      exclusiveMinimum: 0
+      description: "Seconds to wait for convergence before giving up."
+    stall_timeout_s:
+      type: number
+      exclusiveMinimum: 0
+      description: "Seconds of no measurable progress before giving up."
+  required: ["position", "quaternion_xyzw"]

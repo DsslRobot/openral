@@ -1,0 +1,50 @@
+# rSkill manifest — close the EG2-4C2 gripper and detect a grasp
+# (kind: procedural). execution_plan.md §8.3 item 3.
+#
+# Shares its entrypoint class with rskill-procedural-release
+# (openral_rskill.procedural_gripper.GripperRskill) -- both command the same
+# GRIPPER_BINARY actuator every step and differ only in which joint-state
+# reading counts as done vs failed. This manifest fixes mode="close".
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-grasp"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "gripper_binary"
+    control_mode_semantics:
+      mode: "absolute"
+      gripper_convention: "normalized_open_unit"
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Close the EG2-4C2 parallel gripper and detect the outcome from joint
+  motion: succeeds when the jaw stops moving short of the fully-closed
+  stroke (something is between the jaws); fails if the jaw reaches the
+  fully-closed stroke (nothing grasped) or on timeout. Deterministic -- no
+  learned policy, no external ROS server, no vision.
+actions:
+  - "grasp"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_gripper:GripperRskill"
+  default_goal_json: |
+    {
+      "mode": "close",
+      "timeout_s": 5.0,
+      "stable_steps": 3,
+      "velocity_eps_rad_s": 0.01
+    }
