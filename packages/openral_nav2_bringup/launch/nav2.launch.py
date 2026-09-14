@@ -153,6 +153,18 @@ def generate_launch_description() -> LaunchDescription:
             ),
         ),
         DeclareLaunchArgument(
+            "pointcloud_to_laserscan",
+            default_value="true",
+            description=(
+                "Run `pointcloud_to_laserscan_node` alongside Nav2: converts "
+                "`/openral/lidar/points` into `/scan` for robots whose only "
+                "lidar is a 3-D point cloud (e.g. LunarBot's Mid-360) rather "
+                "than a native 2-D scan (§8.3 item 5). Lidar backend only "
+                "(mirrors `payload_scan_filter`). Requires "
+                "`ros-humble-pointcloud-to-laserscan`."
+            ),
+        ),
+        DeclareLaunchArgument(
             "cmd_vel_relay",
             default_value="true",
             description=(
@@ -351,6 +363,15 @@ def _nav2_include_with_robot_overrides(context: object) -> list[object]:
         actions.extend(
             _payload_scan_filter_nodes(
                 robot_yaml=robot_yaml,
+                slam_backend=slam_backend,
+                use_sim_time=use_sim_time.strip().lower() in ("true", "1", "yes"),
+            )
+        )
+    pointcloud_to_laserscan = LaunchConfiguration("pointcloud_to_laserscan").perform(context)  # type: ignore[attr-defined]
+    if pointcloud_to_laserscan.strip().lower() in ("true", "1", "yes"):
+        use_sim_time = LaunchConfiguration("use_sim_time").perform(context)  # type: ignore[attr-defined]
+        actions.extend(
+            _pointcloud_to_laserscan_nodes(
                 slam_backend=slam_backend,
                 use_sim_time=use_sim_time.strip().lower() in ("true", "1", "yes"),
             )
