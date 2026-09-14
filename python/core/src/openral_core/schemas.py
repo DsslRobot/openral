@@ -5844,6 +5844,7 @@ EmbodimentTag: TypeAlias = Literal[
     "pusht",
     "rizon4",
     "r1pro",
+    "rm75",
     "sawyer",
     "so100_follower",
     "so101_follower",
@@ -5874,6 +5875,16 @@ base + ``body_twist`` actuator declares it so base-only rSkills (Nav2
 NavigateToPose, etc.) can target the whole class without naming each specific
 mobile platform. Robot-specific tags (e.g. ``"panda_mobile"``) coexist on the
 same ``RobotDescription`` for skills that DO depend on the specific composition.
+
+``"rm75"`` is likewise a CLASS tag: any robot carrying a RealMan RM-75 7-DoF
+arm declares it (today: ``lunar_bot``) so the generic ``rskill-moveit-*``
+family (§8.3 item 6, ``robots/lunar_bot/robot.yaml``) can target the arm
+without a robot-specific manifest, the same way ``franka_panda``/``ur5e``/etc.
+already do for their respective arms in that same manifest's
+``embodiment_tags``. The MoveIt config (URDF/SRDF/kinematics) lives in
+``packages/rm_description/`` + ``packages/rm_75_config/`` — vendored from
+RealMan's own ``ros2_rm_robot``, see ``docs/research_findings.md`` F31 (in
+the research harness repo) for the license/provenance decision.
 
 The ``RSkillManifest.embodiment_tags`` field is restricted to this set so a
 typo or framework hint (``lerobot``, ``libero``) cannot land in a manifest

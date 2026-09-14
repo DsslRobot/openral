@@ -1048,6 +1048,15 @@ const LAYERS = [
         schemas: ["RSkillManifest", "RosIntegration", "Action"],
       },
       {
+        title: "RM-75 MoveIt config (vendored)",
+        pkg: "packages/rm_description · packages/rm_75_config",
+        status: "yellow",
+        desc: "MoveIt2 config for the RM-75 arm (lunar_bot's manipulator, §8.3 item 6) so the generic rskill-moveit-* family / ROSActionRskill above can target it the same way it already targets franka_panda/ur5e/etc. — no new adapter code, just a new EmbodimentTag member (\"rm75\", a CLASS tag like \"mobile_base\") plus config. Filtered/vendored from RealMan's own ros2_rm_robot (rm_description + rm_moveit2_config/rm_75_config, commit c941b565, branch humble) rather than hand-derived: joint names/limits already matched robots/lunar_bot/robot.yaml's (joint1..joint7, Link1..Link7) once the seven position limits were tightened from upstream's rounded values to the exact datasheet ones (F22's source). Upstream's own license is undeclared/ambiguous (package.xml TODO / bare BSD with no license text) — vendored under a recorded research-use exception, not a clean grant; see docs/research_findings.md F31 (research harness repo) and each package's NOTICE.md before upstreaming or publishing standalone. rm_group's chain root is the arm's own base_link, not lunar_bot's chassis_base_link (known gap, arm planned in isolation — same pattern the existing Franka demo config already uses). Status yellow: offline-verified only this session (xacro expansion, check_urdf, SRDF↔URDF cross-check, RSkillManifest/RobotDescription schema validation all pass) — live dispatch of rskill-moveit-eef-pose against the running kernel/SRB graph not yet run.",
+        inputs: ["rm_description: RM-75 URDF + 8 meshes (base_link, link1..link7)"],
+        outputs: ["rm_75_config: move_group (/move_action) via demo.launch.py's MoveItConfigsBuilder — SRDF (rm_group: base_link..Link7), kinematics.yaml (KDL), joint_limits.yaml, moveit_controllers.yaml"],
+        schemas: ["EmbodimentTag (+\"rm75\")", "RSkillManifest", "RobotDescription"],
+      },
+      {
         title: "ROSPublishingHAL (F1)",
         pkg: "python/runner · openral_runner.ros_publishing_hal",
         status: "green",
