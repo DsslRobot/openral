@@ -5836,6 +5836,7 @@ EmbodimentTag: TypeAlias = Literal[
     "google_robot",
     "gr1",
     "h1",
+    "lunar_bot",
     "mobile_base",
     "multi",
     "openarm",

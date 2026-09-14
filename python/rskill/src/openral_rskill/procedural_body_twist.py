@@ -60,7 +60,13 @@ class ProceduralBodyTwistRskill(rSkillBase):
         prompt: str,
         prompt_metadata_json: str,
         goal_params_json: str = "",
+        tf_lookup: Any = None,
     ) -> None:
+        del tf_lookup  # unused — a fixed body-twist hold needs no TF feedback;
+        # accepted so every `kind: procedural` skill shares one constructor
+        # shape (`make_default_skill_resolver`'s procedural branch forwards
+        # it uniformly — see `procedural_move_ee_to_pose.py` for the skill
+        # that actually consumes it).
         if manifest.procedural is None:
             raise ROSConfigError(
                 f"ProceduralBodyTwistRskill requires manifest.procedural (kind={manifest.kind!r}); "
