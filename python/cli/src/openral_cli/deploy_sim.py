@@ -2042,8 +2042,26 @@ def _cmdline_is_openral_graph_process(cmdline: str) -> bool:
     )
 
 
+_ORPHAN_GROUP_LEADER_NEEDLES: tuple[str, ...] = ("tools/process_group_wrapper.py",)
+"""argv signatures of graph processes that must be SIGTERMed, never SIGKILLed.
+
+These are process-group leaders (``os.setsid``) that forward a SIGTERM to
+their whole group and escalate to SIGKILL themselves; killing the leader
+outright would orphan the group it guards. Today: the external simulator
+wrapper spawned by ``deploy_e2e.launch.py`` around ``srb agent ros``.
+"""
+
+
+def _cmdline_is_process_group_leader(cmdline: str) -> bool:
+    """Return True when ``cmdline`` is one of our group-leader wrappers."""
+    return any(needle in cmdline for needle in _ORPHAN_GROUP_LEADER_NEEDLES)
+
+
 def _kill_orphan_openral_graph_processes() -> int:
     """SIGKILL orphaned openral-graph processes from a prior ``openral deploy sim``.
+
+    Group-leader wrappers (``_ORPHAN_GROUP_LEADER_NEEDLES``) get SIGTERM
+    instead, so they take their whole group down rather than orphaning it.
 
     A graceful ``Ctrl-C`` doesn't always propagate through ``ros2
     launch`` to every child — under load, the launch dispatcher
@@ -2095,6 +2113,17 @@ def _kill_orphan_openral_graph_processes() -> int:
             )
         except (FileNotFoundError, PermissionError):
             continue
+        if _cmdline_is_process_group_leader(cmdline):
+            # The external-simulator wrapper (``tools/process_group_wrapper.py``)
+            # is a session leader whose only job is to take its whole group
+            # (Isaac Sim's ``python.sh`` → kit-python) down with it: SIGTERM
+            # lets it do that, then escalate to SIGKILL on its own. SIGKILLing
+            # the wrapper itself would orphan the multi-GiB kit process — the
+            # exact leak the wrapper exists to prevent.
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+            continue
         if not _cmdline_is_openral_graph_process(cmdline):
             continue
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
@@ -2124,6 +2153,24 @@ def _terminate_launch_group(proc: subprocess.Popen[bytes], *, grace_s: float = 1
         os.killpg(proc.pid, signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=5.0)
+
+
+_SIGNAL_RESET_TRAMPOLINE: Final[str] = (
+    "import os, signal, sys; "
+    "[signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]; "
+    "os.execvp(sys.argv[1], sys.argv[1:])"
+)
+"""``python -c`` body that resets the shutdown signals to default, then ``exec``s argv.
+
+Used instead of ``preexec_fn`` (unsafe in a threaded parent, ruff PLW1509):
+the trampoline ``exec``s in place, so the launch keeps the ``Popen`` PID and
+``killpg`` semantics are unchanged.
+"""
+
+
+def _with_default_signal_dispositions(argv: list[str]) -> list[str]:
+    """Wrap ``argv`` so it starts with SIGINT/SIGTERM/SIGHUP at ``SIG_DFL``."""
+    return [sys.executable, "-c", _SIGNAL_RESET_TRAMPOLINE, *argv]
 
 
 def _run_launch(argv: list[str], env: dict[str, str], *, grace_s: float = 12.0) -> int:
@@ -2162,8 +2209,20 @@ def _run_launch(argv: list[str], env: dict[str, str], *, grace_s: float = 12.0) 
 
     Returns the launch process's exit code (0 if it exited via signal
     with no recorded returncode).
+
+    The launch is started with default signal dispositions
+    (``_with_default_signal_dispositions``). A CLI started in the
+    background of a non-interactive shell (``openral deploy sim … &`` in a
+    script, the normal shape of an experiment runner) inherits
+    ``SIGINT=SIG_IGN`` per POSIX, and CPython leaves an ignored SIGINT
+    ignored — so ``ros2 launch`` never saw the SIGINT stage 1 forwards,
+    never ran its shutdown, and the external simulator (in its own session,
+    unreachable by ``killpg``) kept ticking after every node had exited
+    (observed live 2026-09-14, twice).
     """
-    proc = subprocess.Popen(argv, env=env, start_new_session=True)
+    proc = subprocess.Popen(
+        _with_default_signal_dispositions(argv), env=env, start_new_session=True
+    )
 
     def _forward(_signum: int, _frame: object) -> None:
         with contextlib.suppress(ProcessLookupError, OSError):
