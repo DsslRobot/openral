@@ -97,6 +97,25 @@ SRB_SENSOR_TF_SOURCE = {
 #: (item 2's full set — see `docs/lunar_bot_capability_set_plan.md` §3.2).
 REQUIRED_SENSOR_NAMES = ("front", "front_depth", "wrist", "imu", "lidar")
 
+#: The arm's flange body — SRB's ``RosInterface._broadcast_transforms``
+#: publishes a live TF frame for every body of every articulation
+#: (``srb/env{i}/{asset_name}/{body_name}``, not just declared sensors), so
+#: ``Link7`` is already on ``/tf`` under the robot articulation root with no
+#: SRB-side change needed — confirmed by reading
+#: ``srb/interfaces/interface/ros.py``'s per-articulation body loop.
+LINK7_BODY_NAME = "Link7"
+#: Tool-centre-point offset from ``Link7`` along its own +Z axis — must stay
+#: numerically identical to SRB's ``lunarbot.py`` ``_TCP_OFFSET`` (also fed
+#: into ``SwitchableArmActionCfg.OffsetCfg`` there, so it is already the
+#: pose the arm's IK controller itself targets); duplicated here rather than
+#: imported because this package does not depend on the SRB submodule, the
+#: same rationale as ``openral_hal.lunar_bot_srb``'s calibration constants.
+_TCP_OFFSET = (0.0, 0.0, 0.140)
+#: Published child frame for the gripper TCP (execution_plan.md §8.3 item 3:
+#: "the TCP frame: Link7 + _TCP_OFFSET, exposed by the sensor bridge as
+#: tcp_frame on TF so the skill and the verifier use one definition").
+TCP_FRAME_ID = "tcp_frame"
+
 
 def rotate_vector_by_quat_xyzw(
     vx: float, vy: float, vz: float, qx: float, qy: float, qz: float, qw: float
@@ -444,6 +463,7 @@ if _ROS2_AVAILABLE:
 
         def _on_tick(self) -> None:
             self._publish_sensor_frames()
+            self._publish_tcp_frame()
             self._publish_odom()
 
         def _lookup(self, target_frame: str, source_frame: str) -> TransformStamped | None:
@@ -471,6 +491,37 @@ if _ROS2_AVAILABLE:
                 out.child_frame_id = self._sensors[manifest_name].frame_id
                 out.transform = tf.transform
                 self._tf_broadcaster.sendTransform(out)
+
+        def _publish_tcp_frame(self) -> None:
+            """Broadcast ``chassis_base_link -> tcp_frame`` (``Link7`` + ``_TCP_OFFSET``).
+
+            ``Link7``'s own TF (``<robot_tf_frame>/Link7``) is a direct child
+            of ``robot_tf_frame`` (an articulation body, not a sensor — see
+            ``LINK7_BODY_NAME``'s docstring), and this bridge already treats
+            ``chassis_base_link`` as coincident with ``robot_tf_frame``'s
+            pose (``_publish_odom``), so no extra lookup against
+            ``chassis_base_link`` is needed: ``T(robot_tf_frame <- Link7)``
+            IS ``T(chassis_base_link <- Link7)`` under that same assumption.
+            The TCP offset is applied in ``Link7``'s own frame (rotated into
+            the base frame, then added) — matching ``SwitchableArmActionCfg
+            .OffsetCfg(pos=_TCP_OFFSET)``'s position-only, identity-rotation
+            offset in ``lunarbot.py``.
+            """
+            tf = self._lookup(self._robot_tf_frame, f"{self._robot_tf_frame}/{LINK7_BODY_NAME}")
+            if tf is None:
+                return
+            t = tf.transform.translation
+            r = tf.transform.rotation
+            ox, oy, oz = rotate_vector_by_quat_xyzw(*_TCP_OFFSET, r.x, r.y, r.z, r.w)
+            out = TransformStamped()
+            out.header.stamp = self.get_clock().now().to_msg()
+            out.header.frame_id = self._base_frame
+            out.child_frame_id = TCP_FRAME_ID
+            out.transform.translation.x = t.x + ox
+            out.transform.translation.y = t.y + oy
+            out.transform.translation.z = t.z + oz
+            out.transform.rotation = r
+            self._tf_broadcaster.sendTransform(out)
 
         def _publish_odom(self) -> None:
             """Broadcast ``odom -> chassis_base_link`` and ``/odom`` from SRB truth."""
