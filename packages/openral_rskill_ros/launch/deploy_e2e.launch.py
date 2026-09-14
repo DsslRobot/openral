@@ -1576,11 +1576,28 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
 
     # A ROS-attached external simulator (SRB today) — sim path only
     # (DeployScene.simulator is ignored by `deploy run`, which talks to real
-    # hardware). Spawned and owned by this launch: `ros2 launch` tracks its
-    # exact PID and terminates it on shutdown (never a pattern match). The
-    # HAL's own `configure` is gated on `simulator.ready_topics` via the HAL
-    # autostart invocation below, not here — this action only starts the
-    # process; readiness is a separate concern.
+    # hardware). Spawned and owned by this launch. The HAL's own `configure`
+    # is gated on `simulator.ready_topics` via the HAL autostart invocation
+    # below, not here — this action only starts the process; readiness is a
+    # separate concern.
+    #
+    # Routed through tools/process_group_wrapper.py, NOT run directly —
+    # confirmed live 2026-09-14 that this matters: SRB's own interpreter
+    # (Isaac Sim's `python.sh`) forks its real Kit/PhysX process WITHOUT
+    # `exec` (`$python_exe "$@" || error_exit`, no `exec` — read verbatim
+    # from the installed script), and `launch.actions.execute_local.
+    # ExecuteLocal` has no process-group handling anywhere in its source (no
+    # setsid/killpg — confirmed by reading it): it only ever signals the one
+    # PID it directly spawned. A bare `ExecuteProcess` here would kill only
+    # the bash wrapper on shutdown, orphaning the actual Kit process — which
+    # was observed surviving over an hour afterward, still holding several
+    # GB of GPU memory with zero ROS topics publishing. The wrapper makes
+    # this process a new process-group leader and kills the WHOLE group
+    # (every descendant, however many non-exec forks deep) on SIGTERM/
+    # SIGINT — see its own module docstring and
+    # tests/unit/test_process_group_wrapper.py (which reproduces the exact
+    # failure mode and proves the fix with a real subprocess tree, not a
+    # mock).
     if hal_mode == "sim" and scene_simulator is not None:
         _sim_env = dict(os.environ)
         for _unset_key in scene_simulator.env_unset:
@@ -1594,9 +1611,10 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
         _sim_env.update(
             {k: os.path.expanduser(os.path.expandvars(v)) for k, v in scene_simulator.env_set.items()}
         )
+        _process_group_wrapper_path = str(_REPO_ROOT / "tools" / "process_group_wrapper.py")
         extra_nodes.append(
             ExecuteProcess(
-                cmd=list(scene_simulator.argv),
+                cmd=[sys.executable, _process_group_wrapper_path, "--", *scene_simulator.argv],
                 cwd=scene_simulator.cwd,
                 env=_sim_env,
                 name="openral_deploy_sim_external_simulator",

@@ -189,3 +189,54 @@ def test_drive_transition_raises_on_genuine_failure() -> None:
             transition_label="configure",
             transition_timeout_s=300.0,
         )
+
+
+class _FakeTopicNode:
+    """Fakes just enough of ``rclpy.node.Node`` for ``_wait_for_topic_publishers``.
+
+    ``publisher_counts`` maps topic -> a list of successive
+    ``count_publishers`` results, popped one per call (mirrors
+    ``_FakeGetStateClient``'s "successive values, hold the last" shape) so a
+    test can simulate a topic gaining a publisher partway through the wait.
+    """
+
+    def __init__(self, publisher_counts: dict[str, list[int]]) -> None:
+        self._counts = publisher_counts
+        self.spin_once_calls = 0
+
+    def count_publishers(self, topic: str) -> int:
+        values = self._counts[topic]
+        return values.pop(0) if len(values) > 1 else values[0]
+
+
+def test_wait_for_topic_publishers_returns_empty_when_all_present() -> None:
+    """Every topic already has a publisher — no polling needed, nothing missing."""
+    mod = _load_tool()
+    fake_rclpy = _patch_runtime(mod)
+    node = _FakeTopicNode({"/clock": [1], "/srb/env0/robot/joint_states": [1]})
+    missing = mod._wait_for_topic_publishers(
+        node, ["/clock", "/srb/env0/robot/joint_states"], timeout_s=5.0
+    )
+    assert missing == []
+    assert fake_rclpy.spin_timeouts == []  # never had to poll
+
+
+def test_wait_for_topic_publishers_polls_until_publisher_appears() -> None:
+    """A topic with no publisher yet is polled (spin_once) until it gains one."""
+    mod = _load_tool()
+    _patch_runtime(mod)
+    node = _FakeTopicNode({"/clock": [0, 0, 1]})
+    missing = mod._wait_for_topic_publishers(node, ["/clock"], timeout_s=5.0)
+    assert missing == []
+    assert node.count_publishers("/clock") == 1  # settled, not still cycling
+
+
+def test_wait_for_topic_publishers_reports_still_missing_at_timeout() -> None:
+    """A topic that never gains a publisher is reported missing, not raised."""
+    mod = _load_tool()
+    _patch_runtime(mod)  # _FakeTime.monotonic() ticks 1.0/call -> deadline hit fast
+    node = _FakeTopicNode({"/clock": [0], "/srb/env0/robot/joint_states": [1]})
+    missing = mod._wait_for_topic_publishers(
+        node, ["/clock", "/srb/env0/robot/joint_states"], timeout_s=2.0
+    )
+    assert missing == ["/clock"]
