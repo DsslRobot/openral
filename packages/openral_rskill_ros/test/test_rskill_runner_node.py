@@ -639,7 +639,9 @@ def test_safety_latch_during_apply_wait_is_named_in_the_result() -> None:
     assert elapsed < 4.0, f"safety abort took {elapsed:.2f}s — the apply-wait ran to its timeout"
 
 
-def _send_goal(client: Any, executor: Any, *, prompt: str, deadline_s: float) -> Any:
+def _send_goal(
+    client: Any, executor: Any, *, prompt: str, deadline_s: float, goal_params_json: str = ""
+) -> Any:
     """Send an ExecuteRskill goal and spin until accepted; return the goal handle."""
     from openral_msgs.action import ExecuteRskill
 
@@ -648,6 +650,7 @@ def _send_goal(client: Any, executor: Any, *, prompt: str, deadline_s: float) ->
     goal.revision = ""
     goal.prompt = prompt
     goal.prompt_metadata_json = ""
+    goal.goal_params_json = goal_params_json
     goal.deadline_s = deadline_s
     send_future = client.send_goal_async(goal)
     deadline = time.monotonic() + 5.0
@@ -1164,3 +1167,155 @@ def test_successful_goal_reports_failure_kind_none() -> None:
     assert result.success, result.failure_reason
     assert result.failure_reason == ""
     assert result.failure_kind == ExecuteRskill.Result.FAILURE_NONE
+
+
+def test_acquire_skill_reconfigures_on_goal_params_change() -> None:
+    """A second dispatch of the same rskill_id with DIFFERENT goal_params_json must
+    re-resolve/reconfigure, not silently reuse the first dispatch's resident skill.
+
+    Regression test for the bug found live-testing MoveIt this session (F30/F33,
+    docs/research_findings.md, research repo): ``_acquire_skill``'s cache key used
+    to be ``(rskill_id, revision, prompt)`` only, so a second dispatch with the
+    same rskill_id + prompt but different goal_params_json reused the stale
+    already-configured instance and silently ignored the new params. Keeping
+    ``prompt`` identical across both dispatches here is deliberate — varying it
+    would exercise the part of the key that already worked before the fix and
+    prove nothing about the actual bug.
+    """
+    calls: list[str] = []
+
+    def _tracking_resolver(*, goal_params_json: str = "", **_k: Any) -> Any:
+        calls.append(goal_params_json)
+        return _make_constant_skill()
+
+    from openral_msgs.action import ExecuteRskill
+    from rclpy.action import ActionClient
+
+    with _compose_harness(resolver=_tracking_resolver) as (executor, runtime, _safety, _observed):
+        client = ActionClient(runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill")
+        _spin_for(executor, 0.3)
+        assert client.wait_for_server(timeout_sec=2.0)
+
+        handle1 = _send_goal(
+            client, executor, prompt="same prompt", deadline_s=0.8, goal_params_json='{"x": 1}'
+        )
+        _await_result(handle1, executor)
+        handle2 = _send_goal(
+            client, executor, prompt="same prompt", deadline_s=0.8, goal_params_json='{"x": 2}'
+        )
+        _await_result(handle2, executor)
+
+    assert calls == ['{"x": 1}', '{"x": 2}'], (
+        "the resolver must run again when goal_params_json changes even with an "
+        f"identical rskill_id/prompt -- got {calls!r} (length 1 means the second "
+        "dispatch silently reused the stale resident skill instead of "
+        "reconfiguring with the new params)"
+    )
+
+
+def test_acquire_skill_still_caches_identical_dispatch() -> None:
+    """A byte-identical repeat dispatch must still reuse the resident skill (no regression)."""
+    calls: list[str] = []
+
+    def _tracking_resolver(*, goal_params_json: str = "", **_k: Any) -> Any:
+        calls.append(goal_params_json)
+        return _make_constant_skill()
+
+    from openral_msgs.action import ExecuteRskill
+    from rclpy.action import ActionClient
+
+    with _compose_harness(resolver=_tracking_resolver) as (executor, runtime, _safety, _observed):
+        client = ActionClient(runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill")
+        _spin_for(executor, 0.3)
+        assert client.wait_for_server(timeout_sec=2.0)
+
+        for _ in range(2):
+            handle = _send_goal(
+                client, executor, prompt="same prompt", deadline_s=0.8, goal_params_json='{"x": 1}'
+            )
+            _await_result(handle, executor)
+
+    assert calls == ['{"x": 1}'], (
+        f"an identical repeat dispatch must reuse the resident skill, not re-resolve "
+        f"-- got {calls!r}"
+    )
+
+
+def test_second_goal_accepted_after_estop_reset_service_alone() -> None:
+    """F17/F33: the kernel's real ``/openral/estop_reset`` service must unlatch the runner
+    on its own -- no separate ``/openral/estop_cleared`` broadcast required.
+
+    Reproduces this session's live bug exactly: calling only the real
+    ``/openral/estop_reset`` service (never publishing ``/openral/estop_cleared``)
+    used to leave the runner's own latch set, so a second goal was rejected
+    outright even though ``/openral/safety_status`` correctly reported
+    ``latched: false`` afterward. Uses the real ``SafetyPassthroughNode`` (not a
+    double) for both the estop-reset service and the ``SafetyStatus`` publish.
+    """
+    import rclpy
+    from openral_msgs.action import ExecuteRskill
+    from rclpy.action import ActionClient
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+    from std_msgs.msg import Empty
+    from std_srvs.srv import Trigger
+
+    with _compose_harness() as (executor, runtime, safety, _observed):
+        del safety
+        client = ActionClient(runtime.skill_runner_node, ExecuteRskill, "/openral/execute_rskill")
+        _spin_for(executor, 0.3)
+        assert client.wait_for_server(timeout_sec=2.0)
+
+        helper = rclpy.create_node("openral_skill_runner_estop_reset_test")
+        executor.add_node(helper)
+        estop_qos = QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE, depth=10)
+        estop_pub = helper.create_publisher(Empty, "/openral/estop", estop_qos)
+        _spin_for(executor, 0.2)
+        estop_pub.publish(Empty())
+        _spin_for(executor, 0.3)
+
+        # A goal while latched must be rejected outright (sanity check that the
+        # latch is really armed before testing recovery from it).
+        goal = ExecuteRskill.Goal()
+        goal.rskill_id = "openral/test-constant-skill"
+        goal.prompt = "should be rejected while latched"
+        goal.deadline_s = 0.5
+        send_future = client.send_goal_async(goal)
+        deadline = time.monotonic() + 3.0
+        while not send_future.done() and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.02)
+        assert send_future.done()
+        rejected_handle = send_future.result()
+        assert rejected_handle is not None and not rejected_handle.accepted, (
+            "expected the goal to be rejected while the runner is estop-latched"
+        )
+
+        # Past the default estop_reset_cooldown_s (500 ms) so the reset is valid.
+        _spin_for(executor, 0.6)
+
+        reset_client = helper.create_client(Trigger, "/openral/estop_reset")
+        assert reset_client.wait_for_service(timeout_sec=2.0)
+        reset_future = reset_client.call_async(Trigger.Request())
+        deadline = time.monotonic() + 3.0
+        while not reset_future.done() and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.02)
+        assert reset_future.done()
+        reset_result = reset_future.result()
+        assert reset_result is not None and reset_result.success, reset_result
+
+        # Let the resulting SafetyStatus(latched=False) publish reach the runner.
+        _spin_for(executor, 0.3)
+
+        # `_send_goal` itself asserts `handle.accepted` -- the actual point of
+        # this test (the runner's `_goal_cb` rejects outright while latched;
+        # acceptance here proves the latch actually cleared). The constant
+        # skill never signals completion on its own, so don't require
+        # `success` -- a deadline-exceeded *after* being accepted and ticking
+        # is a fine outcome; a safety-estop failure would mean the latch
+        # never actually cleared.
+        handle2 = _send_goal(client, executor, prompt="should now be accepted", deadline_s=2.0)
+        result2 = _await_result(handle2, executor)
+        helper.destroy_node()
+
+    assert result2.result.failure_kind != ExecuteRskill.Result.FAILURE_SAFETY_ESTOP, (
+        result2.result.failure_reason
+    )

@@ -385,6 +385,7 @@ if _ROS2_AVAILABLE:
             self._safe_group_count: int = 0
             self._estop_sub: Any = None
             self._estop_reset_sub: Any = None
+            self._safety_status_sub: Any = None
             # Decouple the cheap, latency-sensitive publishers (odom /
             # joint_state / TF) from the single executor thread, which is
             # head-of-line-blocked by env.step + render + scan raycast. They run
@@ -677,6 +678,28 @@ if _ROS2_AVAILABLE:
             self._estop_reset_sub = self.create_subscription(
                 Empty, "/openral/estop_cleared", self._on_estop_cleared, estop_qos
             )
+            # F17/F33 — a second, independent recovery path: the kernel's own
+            # /openral/estop_reset already publishes an unlatched
+            # /openral/safety_status (ADR-0096); watching it directly means a
+            # caller only needs to call that ONE service instead of also
+            # remembering to separately publish /openral/estop_cleared (the
+            # gap live-tested this session — forgetting the second broadcast
+            # left this node latched even after the kernel had recovered and
+            # said so on this very topic). _on_estop_cleared keeps working
+            # unchanged.
+            from openral_msgs.msg import SafetyStatus
+
+            safety_status_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                depth=1,
+            )
+            self._safety_status_sub = self.create_subscription(
+                SafetyStatus,
+                "/openral/safety_status",
+                self._on_safety_status,
+                safety_status_qos,
+            )
             rate_hz: float = (
                 self.get_parameter("publish_rate_hz").get_parameter_value().double_value
             )
@@ -723,6 +746,9 @@ if _ROS2_AVAILABLE:
             if self._estop_reset_sub is not None:
                 self.destroy_subscription(self._estop_reset_sub)
                 self._estop_reset_sub = None
+            if self._safety_status_sub is not None:
+                self.destroy_subscription(self._safety_status_sub)
+                self._safety_status_sub = None
             if self._action_applied_pub is not None:
                 self.destroy_publisher(self._action_applied_pub)
                 self._action_applied_pub = None
@@ -1252,6 +1278,23 @@ if _ROS2_AVAILABLE:
                 ral_metrics.get_hal_estop_count().add(1, {semconv.LABEL_HAL_ADAPTER: adapter})
             except Exception as exc:  # reason: telemetry must never disturb the stop path
                 self.get_logger().warning(f"estop telemetry failed: {exc!s}")
+
+        def _on_safety_status(self, msg: object) -> None:
+            """Auto-clear the estop latch when the kernel reports ``latched: false`` (F17/F33).
+
+            Delegates into ``_on_estop_cleared`` — same per-HAL recovery
+            policy (``RESETTABLE`` calls ``reset_estop()``,
+            ``RESTART_REQUIRED`` stays latched), not a bypass of it. This is
+            a second trigger for the same clearing logic, not a second
+            clearing mechanism: the kernel's own ``/openral/estop_reset``
+            already produces this message, so a caller no longer also has to
+            remember the separate ``/openral/estop_cleared`` broadcast for
+            this node to notice recovery (the gap live-tested this session —
+            forgetting it left the HAL latched, silently dropping every
+            ``safe_action``, even after the kernel had already recovered).
+            """
+            if self._estopped and not bool(getattr(msg, "latched", True)):
+                self._on_estop_cleared(msg)
 
         def _on_estop_cleared(self, _msg: object) -> None:
             """Clear the estop latch when the reset authority broadcasts /openral/estop_cleared.
