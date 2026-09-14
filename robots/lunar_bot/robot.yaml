@@ -109,58 +109,66 @@ joints:
     child_link: "rear_right_wheel_link"
     velocity_limit: 41.4458
     effort_limit: 48.512
-  # -- Arm (7-DoF RealMan RM-75) -- lunarbot.py's "arm" ImplicitActuatorCfg,
-  # per-joint effort/velocity limits. Driven via CARTESIAN_TWIST and (as of
-  # 2026-09-13) JOINT_POSITION -- both through SRB's single switchable arm
-  # action term, whose own controller picks which sub-command actually
-  # drives the joints each step (see the module header comment).
-  # `position_limits` is deliberately NOT declared here -- no real RM-75
-  # joint-range spec was available to source it from (CLAUDE.md's "truth
-  # over plausibility": don't invent a number), so the safety kernel's
-  # JOINT_POSITION per-joint check (which DOES exist and DOES run --
-  # unlike CARTESIAN_TWIST/BODY_TWIST before this session's fixes) resolves
-  # to +/-inf for these 7 joints today. A real gap, not a silent one: flag
-  # before relying on JOINT_POSITION for anything safety-relevant.
+  # -- Arm (7-DoF RealMan RM-75) -- driven via CARTESIAN_TWIST and
+  # JOINT_POSITION, both through SRB's single switchable arm action term,
+  # whose own controller picks which sub-command actually drives the joints
+  # each step (see the module header comment).
+  #
+  # position_limits: the RM-75 datasheet's joint ranges (degrees -> radians,
+  # 4 dp), supplied by the robot's owner and recorded in the research repo's
+  # docs/lunar_bot_rm75_spec.md: J1 +/-178, J2 +/-130, J3 +/-178, J4 +/-135,
+  # J5 +/-178, J6 +/-128, J7 +/-360. The safety kernel's JOINT_POSITION
+  # per-joint bound check compares every commanded target against these.
+  # velocity_limit: datasheet max joint speed, J1-J2 180 deg/s, J3-J7
+  # 225 deg/s -- identical to lunarbot.py's "arm" ImplicitActuatorCfg.
+  # effort_limit: from lunarbot.py (the datasheet gives no per-joint torque).
   - name: "joint1"
     joint_type: "revolute"
     parent_link: "chassis_base_link"
     child_link: "Link1"
+    position_limits: [-3.1067, 3.1067]
     velocity_limit: 3.14
     effort_limit: 60.0
   - name: "joint2"
     joint_type: "revolute"
     parent_link: "Link1"
     child_link: "Link2"
+    position_limits: [-2.2689, 2.2689]
     velocity_limit: 3.14
     effort_limit: 60.0
   - name: "joint3"
     joint_type: "revolute"
     parent_link: "Link2"
     child_link: "Link3"
+    position_limits: [-3.1067, 3.1067]
     velocity_limit: 3.92
     effort_limit: 30.0
   - name: "joint4"
     joint_type: "revolute"
     parent_link: "Link3"
     child_link: "Link4"
+    position_limits: [-2.3562, 2.3562]
     velocity_limit: 3.92
     effort_limit: 30.0
   - name: "joint5"
     joint_type: "revolute"
     parent_link: "Link4"
     child_link: "Link5"
+    position_limits: [-3.1067, 3.1067]
     velocity_limit: 3.92
     effort_limit: 10.0
   - name: "joint6"
     joint_type: "revolute"
     parent_link: "Link5"
     child_link: "Link6"
+    position_limits: [-2.2340, 2.2340]
     velocity_limit: 3.92
     effort_limit: 10.0
   - name: "joint7"
     joint_type: "revolute"
     parent_link: "Link6"
     child_link: "Link7"
+    position_limits: [-6.2832, 6.2832]
     velocity_limit: 3.92
     effort_limit: 10.0
   # -- Gripper (Inspire EG2-4C2, 6 actuated joints, mimic-linked in SRB at the
@@ -217,7 +225,7 @@ joints:
 capabilities:
   locomotion:
     - "wheeled"
-  can_lift_kg: 0.0  # RM-75 payload not sourced from lunarbot.py; unset rather than guessed
+  can_lift_kg: 5.0  # RM-75 rated payload (datasheet, docs/lunar_bot_rm75_spec.md)
   has_dexterous_hands: false
   has_tactile: false
   has_force_control: false
@@ -254,6 +262,8 @@ safety:
   # at 0.29-0.43 m/s / 0.39-0.46 rad/s depending on pose/direction): at
   # these declared caps the HAL's raw conversion stays well inside the
   # measured range at every pose tested, not just on average.
+  # The RM-75 datasheet's mechanical TCP ceiling is 1.8 m/s; 0.2 m/s is the
+  # deliberate operational bring-up bound, never to exceed that ceiling.
   max_ee_speed_m_s: 0.2
   max_ee_angular_speed_rad_s: 0.3
 
