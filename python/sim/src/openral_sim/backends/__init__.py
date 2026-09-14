@@ -20,7 +20,9 @@ returns the bound robot or ``None``):
   belong here.** Today: ``tabletop_push`` (the greenfield robot-agnostic native
   scene — composes its table/cube/goal world onto any position-controlled arm
   via MjSpec), ``maniskill3``, ``openarm_robosuite``, ``simpler_env``,
-  ``isaac_sim`` (Isaac Lab env behind an out-of-process py3.11 sidecar).
+  ``isaac_sim`` (Isaac Lab env behind an out-of-process py3.11 sidecar),
+  ``srb`` (Space Robotics Bench — ROS-attached, not stepped through this
+  registry at all; see ``srb.py``'s module docstring).
 * **Single-robot (fixed)** — registered WITH ``fixed_robot="<id>"``. The robot
   is baked into the scene (its own MJCF / a benchmark world); the CLI rejects
   ``--robot``. These reproduce a specific embodiment + reward. Today:
@@ -78,6 +80,7 @@ def _register_backends() -> None:
         robotwin,
         simpler_env,
         so101_box,
+        srb,
         tabletop_push,
         vlabench,
     )

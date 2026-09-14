@@ -9477,6 +9477,87 @@ class LaunchInclude(BaseModel):
     args: dict[str, str] = Field(default_factory=dict)
 
 
+class ExternalSimulatorSpec(BaseModel):
+    """A ROS-attached external simulator ``deploy sim`` spawns and owns.
+
+    Some scenes are not stepped by OpenRAL at all — the sim is a separate
+    process reached only over ROS 2 topics, exactly like a real robot's
+    vendor driver (SRB/Isaac Lab today: OpenRAL never imports it, never
+    calls ``SimRollout.step``, and its ``robot.yaml`` ``hal.sim`` is the
+    *same* topic-bridge HAL class as ``hal.real`` — the only difference is
+    which process is on the other end). ``LaunchInclude`` is the analogous
+    real-path declaration (a vendor **launch file** to include); this is
+    its sim-path counterpart for a vendor **binary** to spawn, since SRB
+    has no ``ros2 launch`` entry point of its own.
+
+    The launch spawns this process before the HAL's ``configure`` and
+    blocks that transition until every ``ready_topics`` entry has a
+    publisher or ``boot_timeout_s`` elapses — the same discipline
+    ``openral_sim``'s sidecar backends use for their own out-of-process
+    boot, moved here because this process is ROS-native rather than a
+    ZMQ sidecar. On shutdown the launch terminates it by its exact spawned
+    PID, never a pattern match.
+
+    Attributes:
+        argv: Full command + arguments to spawn, e.g. ``["srb", "agent",
+            "ros", "--env", "panel_remount_visual", "--headless", …]``.
+        cwd: Working directory for the spawned process. ``None`` = the
+            launch's own cwd.
+        env_set: Environment variables to set/override for the spawned
+            process (e.g. ``ISAAC_SIM_PATH``).
+        env_unset: Environment variables to strip before spawning (e.g. a
+            conda ``CONDA_PREFIX``/``PYTHONPATH`` that would poison the
+            simulator's own interpreter resolution — see
+            ``docs/srb_integration_notes.md`` in the research repo for why
+            SRB specifically needs this).
+        env_path_exclude_substrings: Substrings that disqualify a ``PATH``
+            entry — the launch rebuilds the spawned process's ``PATH`` from
+            its own inherited one with any component containing one of
+            these dropped (e.g. ``"miniconda3"``, so a conda install ahead
+            of the system/venv Python on this host's ``PATH`` cannot shadow
+            it). Unlike ``env_unset``, ``PATH`` itself must stay set — this
+            filters its entries rather than removing the whole variable.
+            Empty = ``PATH`` passed through unfiltered.
+        ready_topics: ROS 2 topics that must each have at least one
+            publisher before the HAL is allowed to configure. Empty means
+            "don't gate" (not recommended — the HAL would race the
+            simulator's own boot).
+        boot_timeout_s: How long the readiness gate waits for
+            ``ready_topics`` before failing loudly, mirroring
+            ``openral_sim``'s sidecar ``boot_timeout_s`` contract.
+        publishes_clock: Whether this process publishes ``/clock`` — when
+            true, the graph runs on simulation time (``use_sim_time``) and
+            the HAL's own ``/clock`` publisher (present on every
+            manifest-driven HAL for the plain-wall-time case) is
+            suppressed rather than fighting over clock authority.
+        attach_existing: When true, the launch does not spawn a new
+            process — it only gates on ``ready_topics`` against whatever
+            is already running (an operator-launched simulator on a
+            second terminal, e.g. for interactive debugging).
+            ``False`` (default): always spawn and own the process, mirroring
+            ``SidecarClient``'s default posture.
+
+    Example:
+        >>> ExternalSimulatorSpec(
+        ...     argv=["srb", "agent", "ros", "--headless"],
+        ...     ready_topics=["/clock"],
+        ... ).boot_timeout_s
+        600.0
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    argv: list[str] = Field(min_length=1)
+    cwd: str | None = None
+    env_set: dict[str, str] = Field(default_factory=dict)
+    env_unset: list[str] = Field(default_factory=list)
+    env_path_exclude_substrings: list[str] = Field(default_factory=list)
+    ready_topics: list[str] = Field(default_factory=list)
+    boot_timeout_s: float = Field(default=600.0, gt=0)
+    publishes_clock: bool = False
+    attach_existing: bool = False
+
+
 class DeployRuntime(BaseModel):
     """Committed deploy-posture toggles for a workcell scene.
 
@@ -9664,6 +9745,14 @@ class DeployScene(BaseModel):
     Empty for a workcell whose sensors OpenRAL opens directly (``opencv_thread``,
     ``gstreamer``): those need no driver. Ignored on the sim path, where cameras
     are rendered rather than driven."""
+    simulator: ExternalSimulatorSpec | None = None
+    """A ROS-attached external simulator (e.g. SRB/Isaac Lab) this scene's
+    sim path spawns and owns — see ``ExternalSimulatorSpec``. ``None`` (the
+    default, every other scene) means the sim is stepped in-process via
+    ``openral_sim.SCENES``/``SimAttachedHAL`` as usual; this field is for the
+    other kind of scene, where the sim is a separate process on the ROS bus
+    the launch must bring up, gate on, and tear down — the sim-path sibling
+    of ``drivers`` (real path). Ignored by ``deploy run``."""
     hal: HalParameters | None = None
     """Deploy-time HAL binding for this workcell.
 

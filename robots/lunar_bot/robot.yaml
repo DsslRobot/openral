@@ -21,12 +21,19 @@
 #     them. Do not rely on them for collision/IK work without replacing them
 #     from the real USD tree first.
 #
-# This is a real-hardware-shaped HAL slot (`hal.real`, not `hal.sim`):
-# although SRB is a simulator, from OpenRAL's perspective it is an EXTERNAL
+# `hal.sim` AND `hal.real` point at the SAME topic-bridge adapter
+# (`LunarBotSRBHAL`) -- this HAL is transport-shaped, not physics-shaped.
+# Although SRB is a simulator, from OpenRAL's perspective it is an EXTERNAL
 # system reached only over ROS 2 topics that OpenRAL does not own or step --
 # structurally identical to how UR5eRealHAL reaches `ur_robot_driver` over
-# ROS. `hal.sim` in this codebase specifically means OpenRAL's own in-process
-# MuJoCo physics (MujocoArmHAL / SimAttachedHAL), which this is not.
+# ROS. `hal.sim` in this codebase MORE OFTEN means OpenRAL's own in-process
+# MuJoCo physics (MujocoArmHAL / SimAttachedHAL), which this is not; here it
+# just means "the process on the other end of the topics is SRB instead of
+# real hardware". `openral deploy sim` spawns and gates that SRB process
+# itself via `DeployScene.simulator` (`_ROBOT_HAL_REGISTRY["lunar_bot"]` is
+# `bare_twin_sim=True` so the launch never scene-attaches this robot through
+# `openral_sim.SCENES` — see the research repo's
+# docs/srb_deploy_backend_plan.md).
 #
 # All three actuator surfaces (base, arm, gripper) are driven through the
 # real candidate_action -> C++ safety kernel -> safe_action path -- see
@@ -57,56 +64,80 @@ base_frame: "chassis_base_link"
 joints:
   # -- Steering (4) -- effort_limit / velocity_limit from lunarbot.py's
   # "steering" ImplicitActuatorCfg (100.0 Nm / 1.9635 rad/s = 112.5 deg/s).
+  # position_limits: SRB's FourWheelSteerActionCfg.max_steering_angle
+  # (four_wheel_steer.py) hard-clamps every commanded steer angle to
+  # +/-120 deg -- the real mechanical/control limit, not a placeholder.
+  # These joints are driven only via BODY_TWIST (never JOINT_POSITION --
+  # they are not in LunarBotSRBHAL's _ARM_JOINT_NAMES), so
+  # openral_deploy_sim only needs this declared to satisfy
+  # validate_for_e2e_pipeline's e2e contract (F20: a JOINT_POSITION row is
+  # always the full 21-wide vector, zero-padded for non-arm slots -- 0.0
+  # sits well inside this range).
   - name: "chassis_to_front_left_steering_joint"
     joint_type: "revolute"
     parent_link: "chassis_base_link"
     child_link: "front_left_steering_link"
+    position_limits: [-2.0943951, 2.0943951]
     velocity_limit: 1.9635
     effort_limit: 100.0
   - name: "chassis_to_front_right_steering_joint"
     joint_type: "revolute"
     parent_link: "chassis_base_link"
     child_link: "front_right_steering_link"
+    position_limits: [-2.0943951, 2.0943951]
     velocity_limit: 1.9635
     effort_limit: 100.0
   - name: "chassis_to_rear_left_steering_joint"
     joint_type: "revolute"
     parent_link: "chassis_base_link"
     child_link: "rear_left_steering_link"
+    position_limits: [-2.0943951, 2.0943951]
     velocity_limit: 1.9635
     effort_limit: 100.0
   - name: "chassis_to_rear_right_steering_joint"
     joint_type: "revolute"
     parent_link: "chassis_base_link"
     child_link: "rear_right_steering_link"
+    position_limits: [-2.0943951, 2.0943951]
     velocity_limit: 1.9635
     effort_limit: 100.0
   # -- Wheels (4) -- "wheels" ImplicitActuatorCfg: 48.512 Nm / 41.4458 rad/s.
   # Wheel radius 0.1453 m (lunarbot.py FourWheelSteerActionCfg) -> ~6.0 m/s
   # theoretical max wheel-surface speed; the SafetyEnvelope below declares a
   # much more conservative operational bound for this first integration test.
+  # position_limits: `continuous` joints spin freely -- there is no real
+  # mechanical limit to declare. +/-1000 revolutions (1000 * 2*pi rad) is
+  # not a physical bound, just a large-enough-to-never-bind ceiling so
+  # validate_for_e2e_pipeline's e2e contract is satisfied honestly (a
+  # placeholder value would misrepresent an actual limit; this represents
+  # "effectively unbounded" instead). Driven only via BODY_TWIST, same as
+  # the steering joints above -- never JOINT_POSITION-targeted.
   - name: "front_left_steering_to_wheel_joint"
     joint_type: "continuous"
     parent_link: "front_left_steering_link"
     child_link: "front_left_wheel_link"
+    position_limits: [-6283.185307, 6283.185307]
     velocity_limit: 41.4458
     effort_limit: 48.512
   - name: "front_right_steering_to_wheel_joint"
     joint_type: "continuous"
     parent_link: "front_right_steering_link"
     child_link: "front_right_wheel_link"
+    position_limits: [-6283.185307, 6283.185307]
     velocity_limit: 41.4458
     effort_limit: 48.512
   - name: "rear_left_steering_to_wheel_joint"
     joint_type: "continuous"
     parent_link: "rear_left_steering_link"
     child_link: "rear_left_wheel_link"
+    position_limits: [-6283.185307, 6283.185307]
     velocity_limit: 41.4458
     effort_limit: 48.512
   - name: "rear_right_steering_to_wheel_joint"
     joint_type: "continuous"
     parent_link: "rear_right_steering_link"
     child_link: "rear_right_wheel_link"
+    position_limits: [-6283.185307, 6283.185307]
     velocity_limit: 41.4458
     effort_limit: 48.512
   # -- Arm (7-DoF RealMan RM-75) -- driven via CARTESIAN_TWIST and
@@ -331,6 +362,6 @@ safety:
 
 sdk_kind: "open"
 hal:
-  sim: null
+  sim: "openral_hal.lunar_bot_srb:LunarBotSRBHAL"
   real: "openral_hal.lunar_bot_srb:LunarBotSRBHAL"
 schema_version: "0.1"

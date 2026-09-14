@@ -43,3 +43,53 @@ def test_real_mode_does_not_inject_scene() -> None:
         hal_mode="real",
     )
     assert "sim_env_yaml" not in inv.hal_params
+
+
+def test_sim_mode_without_simulator_does_not_forward_deploy_config() -> None:
+    """A scene with no `simulator:` (every scene except SRB-backed ones today)
+    still does not get `deploy_config:=` in sim mode — this is the pre-existing
+    behaviour ``ExternalSimulatorSpec`` must not change for every other robot.
+    """
+    inv = resolve_launch_invocation(
+        config=_SCENE,
+        robot_override="franka_panda",
+        dashboard_port=4318,
+        reset_to_pose_service=None,
+        hal_mode="sim",
+    )
+    assert not any(arg.startswith("deploy_config:=") for arg in inv.argv_template)
+
+
+_SRB_SCENE = _REPO / "scenes/deploy/srb_panel_remount.yaml"
+
+
+def test_lunar_bot_srb_scene_is_bare_twin_not_scene_attached() -> None:
+    """lunar_bot's `bare_twin_sim=True` registry entry never injects
+    `sim_env_yaml` — it is never scene-attached through `openral_sim.SCENES`
+    (SRB is ROS-attached, not stepped; see `openral_sim.backends.srb`).
+    """
+    assert _SRB_SCENE.is_file(), f"missing fixture: {_SRB_SCENE}"
+    inv = resolve_launch_invocation(
+        config=_SRB_SCENE,
+        robot_override=None,
+        dashboard_port=4318,
+        reset_to_pose_service=None,
+        hal_mode="sim",
+    )
+    assert "sim_env_yaml" not in inv.hal_params
+    assert inv.hal.package == "openral_hal_lunar_bot"
+
+
+def test_lunar_bot_srb_scene_forwards_deploy_config_in_sim_mode() -> None:
+    """A `DeployScene.simulator` (SRB) is the one case sim mode DOES need
+    `deploy_config:=` — `compose_runtime_graph` reads it to spawn + gate the
+    external simulator process (the launch's own concern, not the HAL's).
+    """
+    inv = resolve_launch_invocation(
+        config=_SRB_SCENE,
+        robot_override=None,
+        dashboard_port=4318,
+        reset_to_pose_service=None,
+        hal_mode="sim",
+    )
+    assert f"deploy_config:={_SRB_SCENE.resolve()}" in inv.argv_template

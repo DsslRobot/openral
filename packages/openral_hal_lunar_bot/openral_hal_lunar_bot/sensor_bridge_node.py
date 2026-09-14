@@ -228,11 +228,13 @@ if _ROS2_AVAILABLE:
     from sensor_msgs.msg import CameraInfo, Image
     from sensor_msgs.msg import Imu as RosImu
     from sensor_msgs.msg import PointCloud2
-    from tf2_ros import ConnectivityException, ExtrapolationException, LookupException
-    from tf2_ros.buffer import Buffer
-    from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
-    from tf2_ros.transform_broadcaster import TransformBroadcaster
-    from tf2_ros.transform_listener import TransformListener
+    from tf2_ros import (
+        Buffer,
+        StaticTransformBroadcaster,
+        TransformBroadcaster,
+        TransformException,
+        TransformListener,
+    )
 
     #: Sensor-data QoS (CLAUDE.md §2: images/pointclouds/IMU — BEST_EFFORT,
     #: VOLATILE, KEEP_LAST small). Matches what SRB itself publishes closely
@@ -253,7 +255,7 @@ if _ROS2_AVAILABLE:
         depth=1,
     )
 
-    class LunarBotSensorBridgeNode(Node):
+    class LunarBotSensorBridgeNode(Node):  # type: ignore[misc]  # reason: rclpy.node.Node is untyped
         """Relay SRB's sensor topics + re-root its TF tree onto OpenRAL conventions.
 
         See the module docstring for the full rationale. Every publisher this
@@ -447,7 +449,7 @@ if _ROS2_AVAILABLE:
         def _lookup(self, target_frame: str, source_frame: str) -> TransformStamped | None:
             try:
                 return self._tf_buffer.lookup_transform(target_frame, source_frame, RclpyTime())
-            except (LookupException, ConnectivityException, ExtrapolationException) as exc:
+            except TransformException as exc:
                 _log.debug(
                     "sensor_bridge.tf_lookup_failed",
                     target_frame=target_frame,

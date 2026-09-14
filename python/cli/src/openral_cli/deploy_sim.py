@@ -306,6 +306,26 @@ _ROBOT_HAL_REGISTRY: dict[str, _HalSpec] = {
         default_params={},
         manifest_driven=True,
     ),
+    "lunar_bot": _HalSpec(
+        # SRB (Space Robotics Bench) is a ROS-attached external simulator, not
+        # a stepped SimRollout — `robot.yaml` declares the SAME topic-bridge
+        # class (`LunarBotSRBHAL`) as both `hal.sim` and `hal.real`.
+        # `bare_twin_sim=True` so the manifest-driven-node injection below
+        # never sets `sim_env_yaml`: this robot is never scene-attached via
+        # `openral_sim.SCENES`/`SimAttachedHAL` (there is nothing to step —
+        # see `openral_sim.backends.srb`'s module docstring). The scene's
+        # `DeployScene.simulator` (an `ExternalSimulatorSpec`) is what
+        # actually spawns and gates the SRB process itself — a launch-level
+        # concern, not a HAL-registry one. See the research repo's
+        # docs/srb_deploy_backend_plan.md.
+        package="openral_hal_lunar_bot",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_lunar_bot",
+        supported_robot_names=frozenset({"lunar_bot"}),
+        default_params={},
+        manifest_driven=True,
+        bare_twin_sim=True,
+    ),
 }
 
 # The lidar-less visual-SLAM twin reuses panda_mobile's HAL verbatim (same node,
@@ -1577,6 +1597,19 @@ def resolve_launch_invocation(  # noqa: PLR0912, PLR0915  # reason: a flat resol
     # only camera source; empty default in the launch file).
     if deploy_config is not None and hal_mode == "real":
         argv_template.append(f"deploy_config:={Path(deploy_config).resolve()}")
+    # Also forward `--config` (not the separate `deploy_config` param above,
+    # which `deploy sim` never populates) on the sim path when the scene
+    # declares an `ExternalSimulatorSpec` (DeployScene.simulator) — that
+    # robot's sim IS a real ROS-attached process (SRB today), so
+    # `compose_runtime_graph` needs `deploy_config:=` to spawn + gate it,
+    # unlike every other sim backend that renders its own cameras in-process.
+    elif (
+        config is not None
+        and hal_mode == "sim"
+        and deploy_scene is not None
+        and deploy_scene.simulator is not None
+    ):
+        argv_template.append(f"deploy_config:={Path(config).resolve()}")
 
     return LaunchInvocation(
         robot_id=robot_id,

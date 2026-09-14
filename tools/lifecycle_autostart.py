@@ -18,6 +18,16 @@ cover a robocasa-kitchen ``on_configure``, which can exceed a minute: MuJoCo
 + robosuite import, ``env.reset``, a possible ``uv`` rebuild). Exits 0 on
 success, non-zero only if the service never appears or the FSM state never
 advances.
+
+Also drives ``deploy_e2e.launch.py``'s readiness gate for a ROS-attached
+external simulator (``DeployScene.simulator``, e.g. SRB): with one or more
+``--wait-for-topic``, this script blocks BEFORE the change_state wait until
+every named topic has at least one publisher (or
+``--wait-for-topics-timeout-s`` elapses, which is a hard failure — unlike an
+absent ``change_state`` service, a scene that declared these topics and
+never got them is a real problem, not "not spawned yet"). Distinct from the
+transition-drive's own retry logic: the simulator's process, not a lifecycle
+FSM, is what's being waited on here.
 """
 
 from __future__ import annotations
@@ -113,6 +123,31 @@ def _drive_transition(
     raise RuntimeError(msg)
 
 
+def _wait_for_topic_publishers(node: Any, topics: list[str], timeout_s: float) -> list[str]:
+    """Block until every ``topics`` entry has >=1 publisher, or ``timeout_s`` elapses.
+
+    ``node.count_publishers(topic)`` reflects local graph-cache knowledge, which
+    updates via discovery independent of any subscription — no subscriber to
+    ``topics`` is created here.
+
+    Args:
+        node: A live ``rclpy`` node.
+        topics: Topic names to wait for (e.g. ``["/clock",
+            "/srb/env0/robot/joint_states"]``).
+        timeout_s: Total budget across all topics, not per-topic.
+
+    Returns:
+        Topics still missing a publisher when the budget ran out (empty = all found).
+    """
+    deadline = time.monotonic() + timeout_s
+    remaining = set(topics)
+    while remaining and time.monotonic() < deadline:
+        remaining = {t for t in remaining if node.count_publishers(t) < 1}
+        if remaining:
+            rclpy.spin_once(node, timeout_sec=0.5)
+    return sorted(remaining)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -141,11 +176,44 @@ def main() -> int:
             "env.reset, plus a possible uv rebuild) can exceed a minute."
         ),
     )
+    parser.add_argument(
+        "--wait-for-topic",
+        action="append",
+        default=[],
+        dest="wait_for_topics",
+        metavar="TOPIC",
+        help=(
+            "Block until this topic has >=1 publisher, before even trying "
+            "change_state. Repeatable. For a scene's ROS-attached external "
+            "simulator (DeployScene.simulator.ready_topics) — the HAL "
+            "should not be asked to configure before its transport exists."
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-topics-timeout-s",
+        type=float,
+        default=600.0,
+        help="Total budget for every --wait-for-topic to gain a publisher.",
+    )
     args = parser.parse_args()
 
     rclpy.init()
     node = rclpy.create_node("openral_lifecycle_autostart")
     try:
+        if args.wait_for_topics:
+            missing = _wait_for_topic_publishers(
+                node, args.wait_for_topics, args.wait_for_topics_timeout_s
+            )
+            if missing:
+                print(
+                    "lifecycle-autostart: external simulator never published "
+                    f"{missing} within {args.wait_for_topics_timeout_s:.1f}s — "
+                    f"not driving {args.node!r} to {args.target!r} "
+                    "(the simulator process likely failed to boot; check its "
+                    "own log).",
+                    file=sys.stderr,
+                )
+                return 1
         change_state_name = _service_path(args.node, "change_state")
         get_state_name = _service_path(args.node, "get_state")
         try:
