@@ -562,6 +562,27 @@ class ROSActionRskill(rSkillBase):
         ``RobotDescription.joints`` order) when available; falls
         back to all-zeroes when ``world_state`` is ``None`` (test path
         only — production always supplies a live snapshot).
+
+        Per-joint, the captured value is used only when it falls inside
+        that joint's own declared ``position_limits`` — otherwise 0.0 is
+        used instead (still validated against that same range; a manifest
+        declaring a position range that excludes 0.0 keeps its captured
+        value regardless, since there is no other generic fallback to
+        reach for). Found live (F33): ``world_state.joint_state.position``
+        is not guaranteed to share units with the kernel's declared
+        envelope for every joint — e.g. LunarBot's gripper joints report
+        SRB's raw mechanical stroke (~+/-0.82 rad) here, while the kernel
+        envelope for them is the OpenRAL HAL's normalised [0, 1] jaw
+        fraction (`robots/lunar_bot/robot.yaml`) — so echoing the raw
+        reading verbatim tripped the kernel's per-joint range check on
+        the very next dispatched chunk. This does not change behavior for
+        a joint whose current reading is already in-range (the normal
+        case this method exists for — Franka's gripper etc. hold their
+        live position while the arm-only plan replays); it only prevents
+        an out-of-range echo for a joint like LunarBot's gripper, which
+        `LunarBotSRBHAL._send_joint_position`'s own docstring already
+        documents as safe to zero (`action.joint_names` names the only
+        slots that HAL actually forwards; the rest are discarded).
         """
         if self._description is None or world_state is None:
             return  # init-time zeros already in place
@@ -569,15 +590,24 @@ class ROSActionRskill(rSkillBase):
             positions = list(world_state.joint_state.position)
         except AttributeError:
             return
-        if len(positions) != len(self._description.joints):
+        joints = self._description.joints
+        if len(positions) != len(joints):
             log.warning(
                 "ros_action_rskill.padding_size_mismatch",
                 name=self.name,
                 got=len(positions),
-                expected=len(self._description.joints),
+                expected=len(joints),
             )
             return
-        self._unmoved_joint_padding = [float(v) for v in positions]
+        padding: list[float] = []
+        for raw_value, joint in zip(positions, joints, strict=True):
+            value = float(raw_value)
+            if joint.position_limits is not None:
+                lo, hi = joint.position_limits
+                if not (lo <= value <= hi):
+                    value = 0.0
+            padding.append(value)
+        self._unmoved_joint_padding = padding
 
     def _dispatch_and_cache_result(self) -> None:
         """Send the wrapped goal and block on the result.

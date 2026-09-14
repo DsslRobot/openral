@@ -21,6 +21,7 @@ from openral_core import (
     ControlMode,
     ControlModeSemantics,
     JointSpec,
+    JointState,
     JointType,
     RobotCapabilities,
     RobotDescription,
@@ -33,6 +34,7 @@ from openral_core import (
     RSkillManifest,
     RSkillState,
     SafetyEnvelope,
+    WorldState,
 )
 from openral_rskill.ros_action_rskill import (
     ROSActionRskill,
@@ -159,6 +161,44 @@ def _two_dof_robot() -> RobotDescription:
     )
 
 
+def _arm_plus_gripper_robot() -> RobotDescription:
+    """Arm joint (wide symmetric limits) + a LunarBot-gripper-shaped joint
+    ([0, 1], the OpenRAL HAL's normalised jaw-fraction contract) + one
+    joint with no declared limits at all (the `position_limits is None`
+    passthrough case)."""
+    return RobotDescription(
+        name="custom_arm_gripper",
+        embodiment_kind="manipulator",
+        joints=[
+            JointSpec(
+                name="arm1",
+                joint_type=JointType.REVOLUTE,
+                parent_link="base",
+                child_link="link_a",
+                position_limits=(-3.14, 3.14),
+            ),
+            JointSpec(
+                name="gripper1",
+                joint_type=JointType.REVOLUTE,
+                parent_link="link_a",
+                child_link="gripper_link",
+                position_limits=(0.0, 1.0),
+            ),
+            JointSpec(
+                name="unbounded1",
+                joint_type=JointType.CONTINUOUS,
+                parent_link="link_a",
+                child_link="wheel_link",
+            ),
+        ],
+        capabilities=RobotCapabilities(
+            supported_control_modes=[ControlMode.JOINT_POSITION],
+            embodiment_tags=["custom"],
+        ),
+        safety=SafetyEnvelope(),
+    )
+
+
 def _trajectory_manifest() -> RSkillManifest:
     return RSkillManifest(
         name="openral/rskill-test-traj",
@@ -224,6 +264,72 @@ def _make_skill(manifest: RSkillManifest, description: RobotDescription | None) 
         prompt="test",
         prompt_metadata_json="",
     )
+
+
+# ── _capture_unmoved_joint_padding (F33) ─────────────────────────────────────
+
+
+def _world_state_at(*positions: float) -> WorldState:
+    return WorldState(
+        stamp_ns=0,
+        joint_state=JointState(
+            name=["arm1", "gripper1", "unbounded1"],
+            position=list(positions),
+            velocity=[0.0] * len(positions),
+            stamp_ns=0,
+        ),
+    )
+
+
+def test_unmoved_joint_padding_holds_in_range_reading() -> None:
+    """Unaffected case: a current reading inside the joint's declared
+    range is held verbatim, matching the pre-fix behaviour this method
+    exists for (e.g. Franka's gripper holding its live position while an
+    arm-only plan replays)."""
+    skill = _make_skill(_trajectory_manifest(), _arm_plus_gripper_robot())
+    skill._capture_unmoved_joint_padding(_world_state_at(1.0, 0.6, 42.0))
+    assert skill._unmoved_joint_padding == [1.0, 0.6, 42.0]
+
+
+def test_unmoved_joint_padding_clamps_out_of_range_reading_to_zero() -> None:
+    """The real bug (F33): LunarBot's gripper joints report SRB's raw
+    mechanical stroke (~+/-0.82 rad) in `world_state.joint_state`, but the
+    kernel's declared envelope for them is [0, 1] (the OpenRAL HAL's
+    normalised jaw-fraction contract). Echoing -0.82 verbatim tripped the
+    kernel's per-joint range check on the very next dispatched chunk.
+    `gripper1` here has that same [0, 1] range; -0.82 must fall back to
+    0.0 (itself in-range, and the value `LunarBotSRBHAL._send_joint_position`
+    already documents as safe to send for a slot it won't forward)."""
+    skill = _make_skill(_trajectory_manifest(), _arm_plus_gripper_robot())
+    skill._capture_unmoved_joint_padding(_world_state_at(1.0, -0.82, 42.0))
+    assert skill._unmoved_joint_padding == [1.0, 0.0, 42.0]
+
+
+def test_unmoved_joint_padding_holds_reading_when_no_limits_declared() -> None:
+    """A joint with `position_limits is None` has nothing to validate
+    against — the captured value passes through unchanged, same as
+    before this fix."""
+    skill = _make_skill(_trajectory_manifest(), _two_dof_robot())  # neither joint declares limits
+    skill._capture_unmoved_joint_padding(_world_state_at(999.0, -999.0))
+    assert skill._unmoved_joint_padding == [999.0, -999.0]
+
+
+def test_unmoved_joint_padding_out_of_range_value_reaches_the_wire() -> None:
+    """End-to-end: the clamped padding is what actually lands in the
+    emitted waypoint's unmoved slot (mirrors the real per-waypoint
+    construction in `_dispatch_and_cache_result`: start from
+    `_unmoved_joint_padding`, overwrite the planned slots)."""
+    skill = _make_skill(_trajectory_manifest(), _arm_plus_gripper_robot())
+    skill._capture_unmoved_joint_padding(_world_state_at(1.0, -0.82, 42.0))
+    perm, _ = build_joint_permutation_from_names(
+        source_names=["arm1"],  # only "arm1" is planned; gripper/unbounded are not
+        target_names=[j.name for j in skill._description.joints],  # type: ignore[union-attr]
+    )
+    wp = list(skill._unmoved_joint_padding)
+    for i, j in enumerate(perm):
+        if j >= 0:
+            wp[i] = 2.0  # the trajectory's planned value for "arm1"
+    assert wp == [2.0, 0.0, 42.0]
 
 
 def test_trajectory_mode_replays_waypoints_then_signals_completion() -> None:
