@@ -318,7 +318,7 @@ if _ROS2_AVAILABLE:
             # the resident skill before loading the next; re-dispatching the
             # same key reuses it (no reload, no double-load).
             self._resident_skill: Any = None
-            self._resident_key: tuple[str, str, str] = ("", "", "")
+            self._resident_key: tuple[str, str, str, str, str] = ("", "", "", "", "")
             self._chunks_published: int = 0
             self._estop_latched: bool = False
             self._cancel_requested: bool = False
@@ -680,15 +680,30 @@ if _ROS2_AVAILABLE:
         ) -> rSkillBase:
             """Return the GPU-resident skill for this dispatch key.
 
-            Keyed by ``(rskill_id, revision, prompt)``: a differing key evicts
-            the resident skill (``shutdown()`` → frees VRAM) before loading the
-            next; an exact match reuses it (no reload, no double-load); a miss
-            resolves + caches. Resolve failures propagate to the caller's abort
-            path unchanged.
+            Keyed by ``(rskill_id, revision, prompt, prompt_metadata_json,
+            goal_params_json)``: a differing key evicts the resident skill
+            (``shutdown()`` → frees VRAM) before loading the next; an exact
+            match reuses it (no reload, no double-load); a miss resolves +
+            caches. Resolve failures propagate to the caller's abort path
+            unchanged.
+
+            ``goal_params_json``/``prompt_metadata_json`` joined the key
+            after a real bug (found live-testing MoveIt dispatch this
+            session): the key used to be ``(rskill_id, revision, prompt)``
+            only, so a second dispatch of the SAME rskill_id with DIFFERENT
+            structured params silently reused the first dispatch's already-
+            configured instance — ``configure()``/``activate()`` never ran
+            again, so the new params (and the skill's own ``_start_s`` clock)
+            were ignored with no error. Every ``kind: procedural`` skill was
+            affected; this is exactly the pattern a reasoner dispatching the
+            same skill repeatedly with different targets in one episode
+            hits. A cache still holds — a byte-identical repeat dispatch
+            still reuses the resident instance — this only widens what
+            counts as "identical."
             """
             from openral_core.schemas import RSkillState
 
-            req_key = (rskill_id, revision, prompt)
+            req_key = (rskill_id, revision, prompt, prompt_metadata_json, goal_params_json)
             if self._resident_skill is not None and self._resident_key != req_key:
                 self._evict_resident_skill()
             if self._resident_skill is not None and self._resident_key == req_key:
@@ -728,7 +743,7 @@ if _ROS2_AVAILABLE:
             """
             skill = self._resident_skill
             self._resident_skill = None
-            self._resident_key = ("", "", "")
+            self._resident_key = ("", "", "", "", "")
             if skill is None:
                 return
             shutdown = getattr(skill, "shutdown", None)
@@ -1830,16 +1845,30 @@ if _ROS2_AVAILABLE:
             self._publish_active_task("")
 
         def _on_safety_status(self, msg: object) -> None:
-            """Cache the newest ``/openral/safety_status`` (ADR-0096).
+            """Cache the newest ``/openral/safety_status`` (ADR-0096); auto-clear the estop latch.
 
-            Store-only: the runner takes no action here. The value is read by
-            ``_safety_abort_reason`` when an apply-wait blocks. The
-            receipt time is recorded on the monotonic clock alongside the
-            message's own ``header.stamp`` so liveness survives a node whose
-            ROS clock is sim-time.
+            The value is read by ``_safety_abort_reason`` when an apply-wait
+            blocks. The receipt time is recorded on the monotonic clock
+            alongside the message's own ``header.stamp`` so liveness survives
+            a node whose ROS clock is sim-time.
+
+            Also clears ``self._estop_latched`` the moment the kernel reports
+            ``latched: false`` (F17/F33): the documented recovery path is
+            "call ``/openral/estop_reset`` AND publish ``/openral/estop_cleared``"
+            — two separate operator actions, and forgetting the second left
+            this node rejecting every subsequent goal even though the kernel
+            had already recovered and said so on this very topic. This makes
+            the kernel's own authoritative state sufficient on its own;
+            ``_on_estop_cleared`` keeps working unchanged as a second,
+            independent path (e.g. for a caller that never sees SafetyStatus).
             """
             self._safety_status = msg
             self._safety_status_recv_monotonic = time.monotonic()
+            if self._estop_latched and not bool(getattr(msg, "latched", True)):
+                self._estop_latched = False
+                self.get_logger().info(
+                    "rskill_runner.estop_cleared (via safety_status); accepting new goals."
+                )
 
         def _safety_abort_reason(self) -> str | None:
             """Return why a safety stop is in effect here, or ``None``.
