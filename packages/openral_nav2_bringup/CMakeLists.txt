@@ -16,6 +16,7 @@ ament_python_install_package(${PROJECT_NAME})
 # the libexec directory". Enforced by test/test_nav2_launch.py and tests/unit/test_ros_node_exec_bits.py.
 install(PROGRAMS
   ${PROJECT_NAME}/payload_scan_filter_node.py
+  ${PROJECT_NAME}/twist_to_action_relay_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

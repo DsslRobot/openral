@@ -366,6 +366,27 @@ safety:
   max_ee_speed_m_s: 0.2
   max_ee_angular_speed_rad_s: 0.3
 
+# Nav2 costmap/MPPI overrides (RobotDescription.nav2_param_overrides(),
+# §8.3 item 5) -- computed from the real wheel geometry SRB's
+# FourWheelSteerActionCfg uses (lunarbot.py wheel_positions/wheel_radius),
+# not an invented number: the farthest wheel centre (rear, (-0.5225,
+# 0.42705)) is 0.6749 m from the chassis origin; + wheel_radius (0.1453 m,
+# the wheel's own lateral extent when steered) = 0.8202 m, rounded down.
+# Conservative but a likely UNDERESTIMATE of the full chassis (mast + arm
+# overhang aren't included -- `assets` is still empty, no USD-derived hull
+# exists yet, see the header comment) -- same "provisional first-
+# integration-test bound" status as the safety envelope above, not a
+# claimed final footprint.
+footprint_radius: 0.82
+# `(v, omega)` is the entire commanded space (four_wheel_steer.py
+# FourWheelSteerAction.action_dim == 2) -- no strafing, despite the
+# independent-steering wheels -- so "differential" (-> Nav2 MPPI
+# `motion_model: DiffDrive`) matches the real command interface; "omni"
+# would tell the planner it can command lateral velocity, which nothing
+# downstream of BODY_TWIST honours for this robot (F19,
+# `four_wheel_steer.py`'s own module docstring).
+base_kinematics: "differential"
+
 sdk_kind: "open"
 hal:
   sim: "openral_hal.lunar_bot_srb:LunarBotSRBHAL"
