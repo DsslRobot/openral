@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rm_description</name>
+  <version>1.7.0</version>
+  <description>
+    RM-75 URDF and meshes, vendored (filtered) from RealManRobot/ros2_rm_robot.
+    See NOTICE.md for provenance and license status.
+  </description>
+  <maintainer email="bingqih0311@gmail.com">Space Robot Harness research project</maintainer>
+  <license>See NOTICE.md (upstream license undeclared; vendored under a recorded research-use exception)</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

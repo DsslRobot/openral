@@ -280,6 +280,12 @@ capabilities:
     # actuator (openral_core.schemas) -- lets generic base-only rSkills
     # target the class without naming this specific robot.
     - "mobile_base"
+    # Canonical class tag for the RM-75 arm (any embodiment carrying one) --
+    # lets the generic rskill-moveit-* family (§8.3 item 6) target this
+    # robot's arm without a lunar_bot-specific manifest. MoveIt config:
+    # packages/rm_description/ + packages/rm_75_config/ (vendored, see
+    # docs/research_findings.md F31 for the license/provenance decision).
+    - "rm75"
 
 # LunarBot is `hal.real` (SRB is an external ROS-attached system, see the
 # header comment) -- so these are NOT `deploy_binding`-opened; ``openral_hal_
