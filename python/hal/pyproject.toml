@@ -3,21 +3,23 @@ name = "openral-hal"
 version = "0.3.1"  # x-release-please-version
 description = "OpenRAL Hardware Abstraction Layer — HAL Protocol and ros2_control adapter"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.10,<3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     # x-release-please-start-version
     "openral-core==0.3.1", # reason: HAL Protocol uses RobotDescription, Action, JointState
     "openral-sensors==0.3.1", # reason: catalog-backed *_with_sensors() factories materialise SensorSpec/Bundle on canonical RobotDescriptions
     # x-release-please-end
-    # reason: lerobot types.py module + the SO-100/SO-101 real servo bus. The
-    # `feetech` extra pulls feetech-servo-sdk (scservo_sdk) + deepdiff, which
-    # lerobot's FeetechMotorsBus lazy-requires at connect(); without it,
-    # `openral deploy run` on real SO-100/101 hardware raises ImportError inside
-    # the HAL's on_configure. The extra is small pure-Python, and the `so100`
-    # optional-extra is never activated by `just sync` (nothing pulls
-    # openral-hal[so100]), so the feetech deps belong in the base. Min 3.12+.
-    "lerobot[feetech]>=0.6.0",
+    # PY310-HUMBLE PATCH: `lerobot[feetech]>=0.6.0` removed from the base deps.
+    # lerobot declares `requires-python >=3.12` in every published version, so it
+    # cannot be resolved on the ROS 2 Humble interpreter this fork targets (see
+    # docs/upstream_pins.md in the research repo). It is only needed by the
+    # SO-100/SO-101 servo bus, which this project does not have; the `so100`
+    # optional-extra below still carries it, so nothing that actually drives that
+    # arm loses its dependency. Upstream's reason for putting it in the base was
+    # that `openral deploy run` on real SO-100/101 hardware raises ImportError
+    # inside the HAL's on_configure without the feetech extra — still true, and
+    # still the documented fix for anyone using that arm.
     "structlog>=24.0", # reason: structured logging per CLAUDE.md §5.1
     # torchcodec (pulled transitively via lerobot) ships per-torch-minor ABI
     # builds: 0.9.x↔torch2.9, 0.10.x↔torch2.10. The dev workspace locks torch
@@ -33,12 +35,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-so100 = [
-    # SO-100/SO-101 servo bus. feetech-servo-sdk + deepdiff are already in the
-    # base deps above (real hardware needs them at connect()); kept here so the
-    # extra stays a self-documenting opt-in surface.
-    "lerobot[feetech]>=0.6.0",
-]
+# PY310-HUMBLE PATCH: the `so100` extra is removed for the same reason as the
+# base-deps lerobot line above — `uv lock` resolves every declared extra, so a
+# Python >= 3.12 requirement anywhere in the workspace blocks the whole solve.
+# Driving a real SO-100/SO-101 servo bus needs `lerobot[feetech]` and therefore
+# needs the upstream 3.12 workspace.
 arm-sim = [
     "mujoco>=3.0",  # reason: MuJoCo physics engine for UR5e / UR10e / Franka Panda HAL sim adapters
     "onnxruntime>=1.17",  # reason: pinned G1 walking controller inference

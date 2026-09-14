@@ -152,6 +152,32 @@ def generate_launch_description() -> LaunchDescription:
                 "its polygon statically from the manifest (see the README)."
             ),
         ),
+        DeclareLaunchArgument(
+            "pointcloud_to_laserscan",
+            default_value="true",
+            description=(
+                "Run `pointcloud_to_laserscan_node` alongside Nav2: converts "
+                "`/openral/lidar/points` into `/scan` for robots whose only "
+                "lidar is a 3-D point cloud (e.g. LunarBot's Mid-360) rather "
+                "than a native 2-D scan (§8.3 item 5). Lidar backend only "
+                "(mirrors `payload_scan_filter`). Requires "
+                "`ros-humble-pointcloud-to-laserscan`."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "cmd_vel_relay",
+            default_value="true",
+            description=(
+                "Run `twist_to_action_relay_node.py` alongside Nav2: bridges its "
+                "`/cmd_vel` output onto `/openral/candidate_action` so the safety "
+                "kernel checks every Nav2 velocity command instead of it reaching "
+                "the base controller directly (§8.3 item 5). Requires `robot_yaml`; "
+                "self-disables (logs why, stays idle) for a robot whose manifest "
+                "declares `base_joints` — `MobileBaseBridge` already bridges "
+                "`/cmd_vel` for that case, via its own bypass path — or that omits "
+                "`body_twist` from `capabilities.supported_control_modes`."
+            ),
+        ),
     ]
 
     # ``OpaqueFunction`` (upstream ``launch.actions``) defers the callback
@@ -196,6 +222,76 @@ def _payload_scan_filter_nodes(
         )
     )
     return nodes
+
+
+def _pointcloud_to_laserscan_nodes(*, slam_backend: str, use_sim_time: object) -> list[object]:
+    """The `/openral/lidar/points` -> `/scan` conversion for lidar-only robots (e.g. LunarBot).
+
+    §8.3 item 5 / `docs/srb_deploy_backend_plan.md` §5: LunarBot's Mid-360 reaches OpenRAL as a
+    `sensor_msgs/PointCloud2` on `/openral/lidar/points` (`openral_hal_lunar_bot.sensor_bridge_node`,
+    F25); Nav2's lidar profile (`config/nav2_panda_mobile.yaml`) consumes only a 2-D `/scan` (through
+    `payload_scan_filter_node.py`'s `/scan` -> `/openral/nav2/scan`, already wired) — no separate
+    full-cloud costmap feed exists to use instead. Requires `ros-humble-pointcloud-to-laserscan`
+    (not installed by this launch file — `apt install ros-humble-pointcloud-to-laserscan`; the node
+    simply fails to start until it is, same as any other missing exec dependency). Visual backend
+    has no `/scan` consumer, so this is skipped there (mirrors `_payload_scan_filter_nodes`).
+
+    Height band / range bounds below are a first-pass choice (base-frame-relative slice through the
+    Mid-360's real -7..+52 deg vertical FOV), not yet live-tuned against real terrain returns —
+    same "provisional, revisit after a live run" status as `robot.yaml`'s new `footprint_radius`.
+    """
+    from launch_ros.actions import Node  # reason: launch-time only
+
+    if slam_backend.strip().lower() == "visual":
+        return []
+    return [
+        Node(
+            package="pointcloud_to_laserscan",
+            executable="pointcloud_to_laserscan_node",
+            name="openral_nav2_pointcloud_to_laserscan",
+            output="screen",
+            remappings=[("cloud_in", "/openral/lidar/points"), ("scan", "/scan")],
+            parameters=[
+                {
+                    "use_sim_time": use_sim_time,
+                    "target_frame": "chassis_base_link",
+                    "transform_tolerance": 0.1,
+                    "min_height": 0.05,
+                    "max_height": 0.6,
+                    "angle_min": -3.14159,
+                    "angle_max": 3.14159,
+                    "angle_increment": 0.0087,  # ~0.5 deg
+                    "scan_time": 0.1,
+                    "range_min": 0.1,
+                    "range_max": 40.0,
+                    "use_inf": True,
+                    "concurrency_level": 1,
+                }
+            ],
+        )
+    ]
+
+
+def _twist_to_action_relay_nodes(*, robot_yaml: str) -> list[object]:
+    """The `/cmd_vel` -> `/openral/candidate_action` relay that rides with Nav2.
+
+    See `twist_to_action_relay_node.py`'s module docstring for the full rationale (§8.3 item 5)
+    and the mutual-exclusion check against `MobileBaseBridge`'s bypass path — that check happens
+    inside the node itself (it needs to load and inspect `robot_yaml`), not here.
+    """
+    from launch_ros.actions import Node  # reason: launch-time only
+
+    if not robot_yaml:
+        return []
+    return [
+        Node(
+            package="openral_nav2_bringup",
+            executable="twist_to_action_relay_node.py",
+            name="openral_nav2_twist_to_action_relay",
+            output="screen",
+            parameters=[{"robot_yaml": robot_yaml}],
+        )
+    ]
 
 
 def _nav2_include_with_robot_overrides(context: object) -> list[object]:
@@ -271,6 +367,18 @@ def _nav2_include_with_robot_overrides(context: object) -> list[object]:
                 use_sim_time=use_sim_time.strip().lower() in ("true", "1", "yes"),
             )
         )
+    pointcloud_to_laserscan = LaunchConfiguration("pointcloud_to_laserscan").perform(context)  # type: ignore[attr-defined]
+    if pointcloud_to_laserscan.strip().lower() in ("true", "1", "yes"):
+        use_sim_time = LaunchConfiguration("use_sim_time").perform(context)  # type: ignore[attr-defined]
+        actions.extend(
+            _pointcloud_to_laserscan_nodes(
+                slam_backend=slam_backend,
+                use_sim_time=use_sim_time.strip().lower() in ("true", "1", "yes"),
+            )
+        )
+    cmd_vel_relay = LaunchConfiguration("cmd_vel_relay").perform(context)  # type: ignore[attr-defined]
+    if cmd_vel_relay.strip().lower() in ("true", "1", "yes"):
+        actions.extend(_twist_to_action_relay_nodes(robot_yaml=robot_yaml))
     return actions
 
 

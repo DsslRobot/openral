@@ -1,0 +1,55 @@
+# Windowed (non-headless) twin of srb_panel_remount.yaml, for interactive
+# visual verification on the dev host — watching LunarBot execute in the
+# actual Isaac Sim viewport, e.g. while manually dispatching the item-3
+# rSkills via `ros2 action send_goal`. Everything below is identical to
+# srb_panel_remount.yaml except dropping "--headless" from simulator.argv;
+# see that file for the full rationale on every other field. Headless stays
+# the default for scripted/CI/experiment runs (throughput, no display
+# needed on a cluster) — this variant exists so "run it and look at it" has
+# a tracked, reproducible config instead of an ad hoc /tmp copy.
+#
+# Run: openral deploy sim --config scenes/deploy/srb_panel_remount_gui.yaml
+
+robot_id: "lunar_bot"
+seed: 0
+
+scene:
+  id: "srb"
+  backend: "isaacsim"
+  observation_height: 480
+  observation_width: 640
+  cameras: ["front", "wrist"]
+
+simulator:
+  argv:
+    - "srb"
+    - "agent"
+    - "ros"
+    - "--env"
+    - "panel_remount_visual"
+    - "env.robot=lunar_bot"
+    - "env.camera_resolution=[640,480]"
+  cwd: "/mnt/SharedData/Research/Space_Robot_Harness/space_robotics_bench"
+  env_unset:
+    - "CONDA_PREFIX"
+    - "CONDA_EXE"
+    - "CONDA_PYTHON_EXE"
+    - "CONDA_DEFAULT_ENV"
+    - "CONDA_SHLVL"
+    - "CONDA_PROMPT_MODIFIER"
+    - "PYTHONPATH"
+  env_path_exclude_substrings:
+    - "miniconda3"
+  env_set:
+    ISAAC_SIM_PATH: "$HOME/Programs/isaac-sim"
+  ready_topics:
+    - "/clock"
+    - "/srb/env0/robot/joint_states"
+    - "/srb/env0/imu_robot"
+    - "/srb/env0/lidar_robot/pointcloud"
+    - "/srb/env0/cam_front/image_rgb"
+  # Cold Isaac Sim boot + first-render shader compile can run several
+  # minutes on this host (srb-native-install memory) — generous, matching
+  # isaac_franka.yaml's 1200s for the same reason.
+  boot_timeout_s: 1200.0
+  publishes_clock: true

@@ -1347,12 +1347,17 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
     # leg — WorldState must subscribe to them too.
     scene_sensors: list[SensorSpec] = []
     scene_drivers: list = []  # type: ignore[type-arg]  # reason: openral_core.LaunchInclude, deferred import
+    # A ROS-attached external simulator (SRB today) this scene's sim path
+    # spawns and owns — see openral_core.ExternalSimulatorSpec. None for
+    # every scene stepped in-process via openral_sim.SCENES.
+    scene_simulator = None
     if deploy_config:
         from openral_core import DeployScene
 
         _scene = DeployScene.from_yaml(deploy_config)
         scene_sensors = list(_scene.sensors)
         scene_drivers = list(_scene.drivers)
+        scene_simulator = _scene.simulator
         scene_rgb = [
             s.name for s in scene_sensors if s.modality == "rgb" and s.name not in rgb_camera_names
         ]
@@ -1521,24 +1526,37 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
     hal_autostart_path = str(_REPO_ROOT / "tools" / "lifecycle_autostart.py")
     from openral_hal.sim_bringup import hal_transition_timeout_s
 
+    _hal_autostart_cmd = [
+        sys.executable,
+        hal_autostart_path,
+        "--node",
+        f"/{hal_node_name}",
+        "--target",
+        "active",
+        "--service-timeout-s",
+        "60.0",
+        # Derived from the scene, not fixed: a sidecar backend boots
+        # inside ``on_configure`` and a measured cold Isaac Sim boot
+        # runs past the old 300 s literal. See
+        # ``openral_hal.sim_bringup.hal_transition_timeout_s``.
+        "--transition-timeout-s",
+        hal_transition_timeout_s(deploy_config),
+    ]
+    # A ROS-attached external simulator (SRB) needs its own topics up BEFORE
+    # the HAL is even asked to configure — its transport isn't ready until
+    # then, unlike a scene-attached/bare-twin HAL whose sim lives inside its
+    # own `on_configure`. `lifecycle_autostart.py` blocks on these first, so
+    # a slow simulator boot delays CONFIGURE rather than racing it.
+    if scene_simulator is not None and scene_simulator.ready_topics:
+        for _ready_topic in scene_simulator.ready_topics:
+            _hal_autostart_cmd += ["--wait-for-topic", _ready_topic]
+        _hal_autostart_cmd += [
+            "--wait-for-topics-timeout-s",
+            str(scene_simulator.boot_timeout_s),
+        ]
     autostart.append(
         ExecuteProcess(
-            cmd=[
-                sys.executable,
-                hal_autostart_path,
-                "--node",
-                f"/{hal_node_name}",
-                "--target",
-                "active",
-                "--service-timeout-s",
-                "60.0",
-                # Derived from the scene, not fixed: a sidecar backend boots
-                # inside ``on_configure`` and a measured cold Isaac Sim boot
-                # runs past the old 300 s literal. See
-                # ``openral_hal.sim_bringup.hal_transition_timeout_s``.
-                "--transition-timeout-s",
-                hal_transition_timeout_s(deploy_config),
-            ],
+            cmd=_hal_autostart_cmd,
             output="log",
         )
     )
@@ -1555,6 +1573,54 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
     #   publishes its own URDF on ``/robot_description``. ``resolve_asset`` returns ``None`` for
     #   it, so RSP is skipped (the URDF is already on the bus).
     extra_nodes: list = []
+
+    # A ROS-attached external simulator (SRB today) — sim path only
+    # (DeployScene.simulator is ignored by `deploy run`, which talks to real
+    # hardware). Spawned and owned by this launch. The HAL's own `configure`
+    # is gated on `simulator.ready_topics` via the HAL autostart invocation
+    # below, not here — this action only starts the process; readiness is a
+    # separate concern.
+    #
+    # Routed through tools/process_group_wrapper.py, NOT run directly —
+    # confirmed live 2026-09-14 that this matters: SRB's own interpreter
+    # (Isaac Sim's `python.sh`) forks its real Kit/PhysX process WITHOUT
+    # `exec` (`$python_exe "$@" || error_exit`, no `exec` — read verbatim
+    # from the installed script), and `launch.actions.execute_local.
+    # ExecuteLocal` has no process-group handling anywhere in its source (no
+    # setsid/killpg — confirmed by reading it): it only ever signals the one
+    # PID it directly spawned. A bare `ExecuteProcess` here would kill only
+    # the bash wrapper on shutdown, orphaning the actual Kit process — which
+    # was observed surviving over an hour afterward, still holding several
+    # GB of GPU memory with zero ROS topics publishing. The wrapper makes
+    # this process a new process-group leader and kills the WHOLE group
+    # (every descendant, however many non-exec forks deep) on SIGTERM/
+    # SIGINT — see its own module docstring and
+    # tests/unit/test_process_group_wrapper.py (which reproduces the exact
+    # failure mode and proves the fix with a real subprocess tree, not a
+    # mock).
+    if hal_mode == "sim" and scene_simulator is not None:
+        _sim_env = dict(os.environ)
+        for _unset_key in scene_simulator.env_unset:
+            _sim_env.pop(_unset_key, None)
+        if scene_simulator.env_path_exclude_substrings and "PATH" in _sim_env:
+            _sim_env["PATH"] = os.pathsep.join(
+                entry
+                for entry in _sim_env["PATH"].split(os.pathsep)
+                if not any(bad in entry for bad in scene_simulator.env_path_exclude_substrings)
+            )
+        _sim_env.update(
+            {k: os.path.expanduser(os.path.expandvars(v)) for k, v in scene_simulator.env_set.items()}
+        )
+        _process_group_wrapper_path = str(_REPO_ROOT / "tools" / "process_group_wrapper.py")
+        extra_nodes.append(
+            ExecuteProcess(
+                cmd=[sys.executable, _process_group_wrapper_path, "--", *scene_simulator.argv],
+                cwd=scene_simulator.cwd,
+                env=_sim_env,
+                name="openral_deploy_sim_external_simulator",
+                output="screen",
+            )
+        )
 
     # Vendor ros2_control bringup, on the real path only — see
     # ``_build_real_bringup_include``. This is what keeps ``deploy run`` a

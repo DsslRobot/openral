@@ -306,6 +306,26 @@ _ROBOT_HAL_REGISTRY: dict[str, _HalSpec] = {
         default_params={},
         manifest_driven=True,
     ),
+    "lunar_bot": _HalSpec(
+        # SRB (Space Robotics Bench) is a ROS-attached external simulator, not
+        # a stepped SimRollout — `robot.yaml` declares the SAME topic-bridge
+        # class (`LunarBotSRBHAL`) as both `hal.sim` and `hal.real`.
+        # `bare_twin_sim=True` so the manifest-driven-node injection below
+        # never sets `sim_env_yaml`: this robot is never scene-attached via
+        # `openral_sim.SCENES`/`SimAttachedHAL` (there is nothing to step —
+        # see `openral_sim.backends.srb`'s module docstring). The scene's
+        # `DeployScene.simulator` (an `ExternalSimulatorSpec`) is what
+        # actually spawns and gates the SRB process itself — a launch-level
+        # concern, not a HAL-registry one. See the research repo's
+        # docs/srb_deploy_backend_plan.md.
+        package="openral_hal_lunar_bot",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_lunar_bot",
+        supported_robot_names=frozenset({"lunar_bot"}),
+        default_params={},
+        manifest_driven=True,
+        bare_twin_sim=True,
+    ),
 }
 
 # The lidar-less visual-SLAM twin reuses panda_mobile's HAL verbatim (same node,
@@ -1577,6 +1597,19 @@ def resolve_launch_invocation(  # noqa: PLR0912, PLR0915  # reason: a flat resol
     # only camera source; empty default in the launch file).
     if deploy_config is not None and hal_mode == "real":
         argv_template.append(f"deploy_config:={Path(deploy_config).resolve()}")
+    # Also forward `--config` (not the separate `deploy_config` param above,
+    # which `deploy sim` never populates) on the sim path when the scene
+    # declares an `ExternalSimulatorSpec` (DeployScene.simulator) — that
+    # robot's sim IS a real ROS-attached process (SRB today), so
+    # `compose_runtime_graph` needs `deploy_config:=` to spawn + gate it,
+    # unlike every other sim backend that renders its own cameras in-process.
+    elif (
+        config is not None
+        and hal_mode == "sim"
+        and deploy_scene is not None
+        and deploy_scene.simulator is not None
+    ):
+        argv_template.append(f"deploy_config:={Path(config).resolve()}")
 
     return LaunchInvocation(
         robot_id=robot_id,
@@ -2009,8 +2042,26 @@ def _cmdline_is_openral_graph_process(cmdline: str) -> bool:
     )
 
 
+_ORPHAN_GROUP_LEADER_NEEDLES: tuple[str, ...] = ("tools/process_group_wrapper.py",)
+"""argv signatures of graph processes that must be SIGTERMed, never SIGKILLed.
+
+These are process-group leaders (``os.setsid``) that forward a SIGTERM to
+their whole group and escalate to SIGKILL themselves; killing the leader
+outright would orphan the group it guards. Today: the external simulator
+wrapper spawned by ``deploy_e2e.launch.py`` around ``srb agent ros``.
+"""
+
+
+def _cmdline_is_process_group_leader(cmdline: str) -> bool:
+    """Return True when ``cmdline`` is one of our group-leader wrappers."""
+    return any(needle in cmdline for needle in _ORPHAN_GROUP_LEADER_NEEDLES)
+
+
 def _kill_orphan_openral_graph_processes() -> int:
     """SIGKILL orphaned openral-graph processes from a prior ``openral deploy sim``.
+
+    Group-leader wrappers (``_ORPHAN_GROUP_LEADER_NEEDLES``) get SIGTERM
+    instead, so they take their whole group down rather than orphaning it.
 
     A graceful ``Ctrl-C`` doesn't always propagate through ``ros2
     launch`` to every child — under load, the launch dispatcher
@@ -2062,6 +2113,17 @@ def _kill_orphan_openral_graph_processes() -> int:
             )
         except (FileNotFoundError, PermissionError):
             continue
+        if _cmdline_is_process_group_leader(cmdline):
+            # The external-simulator wrapper (``tools/process_group_wrapper.py``)
+            # is a session leader whose only job is to take its whole group
+            # (Isaac Sim's ``python.sh`` → kit-python) down with it: SIGTERM
+            # lets it do that, then escalate to SIGKILL on its own. SIGKILLing
+            # the wrapper itself would orphan the multi-GiB kit process — the
+            # exact leak the wrapper exists to prevent.
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+            continue
         if not _cmdline_is_openral_graph_process(cmdline):
             continue
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
@@ -2091,6 +2153,24 @@ def _terminate_launch_group(proc: subprocess.Popen[bytes], *, grace_s: float = 1
         os.killpg(proc.pid, signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=5.0)
+
+
+_SIGNAL_RESET_TRAMPOLINE: Final[str] = (
+    "import os, signal, sys; "
+    "[signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]; "
+    "os.execvp(sys.argv[1], sys.argv[1:])"
+)
+"""``python -c`` body that resets the shutdown signals to default, then ``exec``s argv.
+
+Used instead of ``preexec_fn`` (unsafe in a threaded parent, ruff PLW1509):
+the trampoline ``exec``s in place, so the launch keeps the ``Popen`` PID and
+``killpg`` semantics are unchanged.
+"""
+
+
+def _with_default_signal_dispositions(argv: list[str]) -> list[str]:
+    """Wrap ``argv`` so it starts with SIGINT/SIGTERM/SIGHUP at ``SIG_DFL``."""
+    return [sys.executable, "-c", _SIGNAL_RESET_TRAMPOLINE, *argv]
 
 
 def _run_launch(argv: list[str], env: dict[str, str], *, grace_s: float = 12.0) -> int:
@@ -2129,8 +2209,20 @@ def _run_launch(argv: list[str], env: dict[str, str], *, grace_s: float = 12.0) 
 
     Returns the launch process's exit code (0 if it exited via signal
     with no recorded returncode).
+
+    The launch is started with default signal dispositions
+    (``_with_default_signal_dispositions``). A CLI started in the
+    background of a non-interactive shell (``openral deploy sim … &`` in a
+    script, the normal shape of an experiment runner) inherits
+    ``SIGINT=SIG_IGN`` per POSIX, and CPython leaves an ignored SIGINT
+    ignored — so ``ros2 launch`` never saw the SIGINT stage 1 forwards,
+    never ran its shutdown, and the external simulator (in its own session,
+    unreachable by ``killpg``) kept ticking after every node had exited
+    (observed live 2026-09-14, twice).
     """
-    proc = subprocess.Popen(argv, env=env, start_new_session=True)
+    proc = subprocess.Popen(
+        _with_default_signal_dispositions(argv), env=env, start_new_session=True
+    )
 
     def _forward(_signum: int, _frame: object) -> None:
         with contextlib.suppress(ProcessLookupError, OSError):

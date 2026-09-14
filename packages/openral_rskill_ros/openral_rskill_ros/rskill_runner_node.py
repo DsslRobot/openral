@@ -31,6 +31,7 @@ single-process invocation is a thin wrapper that sends a goal to this server.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import math
 import os
 import sys
@@ -381,6 +382,14 @@ if _ROS2_AVAILABLE:
                 self._skill_resolver = make_default_skill_resolver(
                     self,
                     tf_lookup=self._tf_lookup,
+                    # A getter, not just the value above: `_skill_resolver`
+                    # is built once and reused across a cleanup/reconfigure
+                    # cycle (the `if self._skill_resolver is None` guard
+                    # above), but `_init_tf_lookup()` rebuilds `_tf_lookup`
+                    # on every configure — capturing only the value would
+                    # close over a stale (possibly `None`, post-cleanup)
+                    # buffer after the first reconfigure.
+                    tf_lookup_getter=lambda: self._tf_lookup,
                 )
 
             # F1 — ROSPublishingHAL replaces the motor-driving HAL.
@@ -2020,6 +2029,34 @@ def _ros_action_adapter_cls(builder: str | None) -> type:
     return ROSActionRskill
 
 
+def _import_procedural_entrypoint(entrypoint: str) -> type:
+    """Resolve a ``kind: "procedural"`` manifest's ``"module.path:ClassName"``
+    entrypoint string, the same convention ``openral_hal.build_hal`` uses for
+    ``hal.real``/``hal.sim``.
+
+    Raises:
+        ROSConfigError: If the string is malformed, the module is not
+            importable, or the attribute is absent.
+    """
+    if ":" not in entrypoint:
+        raise ROSConfigError(
+            f"procedural entrypoint {entrypoint!r} is malformed; expected 'module.path:Attribute'."
+        )
+    module_path, _, attr = entrypoint.partition(":")
+    try:
+        module = importlib.import_module(module_path)
+    except ModuleNotFoundError as exc:
+        raise ROSConfigError(
+            f"procedural entrypoint {entrypoint!r}: module {module_path!r} is not importable ({exc})."
+        ) from exc
+    try:
+        return getattr(module, attr)
+    except AttributeError as exc:
+        raise ROSConfigError(
+            f"procedural entrypoint {entrypoint!r}: module {module_path!r} has no attribute {attr!r}."
+        ) from exc
+
+
 def make_default_skill_resolver(
     ros_node: Any,
     *,
@@ -2156,15 +2193,38 @@ def make_default_skill_resolver(
             skill.configure()
             skill.activate()
             return skill
+        if manifest.kind == "procedural":
+            entrypoint_cls = _import_procedural_entrypoint(manifest.procedural.entrypoint)  # type: ignore[union-attr]
+            # Same lazy-resolution rationale as the VLA branch above
+            # (line ~2307): `tf_lookup` is only wired by `on_configure` at
+            # `_init_tf_lookup()` time, so a resolver built earlier (the
+            # test-harness pattern of swapping `node._skill_resolver`
+            # before `configure()`) must re-read it at dispatch time via
+            # `tf_lookup_getter`, not capture a stale `None`. Forwarded
+            # to every procedural skill uniformly (accepted-and-ignored
+            # by skills that don't need it, e.g. body_twist) — only
+            # `move_ee_to_pose` closes its loop against live TF.
+            resolved_tf_lookup = tf_lookup_getter() if tf_lookup_getter is not None else tf_lookup
+            skill = entrypoint_cls(
+                manifest=manifest,
+                robot_description=description,
+                prompt=prompt,
+                prompt_metadata_json=prompt_metadata_json,
+                goal_params_json=goal_params_json,
+                tf_lookup=resolved_tf_lookup,
+            )
+            skill.configure()
+            skill.activate()
+            return skill
         if manifest.kind == "wam":
             raise ROSConfigError(
                 f"rSkill {rskill_id!r} declares kind='wam'; the WAM resolver "
                 "branch is not implemented yet (tracked separately). "
-                "VLA / ros_action / ros_service kinds are supported today."
+                "VLA / ros_action / ros_service / procedural kinds are supported today."
             )
         raise ROSConfigError(
             f"rSkill {rskill_id!r} declares unknown kind={manifest.kind!r}; "
-            "expected one of 'vla', 'wam', 'ros_action', 'ros_service'."
+            "expected one of 'vla', 'wam', 'ros_action', 'ros_service', 'procedural'."
         )
 
     return _resolver

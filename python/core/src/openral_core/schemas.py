@@ -19,11 +19,15 @@ from typing import (
     ClassVar,
     Literal,
     NamedTuple,
-    Self,
     TypeAlias,
     TypeVar,
     get_args,
 )
+
+# PY310-HUMBLE PATCH: ``typing.Self`` is 3.11+; this fork targets the ROS 2
+# Humble interpreter (3.10). ``typing_extensions`` backports it identically and
+# is already a hard transitive dependency via pydantic.
+from typing_extensions import Self
 
 from pydantic import (
     AliasChoices,
@@ -5832,6 +5836,7 @@ EmbodimentTag: TypeAlias = Literal[
     "google_robot",
     "gr1",
     "h1",
+    "lunar_bot",
     "mobile_base",
     "multi",
     "openarm",
@@ -5839,6 +5844,7 @@ EmbodimentTag: TypeAlias = Literal[
     "pusht",
     "rizon4",
     "r1pro",
+    "rm75",
     "sawyer",
     "so100_follower",
     "so101_follower",
@@ -5869,6 +5875,16 @@ base + ``body_twist`` actuator declares it so base-only rSkills (Nav2
 NavigateToPose, etc.) can target the whole class without naming each specific
 mobile platform. Robot-specific tags (e.g. ``"panda_mobile"``) coexist on the
 same ``RobotDescription`` for skills that DO depend on the specific composition.
+
+``"rm75"`` is likewise a CLASS tag: any robot carrying a RealMan RM-75 7-DoF
+arm declares it (today: ``lunar_bot``) so the generic ``rskill-moveit-*``
+family (§8.3 item 6, ``robots/lunar_bot/robot.yaml``) can target the arm
+without a robot-specific manifest, the same way ``franka_panda``/``ur5e``/etc.
+already do for their respective arms in that same manifest's
+``embodiment_tags``. The MoveIt config (URDF/SRDF/kinematics) lives in
+``packages/rm_description/`` + ``packages/rm_75_config/`` — vendored from
+RealMan's own ``ros2_rm_robot``, see ``docs/research_findings.md`` F31 (in
+the research harness repo) for the license/provenance decision.
 
 The ``RSkillManifest.embodiment_tags`` field is restricted to this set so a
 typo or framework hint (``lerobot``, ``libero``) cannot land in a manifest
@@ -6102,6 +6118,7 @@ RSkillKind: TypeAlias = Literal[
     "wam",
     "ros_action",
     "ros_service",
+    "procedural",
     "detector",
     "segmenter",
     "vlm",
@@ -6126,6 +6143,22 @@ RSkillKind: TypeAlias = Literal[
   per-row check sees every commanded position.
 * ``"ros_service"`` — wraps an existing ROS 2 service. Same constraints as
   ``"ros_action"``.
+* ``"procedural"`` — a deterministic, non-learned actuator: a scripted or
+  behaviour-tree-style skill with no weights and no external ROS action/
+  service server to wrap (unlike ``"ros_action"``/``"ros_service"``, which
+  drive a running server this project does not own; a ``"procedural"``
+  skill's own Python class computes the ``Action`` directly). Exists for
+  procedure-driven / non-learned mission execution — the operating model
+  that coordinates the same underlying capabilities without a learned
+  policy or an LLM reasoner in the loop. Requires a
+  ``ProceduralIntegration`` block (an ``entrypoint`` import string plus
+  ``default_goal_json``, mirroring ``RosIntegration``'s contract).
+  ``model_family``, ``weights_uri``, ``ros_integration``, ``processors``,
+  ``state_contract``, ``action_contract``, ``n_action_steps``,
+  ``image_preprocessing``, ``starting_pose``, ``detector``, ``segmenter``,
+  and ``reward`` are FORBIDDEN. ``chunk_size`` is pinned to ``1`` for the
+  same reason as the ROS-wrapper kinds — the safety supervisor only checks
+  row 0 of every chunk today. ``actuators_required`` REQUIRED (≥1 entry).
 * ``"detector"`` — perception producer that runs an exported detection model
   (RT-DETR / D-FINE ONNX) on the camera tee and publishes
   ``ObjectsMetadata``; emits no
@@ -6288,6 +6321,63 @@ class RosIntegration(BaseModel):
         if not isinstance(parsed, dict):
             raise ValueError(
                 "RosIntegration.default_goal_json must encode a JSON object, "
+                f"got {type(parsed).__name__}."
+            )
+        return v
+
+
+class ProceduralIntegration(BaseModel):
+    """Wiring for an rSkill implemented as a plain, deterministic Python class.
+
+    Populated when ``RSkillManifest.kind == "procedural"``: a scripted /
+    behaviour-tree-style skill with no learned weights and no external ROS
+    action/service server on the other end (unlike ``RosIntegration``, which
+    wraps a running server this project does not own — Nav2, MoveGroup — a
+    procedural skill's own class computes the ``Action`` directly, in-process).
+    Mirrors ``RosIntegration``'s ``entrypoint`` + ``default_goal_json`` +
+    per-dispatch-merge contract so the reasoner/LLM tool-call path is
+    identical regardless of kind.
+
+    Attributes:
+        entrypoint: ``"module.path:ClassName"`` import string, resolved the
+            same way a HAL's ``hal.real``/``hal.sim`` entrypoint is. The
+            referenced class must implement ``openral_rskill.base.rSkillBase``
+            directly — constructed with the same
+            ``(description, prompt, prompt_metadata_json, goal_params_json)``
+            shape ``ROSActionRskill`` takes, so the runner's call site stays
+            uniform across kinds.
+        default_goal_json: JSON dict literal the skill is invoked with by
+            default. Per-dispatch ``goal_params_json`` (the LLM's structured
+            override) is deep-merged over it at configure time — same
+            contract as ``RosIntegration.default_goal_json``.
+
+    Example:
+        >>> pi = ProceduralIntegration(
+        ...     entrypoint="openral_rskill.procedural_body_twist:ProceduralBodyTwistRskill",
+        ...     default_goal_json='{"linear": [0.0, 0.0, 0.0], "angular": [0.0, 0.0, 0.0], "duration_s": 1.0}',
+        ... )
+        >>> pi.entrypoint
+        'openral_rskill.procedural_body_twist:ProceduralBodyTwistRskill'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint: str = Field(min_length=1, max_length=200)
+    default_goal_json: str = Field(min_length=2, max_length=10_000)
+
+    @field_validator("default_goal_json")
+    @classmethod
+    def _check_default_goal_json_is_object(cls, v: str) -> str:
+        """Reject manifests that ship un-parseable goal JSON."""
+        import json  # noqa: PLC0415  # reason: stdlib, defer to keep import-time cheap
+
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"ProceduralIntegration.default_goal_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "ProceduralIntegration.default_goal_json must encode a JSON object, "
                 f"got {type(parsed).__name__}."
             )
         return v
@@ -7001,6 +7091,10 @@ class RSkillManifest(BaseModel):
     # manifest cannot accidentally carry stale wrapper config.
     ros_integration: RosIntegration | None = None
 
+    # Wiring for a deterministic, non-learned Python class. REQUIRED when
+    # ``kind == "procedural"``; FORBIDDEN otherwise.
+    procedural: ProceduralIntegration | None = None
+
     # Detector model contract. REQUIRED when ``kind == "detector"``;
     # FORBIDDEN otherwise. Carries the class-label list, input resolution, and
     # score threshold the runtime ObjectsDetector reads at configure time.
@@ -7248,6 +7342,49 @@ class RSkillManifest(BaseModel):
                 )
             return self
 
+        if self.kind == "procedural":
+            if self.procedural is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires a "
+                    "`procedural` block (entrypoint, default_goal_json)."
+                )
+            forbidden_procedural = {
+                "model_family": self.model_family,
+                "weights_uri": self.weights_uri,
+                "ros_integration": self.ros_integration,
+                "processors": self.processors,
+                "state_contract": self.state_contract,
+                "action_contract": self.action_contract,
+                "n_action_steps": self.n_action_steps,
+                "image_preprocessing": self.image_preprocessing,
+                "starting_pose": self.starting_pose,
+                "detector": self.detector,
+                "segmenter": self.segmenter,
+                "reward": self.reward,
+            }
+            set_procedural_forbidden = sorted(
+                name for name, value in forbidden_procedural.items() if value is not None
+            )
+            if set_procedural_forbidden:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' forbids "
+                    f"these fields: {set_procedural_forbidden!r}. A procedural skill has "
+                    "no weights, no policy preprocessing, and no external ROS server "
+                    "to wrap."
+                )
+            if self.chunk_size != 1:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires "
+                    f"chunk_size=1, got {self.chunk_size}. The safety supervisor's "
+                    "per-row check only sees row 0 of every chunk today."
+                )
+            if not self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires at least one "
+                    "`actuators_required` entry."
+                )
+            return self
+
         if self.kind == "detector":
             if self.detector is None:
                 raise ValueError(
@@ -7263,6 +7400,7 @@ class RSkillManifest(BaseModel):
                 "model_family": self.model_family,
                 "segmenter": self.segmenter,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "action_contract": self.action_contract,
                 "state_contract": self.state_contract,
                 "processors": self.processors,
@@ -7306,6 +7444,7 @@ class RSkillManifest(BaseModel):
                 "reward": self.reward,
                 "model_family": self.model_family,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "action_contract": self.action_contract,
                 "state_contract": self.state_contract,
                 "processors": self.processors,
@@ -7344,6 +7483,7 @@ class RSkillManifest(BaseModel):
                 "segmenter": self.segmenter,
                 "reward": self.reward,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "action_contract": self.action_contract,
                 "state_contract": self.state_contract,
                 "processors": self.processors,
@@ -7386,6 +7526,7 @@ class RSkillManifest(BaseModel):
                 "segmenter": self.segmenter,
                 "model_family": self.model_family,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "action_contract": self.action_contract,
                 "state_contract": self.state_contract,
                 "processors": self.processors,
@@ -7443,6 +7584,7 @@ class RSkillManifest(BaseModel):
                 "segmenter": self.segmenter,
                 "reward": self.reward,
                 "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
                 "processors": self.processors,
                 "image_preprocessing": self.image_preprocessing,
                 "action_contract": self.action_contract,
@@ -9347,6 +9489,87 @@ class LaunchInclude(BaseModel):
     args: dict[str, str] = Field(default_factory=dict)
 
 
+class ExternalSimulatorSpec(BaseModel):
+    """A ROS-attached external simulator ``deploy sim`` spawns and owns.
+
+    Some scenes are not stepped by OpenRAL at all — the sim is a separate
+    process reached only over ROS 2 topics, exactly like a real robot's
+    vendor driver (SRB/Isaac Lab today: OpenRAL never imports it, never
+    calls ``SimRollout.step``, and its ``robot.yaml`` ``hal.sim`` is the
+    *same* topic-bridge HAL class as ``hal.real`` — the only difference is
+    which process is on the other end). ``LaunchInclude`` is the analogous
+    real-path declaration (a vendor **launch file** to include); this is
+    its sim-path counterpart for a vendor **binary** to spawn, since SRB
+    has no ``ros2 launch`` entry point of its own.
+
+    The launch spawns this process before the HAL's ``configure`` and
+    blocks that transition until every ``ready_topics`` entry has a
+    publisher or ``boot_timeout_s`` elapses — the same discipline
+    ``openral_sim``'s sidecar backends use for their own out-of-process
+    boot, moved here because this process is ROS-native rather than a
+    ZMQ sidecar. On shutdown the launch terminates it by its exact spawned
+    PID, never a pattern match.
+
+    Attributes:
+        argv: Full command + arguments to spawn, e.g. ``["srb", "agent",
+            "ros", "--env", "panel_remount_visual", "--headless", …]``.
+        cwd: Working directory for the spawned process. ``None`` = the
+            launch's own cwd.
+        env_set: Environment variables to set/override for the spawned
+            process (e.g. ``ISAAC_SIM_PATH``).
+        env_unset: Environment variables to strip before spawning (e.g. a
+            conda ``CONDA_PREFIX``/``PYTHONPATH`` that would poison the
+            simulator's own interpreter resolution — see
+            ``docs/srb_integration_notes.md`` in the research repo for why
+            SRB specifically needs this).
+        env_path_exclude_substrings: Substrings that disqualify a ``PATH``
+            entry — the launch rebuilds the spawned process's ``PATH`` from
+            its own inherited one with any component containing one of
+            these dropped (e.g. ``"miniconda3"``, so a conda install ahead
+            of the system/venv Python on this host's ``PATH`` cannot shadow
+            it). Unlike ``env_unset``, ``PATH`` itself must stay set — this
+            filters its entries rather than removing the whole variable.
+            Empty = ``PATH`` passed through unfiltered.
+        ready_topics: ROS 2 topics that must each have at least one
+            publisher before the HAL is allowed to configure. Empty means
+            "don't gate" (not recommended — the HAL would race the
+            simulator's own boot).
+        boot_timeout_s: How long the readiness gate waits for
+            ``ready_topics`` before failing loudly, mirroring
+            ``openral_sim``'s sidecar ``boot_timeout_s`` contract.
+        publishes_clock: Whether this process publishes ``/clock`` — when
+            true, the graph runs on simulation time (``use_sim_time``) and
+            the HAL's own ``/clock`` publisher (present on every
+            manifest-driven HAL for the plain-wall-time case) is
+            suppressed rather than fighting over clock authority.
+        attach_existing: When true, the launch does not spawn a new
+            process — it only gates on ``ready_topics`` against whatever
+            is already running (an operator-launched simulator on a
+            second terminal, e.g. for interactive debugging).
+            ``False`` (default): always spawn and own the process, mirroring
+            ``SidecarClient``'s default posture.
+
+    Example:
+        >>> ExternalSimulatorSpec(
+        ...     argv=["srb", "agent", "ros", "--headless"],
+        ...     ready_topics=["/clock"],
+        ... ).boot_timeout_s
+        600.0
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    argv: list[str] = Field(min_length=1)
+    cwd: str | None = None
+    env_set: dict[str, str] = Field(default_factory=dict)
+    env_unset: list[str] = Field(default_factory=list)
+    env_path_exclude_substrings: list[str] = Field(default_factory=list)
+    ready_topics: list[str] = Field(default_factory=list)
+    boot_timeout_s: float = Field(default=600.0, gt=0)
+    publishes_clock: bool = False
+    attach_existing: bool = False
+
+
 class DeployRuntime(BaseModel):
     """Committed deploy-posture toggles for a workcell scene.
 
@@ -9534,6 +9757,14 @@ class DeployScene(BaseModel):
     Empty for a workcell whose sensors OpenRAL opens directly (``opencv_thread``,
     ``gstreamer``): those need no driver. Ignored on the sim path, where cameras
     are rendered rather than driven."""
+    simulator: ExternalSimulatorSpec | None = None
+    """A ROS-attached external simulator (e.g. SRB/Isaac Lab) this scene's
+    sim path spawns and owns — see ``ExternalSimulatorSpec``. ``None`` (the
+    default, every other scene) means the sim is stepped in-process via
+    ``openral_sim.SCENES``/``SimAttachedHAL`` as usual; this field is for the
+    other kind of scene, where the sim is a separate process on the ROS bus
+    the launch must bring up, gate on, and tear down — the sim-path sibling
+    of ``drivers`` (real path). Ignored by ``deploy run``."""
     hal: HalParameters | None = None
     """Deploy-time HAL binding for this workcell.
 

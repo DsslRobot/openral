@@ -208,7 +208,10 @@ def test_locateanything_extra_declares_sidecar_client_deps(expand_dependency_gro
     --object-detector-manifest`` fails per-request with ``No module named
     'zmq'`` — previously only in the unrelated ``rldx`` group.
     """
-    import tomllib
+    try:
+        import tomllib  # Python 3.11+
+    except ModuleNotFoundError:  # PY310-HUMBLE PATCH: 3.10 has no stdlib tomllib
+        import tomli as tomllib  # type: ignore[no-redef]
 
     with (_REPO / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)

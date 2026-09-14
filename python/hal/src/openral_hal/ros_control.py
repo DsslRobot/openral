@@ -38,7 +38,11 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from enum import StrEnum
+# PY310-HUMBLE PATCH: ``enum.StrEnum`` is 3.11+; this fork targets the ROS 2
+# Humble interpreter (3.10). ``str, Enum`` is the pre-3.11 spelling and is
+# behaviourally identical for this use — members compare equal to their string
+# values and serialise as strings.
+from enum import Enum
 
 import structlog
 from openral_core.exceptions import (
@@ -54,7 +58,7 @@ from openral_hal._base import HALBase, _raw_floats
 __all__ = ["ControllerKind", "RosControlHAL"]
 
 
-class ControllerKind(StrEnum):
+class ControllerKind(str, Enum):
     """Which ros2_control controller sits behind one command topic.
 
     A command topic is not self-describing: the topic name says nothing about

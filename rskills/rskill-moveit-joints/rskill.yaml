@@ -35,6 +35,7 @@ embodiment_tags:
   - "rizon4"
   - "sawyer"
   - "widowx"
+  - "rm75"  # RM-75 (lunar_bot), added item 6 (docs/lunar_bot_capability_set_plan.md)
 
 actuators_required:
   - kind: "joint_position"

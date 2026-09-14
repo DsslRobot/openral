@@ -177,6 +177,33 @@ TEST(Validator, CartesianTwistSpeedCap) {
   EXPECT_NEAR(rc.error().offending_value, 1.0, 1e-9);
 }
 
+TEST(Validator, CartesianTwistAngularSpeedCapEnforced) {
+  auto env = make_env(6);
+  env.max_ee_speed_m_s = 0.5;
+  env.max_ee_angular_speed_rad_s = 0.4;
+  // Linear component within bound; angular |w|=1.0 > 0.4.
+  const std::vector<double> flat = {0.1, 0.0, 0.0, 1.0, 0.0, 0.0};
+  const auto view = make_chunk_view(flat, 1, 6, osk::ControlMode::kCartesianTwist);
+  const auto rc = osk::validate(view, env);
+  ASSERT_FALSE(rc);
+  EXPECT_EQ(rc.error().kind, osk::ViolationKind::kForce);
+  EXPECT_STREQ(rc.error().field, "ee_angular_speed");
+  EXPECT_NEAR(rc.error().offending_value, 1.0, 1e-9);
+  EXPECT_NEAR(rc.error().limit_value, 0.4, 1e-9);
+}
+
+TEST(Validator, CartesianTwistAngularSpeedDefaultsToUnboundedWhenUnset) {
+  // env.max_ee_angular_speed_rad_s defaults to kPosInfinity in make_env() --
+  // a robot that never declares this bound (every robot except the ones
+  // fixed as part of this change) must see unchanged behaviour.
+  auto env = make_env(6);
+  env.max_ee_speed_m_s = 0.5;
+  const std::vector<double> flat = {0.1, 0.0, 0.0, 100.0, 0.0, 0.0};
+  const auto view = make_chunk_view(flat, 1, 6, osk::ControlMode::kCartesianTwist);
+  const auto rc = osk::validate(view, env);
+  EXPECT_TRUE(rc);
+}
+
 TEST(Validator, CartesianPoseWorkspaceAabb) {
   auto env = make_env(7);
   env.workspace_box.set = true;
@@ -218,6 +245,54 @@ TEST(Validator, BodyTwistPassesWithSixDofWidthAndJointEnvelope) {
   const auto view = make_chunk_view(flat, 1, 6, osk::ControlMode::kBodyTwist);
   const auto rc = osk::validate(view, env);
   EXPECT_TRUE(rc);
+}
+
+TEST(Validator, BodyTwistLinearSpeedCapEnforced) {
+  auto env = make_env(11);
+  env.max_base_linear_speed_m_s = 0.3;
+  env.max_base_angular_speed_rad_s = 0.5;
+  // (vx, vy, vz, wx, wy, wz) — |v|=sqrt(36)=6.0 > 0.3 (the F12 6.0-vs-0.3
+  // m/s live-test scenario that motivated this check).
+  const std::vector<double> flat = {6.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  const auto view = make_chunk_view(flat, 1, 6, osk::ControlMode::kBodyTwist);
+  const auto rc = osk::validate(view, env);
+  ASSERT_FALSE(rc);
+  EXPECT_EQ(rc.error().kind, osk::ViolationKind::kForce);
+  EXPECT_STREQ(rc.error().field, "base_linear_speed");
+  EXPECT_NEAR(rc.error().offending_value, 6.0, 1e-9);
+  EXPECT_NEAR(rc.error().limit_value, 0.3, 1e-9);
+}
+
+TEST(Validator, BodyTwistAngularSpeedCapEnforced) {
+  auto env = make_env(11);
+  env.max_base_linear_speed_m_s = 0.3;
+  env.max_base_angular_speed_rad_s = 0.5;
+  // Linear component within bound; angular |w|=1.0 > 0.5.
+  const std::vector<double> flat = {0.1, 0.0, 0.0, 1.0, 0.0, 0.0};
+  const auto view = make_chunk_view(flat, 1, 6, osk::ControlMode::kBodyTwist);
+  const auto rc = osk::validate(view, env);
+  ASSERT_FALSE(rc);
+  EXPECT_EQ(rc.error().kind, osk::ViolationKind::kForce);
+  EXPECT_STREQ(rc.error().field, "base_angular_speed");
+  EXPECT_NEAR(rc.error().offending_value, 1.0, 1e-9);
+  EXPECT_NEAR(rc.error().limit_value, 0.5, 1e-9);
+}
+
+TEST(Validator, BodyTwistDimMismatchRejected) {
+  auto env = make_env(11);
+  env.max_base_linear_speed_m_s = 0.3;
+  // n_dof (row width) < 6: not a well-formed body-twist chunk.
+  auto narrow_env = env;
+  narrow_env.n_dof = 3;
+  narrow_env.joint_position_min.assign(3, -1.0);
+  narrow_env.joint_position_max.assign(3, 1.0);
+  narrow_env.joint_velocity_max.assign(3, 1.0);
+  narrow_env.joint_torque_max.assign(3, 1.0);
+  const std::vector<double> flat = {0.1, 0.0, 0.0};
+  const auto view = make_chunk_view(flat, 1, 3, osk::ControlMode::kBodyTwist);
+  const auto rc = osk::validate(view, narrow_env);
+  ASSERT_FALSE(rc);
+  EXPECT_EQ(rc.error().sub, osk::ControllerSubKind::kDimMismatch);
 }
 
 TEST(Validator, NonJointModeStillRejectsNan) {

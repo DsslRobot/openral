@@ -10,6 +10,7 @@ No mocks (CLAUDE.md §1.11). The CLI is exercised via Typer's
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -28,6 +29,8 @@ from openral_cli.deploy_sim import (
     _apply_palette_head_cam,
     _capability_matched_manifests,
     _cmdline_is_openral_graph_process,
+    _cmdline_is_process_group_leader,
+    _kill_orphan_openral_graph_processes,
     _preflight_palette_deps,
     _prepare_launch_env,
     _resolve_slam_backend,
@@ -1801,6 +1804,64 @@ def test_run_launch_returns_exit_code_and_leaves_no_orphans() -> None:
         grace_s=5.0,
     )
     assert rc == 7
+
+
+def test_run_launch_resets_an_inherited_sigint_ignore() -> None:
+    """The launch child must see SIGINT even when the CLI inherited SIG_IGN.
+
+    A CLI started as ``openral deploy sim … &`` from a non-interactive shell
+    inherits ``SIGINT=SIG_IGN`` (POSIX job-control rule). CPython keeps an
+    inherited SIG_IGN, so ``ros2 launch`` would never run its graceful
+    shutdown and the external simulator outlived every node (observed live
+    2026-09-14). The child below exits 0 only if CPython installed its
+    default SIGINT handler — which it does solely when SIGINT was NOT
+    ignored at startup.
+    """
+    probe = (
+        "import signal, sys; "
+        "sys.exit(0 if signal.getsignal(signal.SIGINT) is signal.default_int_handler else 3)"
+    )
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        rc = _run_launch([sys.executable, "-c", probe], dict(os.environ), grace_s=5.0)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    assert rc == 0
+
+
+def test_orphan_sweep_sigterms_the_group_leader_instead_of_sigkilling_it() -> None:
+    """The external-simulator wrapper is SIGTERMed so it can reap its group.
+
+    SIGKILLing the wrapper would orphan the kit-python process it guards
+    (the multi-GiB Isaac Sim leak the wrapper exists to prevent). Real
+    wrapper, real grandchild, real sweep: after the sweep both are gone.
+    """
+    wrapper = Path(__file__).resolve().parents[2] / "tools" / "process_group_wrapper.py"
+    proc = subprocess.Popen(
+        [sys.executable, str(wrapper), "--", sys.executable, "-c", "import time; time.sleep(300)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(0.8)  # let the wrapper setsid + spawn its child
+        cmdline = Path(f"/proc/{proc.pid}/cmdline").read_bytes().replace(b"\0", b" ").decode()
+        assert _cmdline_is_process_group_leader(cmdline)
+        assert not _cmdline_is_openral_graph_process(cmdline)
+        killed = _kill_orphan_openral_graph_processes()
+        assert killed >= 1
+        assert proc.wait(timeout=15.0) != 0
+        # The sleeping grandchild lived in the wrapper's group: it must be gone too
+        survivors: list[str] = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            with contextlib.suppress(FileNotFoundError, PermissionError, ProcessLookupError):
+                if b"time.sleep(300)" in (entry / "cmdline").read_bytes():
+                    survivors.append(entry.name)
+        assert survivors == []
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
 
 
 def test_orphan_needles_cover_tf_publishers_and_sidecar() -> None:

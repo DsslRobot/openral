@@ -21,7 +21,10 @@ import re
 from pathlib import Path
 
 import pytest
-import tomllib
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # PY310-HUMBLE PATCH: 3.10 has no stdlib tomllib
+    import tomli as tomllib  # type: ignore[no-redef]
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

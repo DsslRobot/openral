@@ -560,21 +560,21 @@ _SO100DigitalTwin — in-process simulator for the SO-100 follower arm._
 ### `python/hal/src/openral_hal/ros_control.py`
 _RosControlHAL — `ros2_control`-backed HAL adapter._
 
-- `class ControllerKind(StrEnum)` — Which ros2_control controller sits behind one command topic, and therefore which message type commands it: `JOINT_TRAJECTORY` (`trajectory_msgs/JointTrajectory` — every ros2_control robot in this repo, OpenArm's 1-DoF grippers included) and `FORWARD_COMMAND` (`std_msgs/Float64MultiArray`, the `forward_command_controller` family; no in-repo robot yet). Declared rather than assumed because publishing the wrong type is **silent** — DDS never delivers it, so the arm does not move and nothing logs an error. Re-exported from `openral_hal`. (L57)
-- `class RosControlHAL` — `ros2_control`-backed HAL adapter. (L109)
-  - `__init__(description, controller_name, *, joint_state_topic='/joint_states', command_topic=None, publish_fn=None, state_fn=None, staleness_limit_s=0.5)` (L138)
-  - `attach_transport(publish_fn, state_fn, stamp_fn=None) -> None` — Bind a live transport after construction; `build_hal` runs before any ROS node exists, so a real deployment cannot pass one to `__init__`. `stamp_fn` is the transport's per-message arrival clock and is what makes the staleness check a freshness check rather than a time-since-connect check. Rejects a non-callable `stamp_fn` at wire-up. (L173)
-  - `command_bindings() -> dict[str, ControllerKind]` — Every controller topic this HAL publishes to, each with the wire format its controller speaks; one entry becomes one typed transport publisher. Insertion order is the `send_action` fan-out order. **This is the override point for a new robot** — overridden by the bimanual OpenArm (4 topics, all `JOINT_TRAJECTORY`). (L212)
-  - `command_topics() -> list[str]` — Derived from `command_bindings()` so the topic list and the declared formats cannot drift; override `command_bindings`, not this. (L226)
-  - `ros2_control_joint_names() -> list[str]` — Joint names in ros2_control's namespace, action order; what `/joint_states` is keyed by. Overridden where URDF names differ from manifest names (OpenArm). (L234)
-  - **(property)** `joint_state_topic -> str` — The aggregated `sensor_msgs/JointState` topic this HAL reads. (L244)
-  - `connect() -> None` (L250)
+- `class ControllerKind(StrEnum)` — Which ros2_control controller sits behind one command topic, and therefore which message type commands it: `JOINT_TRAJECTORY` (`trajectory_msgs/JointTrajectory` — every ros2_control robot in this repo, OpenArm's 1-DoF grippers included) and `FORWARD_COMMAND` (`std_msgs/Float64MultiArray`, the `forward_command_controller` family; no in-repo robot yet). Declared rather than assumed because publishing the wrong type is **silent** — DDS never delivers it, so the arm does not move and nothing logs an error. Re-exported from `openral_hal`. (L61)
+- `class RosControlHAL` — `ros2_control`-backed HAL adapter. (L113)
+  - `__init__(description, controller_name, *, joint_state_topic='/joint_states', command_topic=None, publish_fn=None, state_fn=None, staleness_limit_s=0.5)` (L142)
+  - `attach_transport(publish_fn, state_fn, stamp_fn=None) -> None` — Bind a live transport after construction; `build_hal` runs before any ROS node exists, so a real deployment cannot pass one to `__init__`. `stamp_fn` is the transport's per-message arrival clock and is what makes the staleness check a freshness check rather than a time-since-connect check. Rejects a non-callable `stamp_fn` at wire-up. (L177)
+  - `command_bindings() -> dict[str, ControllerKind]` — Every controller topic this HAL publishes to, each with the wire format its controller speaks; one entry becomes one typed transport publisher. Insertion order is the `send_action` fan-out order. **This is the override point for a new robot** — overridden by the bimanual OpenArm (4 topics, all `JOINT_TRAJECTORY`). (L216)
+  - `command_topics() -> list[str]` — Derived from `command_bindings()` so the topic list and the declared formats cannot drift; override `command_bindings`, not this. (L230)
+  - `ros2_control_joint_names() -> list[str]` — Joint names in ros2_control's namespace, action order; what `/joint_states` is keyed by. Overridden where URDF names differ from manifest names (OpenArm). (L238)
+  - **(property)** `joint_state_topic -> str` — The aggregated `sensor_msgs/JointState` topic this HAL reads. (L248)
+  - `connect() -> None` (L254)
   - `disconnect() -> None` — inherited from `HALBase` (flag-and-log default; no extra teardown needed).
-  - `read_state() -> JointState` — Age is measured from `stamp_fn()` when a transport supplied one, else from `connect()`. (L270)
-  - `send_action(action) -> None` — Publish JointTrajectory; carries `joint_names` so no transport keeps a second copy of the mapping. (L312)
-  - `estop() -> None` (L347)
+  - `read_state() -> JointState` — Age is measured from `stamp_fn()` when a transport supplied one, else from `connect()`. (L274)
+  - `send_action(action) -> None` — Publish JointTrajectory; carries `joint_names` so no transport keeps a second copy of the mapping. (L316)
+  - `estop() -> None` (L351)
   - private: `_require_connected`, `_validate_action`
-- `_default_publish(topic, msg) -> None` — No-op publish when no real ROS 2 node. (L99)
+- `_default_publish(topic, msg) -> None` — No-op publish when no real ROS 2 node. (L103)
 
 ### `python/hal/src/openral_hal/ros_control_transport.py`
 _Production `rclpy` transport shared by every real `RosControlHAL` robot._

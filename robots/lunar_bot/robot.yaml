@@ -1,0 +1,394 @@
+# RobotDescription -- LunarBot: 4-wheel independent-drive/independent-steering
+# (4WIS/4WID) rover chassis + 7-DoF RealMan RM-75 manipulator + Inspire-Robots
+# EG2-4C2 parallel gripper, fused into a single PhysX articulation.
+#
+# Source of truth for every joint name and every velocity/effort limit below:
+# the Space Robotics Bench asset definition (a sibling project, developed
+# independently -- this manifest is READ-derived from it, not authoritative
+# over it):
+#   space_robotics_bench/srb/assets/robot/mobile_manipulation/lunarbot.py
+# Cross-checked against the live `sensor_msgs/JointState` SRB actually
+# publishes on `/srb/env0/robot/joint_states` (21 joints, same names) --
+# see the research repo's docs/srb_integration_notes.md.
+#
+# No URDF/SRDF exists for this robot (SRB ships a USD asset, not a URDF), so:
+#   - `assets` is empty -- no self-collision lowering, no robot_state_publisher
+#     wiring from this manifest today.
+#   - every joint's `parent_link`/`child_link` below is an INFERRED label
+#     from the joint-naming convention, not a real URDF/USD link name. They
+#     are placeholders that satisfy the schema; nothing in this first
+#     integration slice (BODY_TWIST only) resolves a kinematic chain through
+#     them. Do not rely on them for collision/IK work without replacing them
+#     from the real USD tree first.
+#
+# `hal.sim` AND `hal.real` point at the SAME topic-bridge adapter
+# (`LunarBotSRBHAL`) -- this HAL is transport-shaped, not physics-shaped.
+# Although SRB is a simulator, from OpenRAL's perspective it is an EXTERNAL
+# system reached only over ROS 2 topics that OpenRAL does not own or step --
+# structurally identical to how UR5eRealHAL reaches `ur_robot_driver` over
+# ROS. `hal.sim` in this codebase MORE OFTEN means OpenRAL's own in-process
+# MuJoCo physics (MujocoArmHAL / SimAttachedHAL), which this is not; here it
+# just means "the process on the other end of the topics is SRB instead of
+# real hardware". `openral deploy sim` spawns and gates that SRB process
+# itself via `DeployScene.simulator` (`_ROBOT_HAL_REGISTRY["lunar_bot"]` is
+# `bare_twin_sim=True` so the launch never scene-attaches this robot through
+# `openral_sim.SCENES` — see the research repo's
+# docs/srb_deploy_backend_plan.md).
+#
+# All three actuator surfaces (base, arm, gripper) are driven through the
+# real candidate_action -> C++ safety kernel -> safe_action path -- see
+# packages/openral_hal_lunar_bot/. BODY_TWIST (base, via SRB's cmd_vel)
+# landed first and was proven end to end before CARTESIAN_TWIST (arm, via
+# SRB's differential_inverse_kinematics action) and GRIPPER_BINARY (via
+# SRB's binary_joint_position action) were added on top of it.
+#
+# CARTESIAN_TWIST is NOT a direct m/s passthrough on SRB's side the way
+# BODY_TWIST is -- SRB's arm_ik action term treats its raw Twist as a
+# per-control-step scaled POSITION delta (Isaac Lab's relative-mode
+# differential IK), not a native rate. openral_hal.lunar_bot_srb converts
+# the physical m/s / rad/s this manifest's bounds below constrain into
+# SRB's raw units via an empirically measured (pose-dependent, so
+# deliberately conservative) calibration -- see that module's
+# _ARM_LINEAR_MPS_PER_RAW_UNIT / _ARM_ANGULAR_RADPS_PER_RAW_UNIT constants
+# for the measured data and rationale.
+
+name: "lunar_bot"
+embodiment_kind: "mobile_manipulator"
+base_frame: "chassis_base_link"
+
+# No base_joints: LunarBot is NOT a holonomic x/y/yaw planar base (that field
+# is for panda_mobile-style robots). It is a 4WIS/4WID rover driven by
+# BODY_TWIST directly through SRB's FourWheelSteerActionCfg kinematics --
+# there are no virtual planar-base joints to name.
+
+joints:
+  # -- Steering (4) -- effort_limit / velocity_limit from lunarbot.py's
+  # "steering" ImplicitActuatorCfg (100.0 Nm / 1.9635 rad/s = 112.5 deg/s).
+  # position_limits: SRB's FourWheelSteerActionCfg.max_steering_angle
+  # (four_wheel_steer.py) hard-clamps every commanded steer angle to
+  # +/-120 deg -- the real mechanical/control limit, not a placeholder.
+  # These joints are driven only via BODY_TWIST (never JOINT_POSITION --
+  # they are not in LunarBotSRBHAL's _ARM_JOINT_NAMES), so
+  # openral_deploy_sim only needs this declared to satisfy
+  # validate_for_e2e_pipeline's e2e contract (F20: a JOINT_POSITION row is
+  # always the full 21-wide vector, zero-padded for non-arm slots -- 0.0
+  # sits well inside this range).
+  - name: "chassis_to_front_left_steering_joint"
+    joint_type: "revolute"
+    parent_link: "chassis_base_link"
+    child_link: "front_left_steering_link"
+    position_limits: [-2.0943951, 2.0943951]
+    velocity_limit: 1.9635
+    effort_limit: 100.0
+  - name: "chassis_to_front_right_steering_joint"
+    joint_type: "revolute"
+    parent_link: "chassis_base_link"
+    child_link: "front_right_steering_link"
+    position_limits: [-2.0943951, 2.0943951]
+    velocity_limit: 1.9635
+    effort_limit: 100.0
+  - name: "chassis_to_rear_left_steering_joint"
+    joint_type: "revolute"
+    parent_link: "chassis_base_link"
+    child_link: "rear_left_steering_link"
+    position_limits: [-2.0943951, 2.0943951]
+    velocity_limit: 1.9635
+    effort_limit: 100.0
+  - name: "chassis_to_rear_right_steering_joint"
+    joint_type: "revolute"
+    parent_link: "chassis_base_link"
+    child_link: "rear_right_steering_link"
+    position_limits: [-2.0943951, 2.0943951]
+    velocity_limit: 1.9635
+    effort_limit: 100.0
+  # -- Wheels (4) -- "wheels" ImplicitActuatorCfg: 48.512 Nm / 41.4458 rad/s.
+  # Wheel radius 0.1453 m (lunarbot.py FourWheelSteerActionCfg) -> ~6.0 m/s
+  # theoretical max wheel-surface speed; the SafetyEnvelope below declares a
+  # much more conservative operational bound for this first integration test.
+  # position_limits: `continuous` joints spin freely -- there is no real
+  # mechanical limit to declare. +/-1000 revolutions (1000 * 2*pi rad) is
+  # not a physical bound, just a large-enough-to-never-bind ceiling so
+  # validate_for_e2e_pipeline's e2e contract is satisfied honestly (a
+  # placeholder value would misrepresent an actual limit; this represents
+  # "effectively unbounded" instead). Driven only via BODY_TWIST, same as
+  # the steering joints above -- never JOINT_POSITION-targeted.
+  - name: "front_left_steering_to_wheel_joint"
+    joint_type: "continuous"
+    parent_link: "front_left_steering_link"
+    child_link: "front_left_wheel_link"
+    position_limits: [-6283.185307, 6283.185307]
+    velocity_limit: 41.4458
+    effort_limit: 48.512
+  - name: "front_right_steering_to_wheel_joint"
+    joint_type: "continuous"
+    parent_link: "front_right_steering_link"
+    child_link: "front_right_wheel_link"
+    position_limits: [-6283.185307, 6283.185307]
+    velocity_limit: 41.4458
+    effort_limit: 48.512
+  - name: "rear_left_steering_to_wheel_joint"
+    joint_type: "continuous"
+    parent_link: "rear_left_steering_link"
+    child_link: "rear_left_wheel_link"
+    position_limits: [-6283.185307, 6283.185307]
+    velocity_limit: 41.4458
+    effort_limit: 48.512
+  - name: "rear_right_steering_to_wheel_joint"
+    joint_type: "continuous"
+    parent_link: "rear_right_steering_link"
+    child_link: "rear_right_wheel_link"
+    position_limits: [-6283.185307, 6283.185307]
+    velocity_limit: 41.4458
+    effort_limit: 48.512
+  # -- Arm (7-DoF RealMan RM-75) -- driven via CARTESIAN_TWIST and
+  # JOINT_POSITION, both through SRB's single switchable arm action term,
+  # whose own controller picks which sub-command actually drives the joints
+  # each step (see the module header comment).
+  #
+  # position_limits: the RM-75 datasheet's joint ranges (degrees -> radians,
+  # 4 dp), supplied by the robot's owner and recorded in the research repo's
+  # docs/lunar_bot_rm75_spec.md: J1 +/-178, J2 +/-130, J3 +/-178, J4 +/-135,
+  # J5 +/-178, J6 +/-128, J7 +/-360. The safety kernel's JOINT_POSITION
+  # per-joint bound check compares every commanded target against these.
+  # velocity_limit: datasheet max joint speed, J1-J2 180 deg/s, J3-J7
+  # 225 deg/s -- identical to lunarbot.py's "arm" ImplicitActuatorCfg.
+  # effort_limit: from lunarbot.py (the datasheet gives no per-joint torque).
+  - name: "joint1"
+    joint_type: "revolute"
+    parent_link: "chassis_base_link"
+    child_link: "Link1"
+    position_limits: [-3.1067, 3.1067]
+    velocity_limit: 3.14
+    effort_limit: 60.0
+  - name: "joint2"
+    joint_type: "revolute"
+    parent_link: "Link1"
+    child_link: "Link2"
+    position_limits: [-2.2689, 2.2689]
+    velocity_limit: 3.14
+    effort_limit: 60.0
+  - name: "joint3"
+    joint_type: "revolute"
+    parent_link: "Link2"
+    child_link: "Link3"
+    position_limits: [-3.1067, 3.1067]
+    velocity_limit: 3.92
+    effort_limit: 30.0
+  - name: "joint4"
+    joint_type: "revolute"
+    parent_link: "Link3"
+    child_link: "Link4"
+    position_limits: [-2.3562, 2.3562]
+    velocity_limit: 3.92
+    effort_limit: 30.0
+  - name: "joint5"
+    joint_type: "revolute"
+    parent_link: "Link4"
+    child_link: "Link5"
+    position_limits: [-3.1067, 3.1067]
+    velocity_limit: 3.92
+    effort_limit: 10.0
+  - name: "joint6"
+    joint_type: "revolute"
+    parent_link: "Link5"
+    child_link: "Link6"
+    position_limits: [-2.2340, 2.2340]
+    velocity_limit: 3.92
+    effort_limit: 10.0
+  - name: "joint7"
+    joint_type: "revolute"
+    parent_link: "Link6"
+    child_link: "Link7"
+    position_limits: [-6.2832, 6.2832]
+    velocity_limit: 3.92
+    effort_limit: 10.0
+  # -- Gripper (Inspire EG2-4C2, 6 actuated joints, mimic-linked in SRB at the
+  # action-group level) -- lunarbot.py's "gripper" ImplicitActuatorCfg.
+  # position_limits: (0.0, 1.0) is the OpenRAL HAL contract for a normalised
+  # jaw fraction (JointSpec docstring) -- SRB's own mechanical stroke
+  # (+/- 0.82 rad, per-joint sign in _GRIPPER_SIGN) is a simulator-internal
+  # detail the HAL translation layer owns, not this envelope. Driven via
+  # GRIPPER_BINARY (>= 0.5 = open); openral_hal.lunar_bot_srb applies SRB's
+  # own inverted True=close/False=open wire convention on the way out.
+  - name: "eg2_joint1"
+    joint_type: "revolute"
+    parent_link: "Link7"
+    child_link: "eg2_joint1_link"
+    position_limits: [0.0, 1.0]
+    velocity_limit: 0.6308
+    effort_limit: 0.9
+  - name: "eg2_joint2"
+    joint_type: "revolute"
+    parent_link: "Link7"
+    child_link: "eg2_joint2_link"
+    position_limits: [0.0, 1.0]
+    velocity_limit: 0.6308
+    effort_limit: 0.9
+  - name: "eg2_joint3"
+    joint_type: "revolute"
+    parent_link: "Link7"
+    child_link: "eg2_joint3_link"
+    position_limits: [0.0, 1.0]
+    velocity_limit: 0.6308
+    effort_limit: 0.9
+  - name: "eg2_joint4"
+    joint_type: "revolute"
+    parent_link: "Link7"
+    child_link: "eg2_joint4_link"
+    position_limits: [0.0, 1.0]
+    velocity_limit: 0.6308
+    effort_limit: 0.9
+  - name: "eg2_joint5"
+    joint_type: "revolute"
+    parent_link: "Link7"
+    child_link: "eg2_joint5_link"
+    position_limits: [0.0, 1.0]
+    velocity_limit: 0.6308
+    effort_limit: 0.9
+  - name: "eg2_joint6"
+    joint_type: "revolute"
+    parent_link: "Link7"
+    child_link: "eg2_joint6_link"
+    position_limits: [0.0, 1.0]
+    velocity_limit: 0.6308
+    effort_limit: 0.9
+
+capabilities:
+  locomotion:
+    - "wheeled"
+  can_lift_kg: 5.0  # RM-75 rated payload (datasheet, docs/lunar_bot_rm75_spec.md)
+  has_dexterous_hands: false
+  has_tactile: false
+  has_force_control: false
+  has_vision: true  # front_camera + wrist_camera per lunarbot.py Frame declarations
+  # Livox Mid-360, landed 2026-09-14 on SRB `feat/mid360-lidar` as the scene
+  # sensor `lidar_robot` (RayCaster, real Livox scan-pattern point density
+  # approximation -- see `sensors.lidar` below and docs/research_findings.md
+  # F23/F24). RTX Lidar (higher fidelity) was attempted on the same branch
+  # and parked on a confirmed upstream Isaac Sim bug; RayCaster is the
+  # permanent implementation, not a placeholder.
+  has_lidar: true
+  has_vision_slam: false
+  supported_control_modes:
+    - "body_twist"
+    - "cartesian_twist"
+    - "joint_position"
+    - "gripper_binary"
+  embodiment_tags:
+    - "lunar_bot"
+    # Canonical class tag for any robot with a planar base + body_twist
+    # actuator (openral_core.schemas) -- lets generic base-only rSkills
+    # target the class without naming this specific robot.
+    - "mobile_base"
+    # Canonical class tag for the RM-75 arm (any embodiment carrying one) --
+    # lets the generic rskill-moveit-* family (§8.3 item 6) target this
+    # robot's arm without a lunar_bot-specific manifest. MoveIt config:
+    # packages/rm_description/ + packages/rm_75_config/ (vendored, see
+    # docs/research_findings.md F31 for the license/provenance decision).
+    - "rm75"
+
+# LunarBot is `hal.real` (SRB is an external ROS-attached system, see the
+# header comment) -- so these are NOT `deploy_binding`-opened; ``openral_hal_
+# lunar_bot.sensor_bridge_node`` relays SRB's own already-computed ROS topics
+# (image/camera_info/pointcloud/imu, all published live by
+# `srb.interfaces.interface.ros.RosInterface` under `--interface ros`) onto
+# these frame_id/topic conventions rather than opening a device or
+# recomputing intrinsics -- see docs/lunar_bot_capability_set_plan.md §3.2.
+# `intrinsics` below are the values Isaac Sim's own pinhole model produces at
+# `camera_resolution=[640,480]` (fx=fy=width*focal_length/horizontal_aperture,
+# cx=width/2, cy=height/2 -- `PinholeCameraCfg` in SRB's
+# `ground_manipulation/visual_ext.py`), recorded for documentation; the
+# bridge relays SRB's live `CameraInfo` verbatim, so a resolution change
+# there does not desync this manifest's numbers from what is actually
+# published (only this comment's claim about the default would go stale).
+sensors:
+  - name: "front"
+    modality: "rgb"
+    frame_id: "front_camera_optical_frame"
+    parent_frame: "chassis_base_link"
+    rate_hz: 30.0
+    intrinsics: { width: 640, height: 480, fx: 266.667, fy: 266.667, cx: 320.0, cy: 240.0 }
+    encoding: "rgb8"
+  - name: "front_depth"
+    modality: "depth"
+    frame_id: "front_camera_optical_frame"  # same optical centre as `front`
+    parent_frame: "chassis_base_link"
+    rate_hz: 30.0
+    intrinsics: { width: 640, height: 480, fx: 266.667, fy: 266.667, cx: 320.0, cy: 240.0 }
+    encoding: "32FC1"  # metres, direct passthrough of SRB's own depth image
+    range_min_m: 0.05
+    range_max_m: 25.0  # PinholeCameraCfg clipping_range, ground_manipulation/visual_ext.py
+  - name: "wrist"
+    modality: "rgb"
+    frame_id: "wrist_camera_optical_frame"
+    parent_frame: "chassis_base_link"  # re-rooted flat, not through the arm chain (§3.2 item 1)
+    rate_hz: 30.0
+    intrinsics: { width: 640, height: 480, fx: 400.0, fy: 400.0, cx: 320.0, cy: 240.0 }
+    encoding: "rgb8"
+  - name: "imu"
+    modality: "imu"
+    frame_id: "imu_link"
+    parent_frame: "chassis_base_link"
+    rate_hz: 50.0  # descriptive only -- the bridge relays every message received, unrated
+  - name: "lidar"
+    modality: "point_cloud"
+    frame_id: "lidar_link"
+    parent_frame: "chassis_base_link"
+    # Livox Mid-360 datasheet nominal (docs/srb_deploy_backend_plan.md §5);
+    # SRB's RayCaster (F23/F24 -- not the real non-repetitive scan pattern,
+    # a comparable-density LidarPatternCfg approximation) publishes at the
+    # env's control rate, not literally 10 Hz -- see that section for the
+    # fidelity caveat this number records.
+    rate_hz: 10.0
+    n_channels: 40  # srb/core/env/mobile/env.py _MID360_CHANNELS
+    range_max_m: 40.0  # _MID360_MAX_RANGE_M
+
+safety:
+  deadman_required: true
+  # Conservative, provisional bounds for this FIRST safety-kernel integration
+  # test -- NOT derived from a validated LunarBot operating envelope (none
+  # exists yet). Theoretical ceiling from wheel velocity_limit x wheel_radius
+  # (41.4458 rad/s x 0.1453 m ~= 6.0 m/s) is far higher; deliberately declaring
+  # a small fraction of it here until real operational limits are set by
+  # experiment design, per execution_plan.md's "do not hard-code scientific
+  # thresholds" rule -- this is an engineering safety margin for bring-up, not
+  # a claimed operational limit.
+  max_base_linear_speed_m_s: 0.3
+  max_base_angular_speed_rad_s: 0.5
+  # Arm CARTESIAN_TWIST bounds -- same "conservative, provisional, first
+  # integration slice" status as the base bounds above, chosen with extra
+  # margin under openral_hal.lunar_bot_srb's calibration (raw=1.0 measured
+  # at 0.29-0.43 m/s / 0.39-0.46 rad/s depending on pose/direction): at
+  # these declared caps the HAL's raw conversion stays well inside the
+  # measured range at every pose tested, not just on average.
+  # The RM-75 datasheet's mechanical TCP ceiling is 1.8 m/s; 0.2 m/s is the
+  # deliberate operational bring-up bound, never to exceed that ceiling.
+  max_ee_speed_m_s: 0.2
+  max_ee_angular_speed_rad_s: 0.3
+
+# Nav2 costmap/MPPI overrides (RobotDescription.nav2_param_overrides(),
+# §8.3 item 5) -- computed from the real wheel geometry SRB's
+# FourWheelSteerActionCfg uses (lunarbot.py wheel_positions/wheel_radius),
+# not an invented number: the farthest wheel centre (rear, (-0.5225,
+# 0.42705)) is 0.6749 m from the chassis origin; + wheel_radius (0.1453 m,
+# the wheel's own lateral extent when steered) = 0.8202 m, rounded down.
+# Conservative but a likely UNDERESTIMATE of the full chassis (mast + arm
+# overhang aren't included -- `assets` is still empty, no USD-derived hull
+# exists yet, see the header comment) -- same "provisional first-
+# integration-test bound" status as the safety envelope above, not a
+# claimed final footprint.
+footprint_radius: 0.82
+# `(v, omega)` is the entire commanded space (four_wheel_steer.py
+# FourWheelSteerAction.action_dim == 2) -- no strafing, despite the
+# independent-steering wheels -- so "differential" (-> Nav2 MPPI
+# `motion_model: DiffDrive`) matches the real command interface; "omni"
+# would tell the planner it can command lateral velocity, which nothing
+# downstream of BODY_TWIST honours for this robot (F19,
+# `four_wheel_steer.py`'s own module docstring).
+base_kinematics: "differential"
+
+sdk_kind: "open"
+hal:
+  sim: "openral_hal.lunar_bot_srb:LunarBotSRBHAL"
+  real: "openral_hal.lunar_bot_srb:LunarBotSRBHAL"
+schema_version: "0.1"

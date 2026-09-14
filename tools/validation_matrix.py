@@ -2759,7 +2759,7 @@ def parse_log_start_time(lines: Iterable[str]) -> str | None:
         match = re.search(r"\[(1[0-9]{9})\.([0-9]{9})\]", line)
         if match:
             seconds = int(match.group(1)) + int(match.group(2)) / 1e9
-            return _dt.datetime.fromtimestamp(seconds, tz=_dt.UTC).isoformat()
+            return _dt.datetime.fromtimestamp(seconds, tz=_dt.timezone.utc).isoformat()
     return None
 
 
@@ -2927,7 +2927,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     metadata = {
         "round_id": args.round_id,
-        "started_at": _dt.datetime.now(tz=_dt.UTC).isoformat(),
+        "started_at": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
         "host": socket.gethostname(),
         "executed_sha": executed_sha,
         "worktree_clean": True,

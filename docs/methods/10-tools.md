@@ -159,17 +159,17 @@ _Answers the fact [issue #108](https://github.com/OpenRAL/openral/issues/108) wa
 ### `tools/select_tests.py`
 _Selective test execution — maps a git diff to the minimal pytest targets that can observe it. Backs `just test-changed` / the `test-selective` workflow. See [`docs/contributing/selective-testing.md`](../contributing/selective-testing.md)._
 
-- `class CapabilityGap(BaseModel)` (L56) — A capability the CI runner provably cannot provide: `summary`, `satisfied_by`, `skip_patterns` (fnmatch globs matched against a skip's reason).
-- `class SelectionConfig(BaseModel)` (L70) — Typed view of `tools/test_selection.toml`: `full_run_globs`, `ignore_globs`, `isolate_globs`, `extra_triggers`, `requirement_globs`, `capability_gaps`.
-- `class SelectionResult(BaseModel)` (L81) — `full_run` / `full_run_reason` / `affected_packages` / `targets` / `isolated_targets` (own-process, issue #24) / `requirement_targets` (per opt-in lane) / `reasons` (per-target rationale).
-- `load_config(path) -> SelectionConfig` (L105) — Load + validate the TOML config.
-- `package_dir_import_names(repo_root) -> dict[str, str]` (L117) — `python/<dir>` → its `src/openral_*` import name.
-- `build_dependency_graph(repo_root) -> dict[str, set[str]]` (L136) — Import-name → direct `openral` deps, derived from each `pyproject.toml` (never hand-written).
-- `transitive_dependents(graph, changed) -> set[str]` (L160) — Closure of packages that depend on any changed package (includes `changed`).
-- `map_test_imports(repo_root) -> dict[str, set[str]]` (L187) — Each top-level `tests/` file → the `openral_*` packages it imports.
-- `select(repo_root, changed_files, config) -> SelectionResult` (L346) — Resolve changed paths to pytest targets (blast-radius → full run; else per-package dirs + import-intersecting tests), peeling `isolate_globs` matches into `isolated_targets`.
-- `changed_files_from_git(base, head, repo_root) -> list[str]` (L462) — Merge-base `git diff --name-only base...head`.
-- `main(argv=None) -> int` (L502) — CLI; `--files` / `--base/--head`, `--github-output` for CI step outputs.
+- `class CapabilityGap(BaseModel)` (L59) — A capability the CI runner provably cannot provide: `summary`, `satisfied_by`, `skip_patterns` (fnmatch globs matched against a skip's reason).
+- `class SelectionConfig(BaseModel)` (L73) — Typed view of `tools/test_selection.toml`: `full_run_globs`, `ignore_globs`, `isolate_globs`, `extra_triggers`, `requirement_globs`, `capability_gaps`.
+- `class SelectionResult(BaseModel)` (L84) — `full_run` / `full_run_reason` / `affected_packages` / `targets` / `isolated_targets` (own-process, issue #24) / `requirement_targets` (per opt-in lane) / `reasons` (per-target rationale).
+- `load_config(path) -> SelectionConfig` (L108) — Load + validate the TOML config.
+- `package_dir_import_names(repo_root) -> dict[str, str]` (L120) — `python/<dir>` → its `src/openral_*` import name.
+- `build_dependency_graph(repo_root) -> dict[str, set[str]]` (L139) — Import-name → direct `openral` deps, derived from each `pyproject.toml` (never hand-written).
+- `transitive_dependents(graph, changed) -> set[str]` (L163) — Closure of packages that depend on any changed package (includes `changed`).
+- `map_test_imports(repo_root) -> dict[str, set[str]]` (L190) — Each top-level `tests/` file → the `openral_*` packages it imports.
+- `select(repo_root, changed_files, config) -> SelectionResult` (L349) — Resolve changed paths to pytest targets (blast-radius → full run; else per-package dirs + import-intersecting tests), peeling `isolate_globs` matches into `isolated_targets`.
+- `changed_files_from_git(base, head, repo_root) -> list[str]` (L465) — Merge-base `git diff --name-only base...head`.
+- `main(argv=None) -> int` (L505) — CLI; `--files` / `--base/--head`, `--github-output` for CI step outputs.
 
 ### `tools/lane_report.py`
 _Opt-in lane accounting — decides, records and attests what each dependency lane actually ran. Makes a vacuous green impossible (issue #163). See [`docs/contributing/selective-testing.md`](../contributing/selective-testing.md)._

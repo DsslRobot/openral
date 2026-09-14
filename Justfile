@@ -427,6 +427,7 @@ ros2-build:
                           openral_hal_g1 \
                           openral_hal_h1 \
                           openral_hal_rizon4 \
+                          openral_hal_lunar_bot \
                           openral_world_state \
                           openral_reasoner_ros \
                           openral_prompt_router \
@@ -440,6 +441,8 @@ ros2-build:
                           openral_foxglove_bringup \
                           openral_octomap_bridge \
                           openral_perception_ros \
+                          rm_description \
+                          rm_75_config \
         --cmake-args -DPython3_EXECUTABLE="$(pwd)/.venv/bin/python" \
                      -DCMAKE_C_COMPILER=/usr/bin/gcc \
                      -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
@@ -527,6 +530,7 @@ ros2-test:
                           openral_hal_g1 \
                           openral_hal_h1 \
                           openral_hal_rizon4 \
+                          openral_hal_lunar_bot \
                           openral_world_state \
                           openral_reasoner_ros \
                           openral_prompt_router \
@@ -539,7 +543,9 @@ ros2-test:
                           openral_nav2_bringup \
                           openral_foxglove_bringup \
                           openral_octomap_bridge \
-                          openral_perception_ros
+                          openral_perception_ros \
+                          rm_description \
+                          rm_75_config
     colcon test-result --verbose
 
 # Run a SimEnvironment YAML config end-to-end via the eval registry/runner.

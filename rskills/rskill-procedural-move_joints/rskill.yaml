@@ -1,0 +1,85 @@
+# rSkill manifest — deterministic JOINT_POSITION for LunarBot's RM-75 arm
+# (kind: procedural). execution_plan.md §8.3 item 3.
+#
+# No learned weights, no external ROS action/service server: the entrypoint
+# class closes the loop on world_state.joint_state directly, same rationale
+# as rskill-procedural-body_twist. Which pose to target is entirely the
+# caller's decision (goal_params_json) — this skill knows only how to servo
+# 7 joint targets to convergence; it encodes no mission semantics.
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-move_joints"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+# lunar_bot only -- ARM_JOINT_NAMES / full_width_joint_row (openral_rskill.
+# _lunar_bot_arm) assume this robot's specific 7-joint RM-75 arm + 21-wide
+# kernel envelope (F20).
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "joint_position"
+    control_mode_semantics:
+      mode: "absolute"
+      joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+
+# REQUIRED for kind='procedural' (the safety supervisor only checks row 0 of
+# every chunk today; one waypoint per chunk keeps every commanded position
+# checked against the kernel's per-joint envelope).
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Servo the 7-DoF RM-75 arm's joints to a target joint configuration
+  (radians), holding until every joint is within tolerance or timing out.
+  Deterministic -- no learned policy, no external ROS server. Use when you
+  have a joint-space goal; for a Cartesian TCP target use
+  rskill-procedural-move_ee_to_pose instead.
+actions:
+  - "reach"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_move_joints:MoveJointsRskill"
+  # No physically meaningful "no-op" default exists for a position skill (see
+  # the body_twist manifest's identity-velocity default for comparison) --
+  # the stow pose (lunarbot.py's own init_state) is used as a safe, always-
+  # valid default so a misconfigured dispatch without an override still
+  # commands a legal, low-risk posture rather than an arbitrary one. The
+  # reasoner is expected to override 'joint_targets' on every real dispatch.
+  default_goal_json: |
+    {
+      "joint_targets": [0.0, -0.6, 0.0, 1.2, 0.0, 0.6, 0.0],
+      "tolerance_rad": 0.05,
+      "timeout_s": 15.0
+    }
+
+# Per-skill JSON Schema surfaced to the Reasoner LLM tool palette.
+goal_params_schema:
+  type: object
+  description: >
+    Target joint configuration (radians) for the 7-DoF RM-75 arm, in
+    joint1..joint7 order.
+  properties:
+    joint_targets:
+      type: array
+      items: { type: number }
+      minItems: 7
+      maxItems: 7
+      description: "[joint1..joint7] target angles in radians."
+    tolerance_rad:
+      type: number
+      exclusiveMinimum: 0
+      description: "Per-joint convergence tolerance (radians)."
+    timeout_s:
+      type: number
+      exclusiveMinimum: 0
+      description: "Seconds to wait for convergence before giving up."
+  required: ["joint_targets"]

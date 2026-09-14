@@ -13,8 +13,14 @@ from typing import Any
 import pytest
 import torch
 from openral_core.exceptions import ROSConfigError, ROSRuntimeError
-from openral_rskill.executor import ChunkedExecutor
 from structlog.testing import capture_logs
+
+# PY310-HUMBLE PATCH: this module exercises the real lerobot RTCConfig, which
+# requires Python >= 3.12 (see the research repo's docs/openral_py310_patch.md).
+# Whole-module skip, same as test_vla_core_rtc.py.
+pytest.importorskip("lerobot", reason="this module drives the real lerobot RTCConfig")
+
+from openral_rskill.executor import ChunkedExecutor  # noqa: E402
 
 CHUNK, DOF = 10, 3
 

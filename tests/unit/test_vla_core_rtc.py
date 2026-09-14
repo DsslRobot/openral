@@ -4,6 +4,15 @@ from typing import Any
 
 import pytest
 from openral_core.exceptions import ROSConfigError
+
+# PY310-HUMBLE PATCH: openral_hal (and this module's own lerobot RTCConfig
+# path) no longer carry lerobot as a base dependency — it requires Python
+# >= 3.12; see the research repo's docs/openral_py310_patch.md. Whole-module
+# skip mirrors test_openarm_real_hal.py's guard for the same reason; every
+# test in this file either imports lerobot directly or exercises
+# build_chunk_executor, which does.
+pytest.importorskip("lerobot", reason="this module's RTC path imports lerobot")
+
 from openral_rskill._vla_core import (
     _parse_rtc_config,
     build_chunk_executor,
