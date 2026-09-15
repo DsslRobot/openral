@@ -1993,6 +1993,14 @@ class RobotDescription(BaseModel):
     # Both ``None`` on fixed-base arms (no Nav2).
     footprint_radius: float | None = Field(default=None, gt=0.0)
     base_kinematics: Literal["differential", "holonomic", "omni", "ackermann"] | None = None
+    # Optional Nav2 speed caps (m/s, rad/s). The shared base param file's
+    # velocity bounds are one robot's tuning; a robot whose safety kernel
+    # bounds differ declares its own caps here so Nav2 plans inside them
+    # (the kernel rejects a whole BODY_TWIST chunk above
+    # ``safety.max_base_*``). Must not exceed those safety bounds. ``None``
+    # keeps the base file's values.
+    nav2_max_linear_speed_m_s: float | None = Field(default=None, gt=0.0)
+    nav2_max_angular_speed_rad_s: float | None = Field(default=None, gt=0.0)
     # Geometric safety. ``collision_geometry`` is the lowered,
     # kernel-facing set of per-link convex primitives; ``allowed_collision_pairs``
     # is the self-collision exclusion matrix (adjacent links touch by design).
@@ -2040,6 +2048,20 @@ class RobotDescription(BaseModel):
             )
         if any(not math.isfinite(c) for pt in poly for c in pt):
             raise ValueError("footprint_polygon vertices must be finite (no NaN/inf)")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_nav2_speed_caps(self) -> RobotDescription:
+        """Nav2 speed caps must sit inside the kernel's BODY_TWIST bounds."""
+        for cap, bound, name in (
+            (self.nav2_max_linear_speed_m_s, self.safety.max_base_linear_speed_m_s, "linear"),
+            (self.nav2_max_angular_speed_rad_s, self.safety.max_base_angular_speed_rad_s, "angular"),
+        ):
+            if cap is not None and bound is not None and cap > bound:
+                raise ValueError(
+                    f"nav2_max_{name}_speed ({cap}) exceeds safety.max_base_{name}_speed ({bound}); "
+                    "the kernel would reject Nav2's commands"
+                )
         return self
 
     @model_validator(mode="after")
@@ -2152,9 +2174,11 @@ class RobotDescription(BaseModel):
         full-footprint collision checks), ``footprint_polygon`` →
         the costmap ``footprint`` polygon (see
         ``nav2_footprint_param``), and ``base_kinematics`` →
-        the MPPI ``motion_model``. Returns an empty dict for fixed-base
-        arms (no mobile base → no Nav2). Velocity bounds remain Nav2
-        tuning in the base param file, not robot identity.
+        the MPPI ``motion_model``, and the optional ``nav2_max_*_speed``
+        caps → MPPI ``vx_max`` / ``wz_max`` and the velocity smoother's
+        ``max_velocity`` / ``min_velocity``. Returns an empty dict for
+        fixed-base arms (no mobile base → no Nav2). Without declared caps,
+        velocity bounds remain Nav2 tuning in the base param file.
         """
         overrides: dict[str, str] = {}
         if self.footprint_radius is not None or self.footprint_polygon:
@@ -2174,6 +2198,16 @@ class RobotDescription(BaseModel):
                 "differential": "DiffDrive",
                 "ackermann": "Ackermann",
             }[self.base_kinematics]
+        v, w = self.nav2_max_linear_speed_m_s, self.nav2_max_angular_speed_rad_s
+        if v is not None:
+            overrides["vx_max"] = str(v)
+        if w is not None:
+            overrides["wz_max"] = str(w)
+        if v is not None or w is not None:
+            # velocity_smoother's [x, y, theta] limits; y stays 0 as in the base file.
+            vs, ws = v if v is not None else 0.5, w if w is not None else 2.0
+            overrides["max_velocity"] = f"[{vs}, 0.0, {ws}]"
+            overrides["min_velocity"] = f"[{-vs}, 0.0, {-ws}]"
         return overrides
 
     @model_validator(mode="after")
