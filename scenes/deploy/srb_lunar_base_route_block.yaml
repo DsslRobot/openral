@@ -1,0 +1,68 @@
+# Route-block variant of srb_lunar_base.yaml: a parked crew rover across the west leg of the depot
+# loop, baked into the lidar mesh (SRB scenery `lunar_base_route_block`, built with
+# `build_scene.py --variant route_block`). Used for the §8.5 Nav2 route-block check.
+#
+# LunarBot on the Connecting Ridge Outpost lunar base scene (SRB `lunar_base`), for
+# Phase C mission runs through the full OpenRAL graph (kernel + HAL + Nav2 + reasoner).
+# Same simulator/bridge wiring as srb_panel_remount.yaml (see that file for the rationale
+# on every field); only the SRB env differs. The Mission A/B task variants
+# (`lunar_base_mission_a_visual` / `lunar_base_mission_b_visual`) take `env.scenario=...`.
+#
+# Run: openral deploy sim --config scenes/deploy/srb_lunar_base_route_block.yaml
+
+robot_id: "lunar_bot"
+seed: 0
+
+scene:
+  id: "srb"
+  backend: "isaacsim"
+  observation_height: 480
+  observation_width: 640
+  cameras: ["front", "wrist"]
+
+simulator:
+  argv:
+    - "srb"
+    - "agent"
+    - "ros"
+    - "--env"
+    - "lunar_base_visual"
+    - "env.scenery=lunar_base_route_block"
+    - "env.robot=lunar_bot"
+    - "env.camera_resolution=[640,480]"
+    - "--headless"
+  cwd: "/mnt/SharedData/Research/Space_Robot_Harness/space_robotics_bench"
+  env_unset:
+    - "CONDA_PREFIX"
+    - "CONDA_EXE"
+    - "CONDA_PYTHON_EXE"
+    - "CONDA_DEFAULT_ENV"
+    - "CONDA_SHLVL"
+    - "CONDA_PROMPT_MODIFIER"
+    - "PYTHONPATH"
+  env_path_exclude_substrings:
+    - "miniconda3"
+  env_set:
+    ISAAC_SIM_PATH: "$HOME/Programs/isaac-sim"
+  ready_topics:
+    - "/clock"
+    - "/srb/env0/robot/joint_states"
+    - "/srb/env0/imu_robot"
+    - "/srb/env0/lidar_robot/pointcloud"
+    - "/srb/env0/cam_front/image_rgb"
+  # Cold Isaac Sim boot + first-render shader compile can run several
+  # minutes on this host (srb-native-install memory) — generous, matching
+  # isaac_franka.yaml's 1200s for the same reason.
+  boot_timeout_s: 1200.0
+  publishes_clock: true
+  # Topic/TF adapter for SRB (sensor_bridge_node): /odom + odom->chassis_base_link TF,
+  # /imu, /openral/cameras/*, /openral/lidar/points. Launched with the simulator;
+  # Nav2 waits for `publishes` before its lifecycle bringup (F37 in the research repo).
+  bridges:
+    - package: "openral_hal_lunar_bot"
+      executable: "sensor_bridge_node.py"
+      name: "openral_hal_lunar_bot_sensor_bridge"
+      pass_robot_yaml: true
+      publishes:
+        - "/odom"
+        - "/openral/lidar/points"
