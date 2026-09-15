@@ -353,7 +353,10 @@ safety:
   # experiment design, per execution_plan.md's "do not hard-code scientific
   # thresholds" rule -- this is an engineering safety margin for bring-up, not
   # a claimed operational limit.
-  max_base_linear_speed_m_s: 0.3
+  # 2026-09-15 (user, Phase C experiment design): base raised 0.3 -> 0.6 m/s
+  # so lunar-base mission runs stay time-bounded; angular kept at 0.5 rad/s.
+  # Verified in SRB at 0.57 m/s on the lunar_base terrain (research repo F43).
+  max_base_linear_speed_m_s: 0.6
   max_base_angular_speed_rad_s: 0.5
   # Arm CARTESIAN_TWIST bounds -- same "conservative, provisional, first
   # integration slice" status as the base bounds above, chosen with extra
@@ -407,6 +410,11 @@ footprint_polygon:
 # downstream of BODY_TWIST honours for this robot (F19,
 # `four_wheel_steer.py`'s own module docstring).
 base_kinematics: "differential"
+# Nav2 plans strictly inside the kernel bounds above (a chunk over them is
+# rejected whole); the shared base file's 0.5 m/s / 1.9 rad/s are panda_mobile
+# tuning and would put every turn over this robot's 0.5 rad/s bound.
+nav2_max_linear_speed_m_s: 0.57
+nav2_max_angular_speed_rad_s: 0.47
 
 sdk_kind: "open"
 hal:
