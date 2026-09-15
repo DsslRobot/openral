@@ -51,7 +51,7 @@ from launch.actions import (
     RegisterEventHandler,
     TimerAction,
 )
-from launch.event_handlers import OnProcessStart
+from launch.event_handlers import OnProcessExit, OnProcessStart
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import LifecycleNode, Node
 from launch_ros.event_handlers import OnStateTransition
@@ -584,6 +584,46 @@ def _build_real_bringup_include(hal_package: str) -> object | None:
     return IncludeLaunchDescription(PythonLaunchDescriptionSource(bringup_path))
 
 
+def _simulator_bridge_params(bridge: object, robot_yaml: str, use_sim_time: bool) -> dict:
+    """ROS parameters for one bridge: its own, plus ``robot_yaml`` on request and the graph clock."""
+    params = dict(bridge.parameters)
+    if bridge.pass_robot_yaml:
+        params["robot_yaml"] = robot_yaml
+    params["use_sim_time"] = use_sim_time
+    return params
+
+
+def _simulator_bridge_nodes(scene_simulator: object, robot_yaml: str, use_sim_time: bool) -> list:
+    """Nodes for a ROS-attached simulator's topic/TF adapters (``ExternalSimulatorSpec.bridges``).
+
+    Started with the simulator; they only subscribe until its topics flow, so no
+    readiness gate is needed in front of them. ``use_sim_time`` follows the graph's
+    clock origin, and ``robot_yaml`` is passed when the bridge asks for it.
+    """
+    nodes = []
+    for bridge in getattr(scene_simulator, "bridges", []) or []:
+        params = _simulator_bridge_params(bridge, robot_yaml, use_sim_time)
+        nodes.append(
+            Node(
+                package=bridge.package,
+                executable=bridge.executable,
+                name=bridge.name,
+                namespace="",
+                parameters=[params],
+                output="screen",
+            )
+        )
+    return nodes
+
+
+def _simulator_bridge_topics(scene_simulator: object) -> list[str]:
+    """Topics the simulator's bridges publish, in declaration order, deduplicated."""
+    topics: list[str] = []
+    for bridge in getattr(scene_simulator, "bridges", []) or []:
+        topics += [t for t in bridge.publishes if t not in topics]
+    return topics
+
+
 def _build_nav2_include(
     robot_yaml: str, *, use_sim_time: bool, slam_backend: str = "lidar"
 ) -> object:
@@ -622,7 +662,54 @@ def _build_nav2_include(
             # visual robots get the `/map`-consuming costmap profile
             # (nav2_visual.yaml); lidar robots keep the `/scan` base config.
             "slam_backend": slam_backend,
+            # Lifecycle is driven by `_nav2_lifecycle_driver` instead of the in-stack
+            # lifecycle_manager's autostart (see there).
+            "autostart": "false",
         }.items(),
+    )
+
+
+# upstream nav2_bringup navigation_launch.py lifecycle order (Humble)
+NAV2_LIFECYCLE_NODES = (
+    "/controller_server",
+    "/smoother_server",
+    "/planner_server",
+    "/behavior_server",
+    "/bt_navigator",
+    "/waypoint_follower",
+    "/velocity_smoother",
+)
+
+
+def _nav2_lifecycle_driver() -> object:
+    """Drive the Nav2 servers to ACTIVE with a state-polling driver, not lifecycle_manager autostart.
+
+    Humble's ``lifecycle_manager_navigation`` blocks on each ``change_state`` reply with no
+    timeout. On this graph (Isaac Sim + the full OpenRAL stack starting together) Fast-DDS
+    dropped one reply ("failed to send response to /controller_server/change_state (timeout)"):
+    the server had configured, the manager never heard, and bringup stopped for good before
+    ``bt_navigator`` (research repo F47). ``tools/lifecycle_autostart.py`` gives up on a missing
+    reply after ``--response-timeout-s`` and reads the node's actual state, re-driving a node that
+    is not ACTIVE.
+    """
+    return ExecuteProcess(
+        cmd=[
+            sys.executable,
+            str(_REPO_ROOT / "tools" / "lifecycle_autostart.py"),
+            *[arg for n in NAV2_LIFECYCLE_NODES for arg in ("--node", n)],
+            "--target",
+            "active",
+            "--service-timeout-s",
+            "120.0",
+            "--transition-timeout-s",
+            "120.0",
+            "--response-timeout-s",
+            "10.0",
+            "--attempts",
+            "3",
+        ],
+        name="openral_nav2_lifecycle_driver",
+        output="screen",
     )
 
 
@@ -1599,6 +1686,9 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
     # failure mode and proves the fix with a real subprocess tree, not a
     # mock).
     if hal_mode == "sim" and scene_simulator is not None:
+        # The simulator's topic/TF adapters (e.g. SRB -> /odom, odom->base TF,
+        # /openral/cameras/*): owned by this launch like the simulator itself.
+        extra_nodes += _simulator_bridge_nodes(scene_simulator, robot_yaml, use_sim_time)
         _sim_env = dict(os.environ)
         for _unset_key in scene_simulator.env_unset:
             _sim_env.pop(_unset_key, None)
@@ -1834,7 +1924,9 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
                 # yaml's use_sim_time so slam_toolbox shares the HAL's wall-clock
                 # /scan + odom TF. Sim-time without a /clock pins its pose-graph at
                 # 0 → empty map → Nav2 plans through obstacles.
-                parameters=[slam_params_path, {"use_sim_time": use_sim_time}],
+                # base_frame from the manifest: the shared yaml says panda_mobile's
+                # `base_link`, which LunarBot does not have (F47 in the research repo).
+                parameters=[slam_params_path, {"use_sim_time": use_sim_time, "base_frame": description.base_frame}],
                 additional_env=otel_env,
                 output="screen",
             )
@@ -1879,16 +1971,42 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
         # robocasa-kitchen boot lags Nav2's autostart by ~10–20 s.
         # Gate the Nav2 include on the HAL's transition to ACTIVE
         # so TF is already streaming when Nav2 sub-nodes wake up.
+        nav2_include = _build_nav2_include(robot_yaml, use_sim_time=use_sim_time, slam_backend=slam_backend)
+        _bridge_topics = (
+            _simulator_bridge_topics(scene_simulator) if hal_mode == "sim" and scene_simulator is not None else []
+        )
+        if _bridge_topics:
+            # A ROS-attached simulator's odom/TF comes from its bridge node, not
+            # the HAL: HAL ACTIVE alone does not mean local_costmap can activate
+            # (F37 in the research repo — lifecycle_manager_navigation wedged
+            # before bt_navigator). Wait for the bridges' topics too.
+            _nav2_gate = ExecuteProcess(
+                cmd=[
+                    sys.executable,
+                    str(_REPO_ROOT / "tools" / "wait_for_topics.py"),
+                    "--label",
+                    "nav2",
+                    "--timeout-s",
+                    "120",
+                    *[arg for t in _bridge_topics for arg in ("--topic", t)],
+                ],
+                name="openral_nav2_bridge_gate",
+                output="screen",
+            )
+            nav2_entities = [
+                _nav2_gate,
+                RegisterEventHandler(
+                    OnProcessExit(target_action=_nav2_gate, on_exit=[nav2_include, _nav2_lifecycle_driver()])
+                ),
+            ]
+        else:
+            nav2_entities = [nav2_include, _nav2_lifecycle_driver()]
         extra_nodes.append(
             RegisterEventHandler(
                 OnStateTransition(
                     target_lifecycle_node=hal,
                     goal_state="active",
-                    entities=[
-                        _build_nav2_include(
-                            robot_yaml, use_sim_time=use_sim_time, slam_backend=slam_backend
-                        )
-                    ],
+                    entities=nav2_entities,
                 ),
             ),
         )

@@ -2174,7 +2174,8 @@ class RobotDescription(BaseModel):
         full-footprint collision checks), ``footprint_polygon`` →
         the costmap ``footprint`` polygon (see
         ``nav2_footprint_param``), and ``base_kinematics`` →
-        the MPPI ``motion_model``, and the optional ``nav2_max_*_speed``
+        the MPPI ``motion_model``, ``base_frame`` → every Nav2 base-frame key
+        (``robot_base_frame`` / ``base_frame_id`` / ``base_frame``), and the optional ``nav2_max_*_speed``
         caps → MPPI ``vx_max`` / ``wz_max`` and the velocity smoother's
         ``max_velocity`` / ``min_velocity``. Returns an empty dict for
         fixed-base arms (no mobile base → no Nav2). Without declared caps,
@@ -2191,6 +2192,13 @@ class RobotDescription(BaseModel):
             overrides["inflation_radius"] = (
                 f"{self.footprint_radius + NAV2_INFLATION_CLEARANCE_M:.3f}"
             )
+        if overrides or self.base_kinematics is not None:
+            # The shared base file names panda_mobile's `base_link`; any other mobile base
+            # (LunarBot: `chassis_base_link`) left unrewritten has costmaps waiting forever
+            # for a `base_link -> odom` TF, blocking controller_server inside its lifecycle
+            # transition (research repo F47).
+            for key in ("robot_base_frame", "base_frame_id", "base_frame"):
+                overrides[key] = self.base_frame
         if self.base_kinematics is not None:
             overrides["motion_model"] = {
                 "omni": "Omni",
@@ -9523,6 +9531,48 @@ class LaunchInclude(BaseModel):
     args: dict[str, str] = Field(default_factory=dict)
 
 
+class SimulatorBridgeSpec(BaseModel):
+    """A ROS node that adapts an external simulator's topics to OpenRAL's own.
+
+    A ROS-attached simulator publishes in its own vocabulary (SRB:
+    ``/srb/env0/...`` sensor topics and ``srb/env0/*`` TF frames); the
+    stack's consumers (Nav2's costmaps, SLAM, WorldState) expect
+    ``/odom``, ``odom -> base_frame`` TF and ``/openral/...`` sensor topics.
+    The adapter is part of the simulator integration, not of the robot's
+    HAL, so the scene declares it next to the simulator and the launch owns
+    its lifecycle: it starts with the simulator, and every consumer that
+    needs its output (Nav2 today) waits for ``publishes`` before bringing
+    itself up. Without this, Nav2's ``local_costmap`` activation blocks on a
+    TF only the adapter publishes and ``lifecycle_manager_navigation``
+    silently wedges before ``bt_navigator`` (research repo F37).
+
+    Attributes:
+        package: ROS package of the node's executable.
+        executable: Executable name inside the package.
+        name: Node name.
+        parameters: ROS parameters. ``use_sim_time`` is added by the launch
+            from the graph's clock origin.
+        pass_robot_yaml: Also pass the deploy's resolved manifest path as the
+            node's ``robot_yaml`` parameter (the node must declare it).
+        publishes: Topics this node must be publishing before dependent
+            stacks (Nav2) are brought up.
+
+    Example:
+        >>> SimulatorBridgeSpec(package="openral_hal_lunar_bot", executable="sensor_bridge_node.py",
+        ...     name="openral_hal_lunar_bot_sensor_bridge", publishes=["/odom"]).pass_robot_yaml
+        False
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    package: str
+    executable: str
+    name: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    pass_robot_yaml: bool = False
+    publishes: list[str] = Field(default_factory=list)
+
+
 class ExternalSimulatorSpec(BaseModel):
     """A ROS-attached external simulator ``deploy sim`` spawns and owns.
 
@@ -9576,6 +9626,9 @@ class ExternalSimulatorSpec(BaseModel):
             the HAL's own ``/clock`` publisher (present on every
             manifest-driven HAL for the plain-wall-time case) is
             suppressed rather than fighting over clock authority.
+        bridges: Adapter nodes that translate this simulator's topics into
+            OpenRAL's (see ``SimulatorBridgeSpec``). Started with the
+            simulator; Nav2 waits for their ``publishes`` topics.
         attach_existing: When true, the launch does not spawn a new
             process — it only gates on ``ready_topics`` against whatever
             is already running (an operator-launched simulator on a
@@ -9601,6 +9654,7 @@ class ExternalSimulatorSpec(BaseModel):
     ready_topics: list[str] = Field(default_factory=list)
     boot_timeout_s: float = Field(default=600.0, gt=0)
     publishes_clock: bool = False
+    bridges: list[SimulatorBridgeSpec] = Field(default_factory=list)
     attach_existing: bool = False
 
 

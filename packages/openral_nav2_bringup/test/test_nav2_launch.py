@@ -375,3 +375,49 @@ def test_the_scan_filter_leg_can_be_turned_off() -> None:
     assert "payload_footprint" not in arg_names, (
         "the footprint publisher was removed — Nav2 is base-only"
     )
+
+
+def test_list_valued_overrides_reach_nav2_as_lists(tmp_path: Path) -> None:
+    """velocity_smoother.max_velocity must stay a double array after a speed-cap override.
+
+    As a RewrittenYaml string it made velocity_smoother's configure throw and aborted
+    lifecycle_manager_navigation before bt_navigator activated. The costmap footprint,
+    also written as "[[...]]", is a string parameter and must be left to RewrittenYaml.
+    """
+    mod = _import_launch_module()
+    rewrites = {
+        "max_velocity": "[0.57, 0.0, 0.47]",
+        "min_velocity": "[-0.57, 0.0, -0.47]",
+        "footprint": "[[0.64, 0.57], [-0.67, 0.57], [-0.67, -0.57], [0.64, -0.57]]",
+        "vx_max": "0.57",
+    }
+    new_file, rest = mod._apply_list_overrides(str(_VISUAL_CONFIG_PATH), rewrites)
+    data = yaml.safe_load(Path(new_file).read_text())
+    vs = data["velocity_smoother"]["ros__parameters"]
+    assert vs["max_velocity"] == [0.57, 0.0, 0.47]
+    assert vs["min_velocity"] == [-0.57, 0.0, -0.47]
+    assert set(rest) == {"footprint", "vx_max"}
+    assert isinstance(data["local_costmap"]["local_costmap"]["ros__parameters"]["footprint"], str)
+
+
+def test_no_list_overrides_leaves_the_base_file(tmp_path: Path) -> None:
+    mod = _import_launch_module()
+    f, rest = mod._apply_list_overrides(str(_VISUAL_CONFIG_PATH), {"vx_max": "0.57"})
+    assert f == str(_VISUAL_CONFIG_PATH) and rest == {"vx_max": "0.57"}
+
+
+def test_every_nav2_server_gets_the_graph_clock() -> None:
+    """The base files carry no use_sim_time and RewrittenYaml adds no keys (F47)."""
+    mod = _import_launch_module()
+    data = yaml.safe_load(Path(mod._with_use_sim_time(str(_CONFIG_PATH), True)).read_text())
+    blocks = []
+
+    def collect(node: object) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "ros__parameters":
+                    blocks.append(v)
+                collect(v)
+
+    collect(data)
+    assert blocks and all(b["use_sim_time"] is True for b in blocks)
