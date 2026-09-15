@@ -2055,6 +2055,7 @@ def test_nav2_param_overrides_name_the_manifest_base_frame() -> None:
     description = RobotDescription.from_yaml(str(_REPO_ROOT / "robots" / "lunar_bot" / "robot.yaml"))
     overrides = description.nav2_param_overrides()
     assert {overrides[k] for k in ("robot_base_frame", "base_frame_id", "base_frame")} == {"chassis_base_link"}
+    assert overrides["stateful"] == "false" and overrides["yaw_goal_tolerance"] == "0.25"
 
 
 def test_nav2_param_overrides_emit_the_use_the_radius_sentinel_without_a_polygon() -> None:

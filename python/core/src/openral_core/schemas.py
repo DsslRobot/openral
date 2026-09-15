@@ -2001,6 +2001,10 @@ class RobotDescription(BaseModel):
     # keeps the base file's values.
     nav2_max_linear_speed_m_s: float | None = Field(default=None, gt=0.0)
     nav2_max_angular_speed_rad_s: float | None = Field(default=None, gt=0.0)
+    # Nav2 goal checker for bases whose heading control is coarse. ``None`` keeps the
+    # shared base file's values (stateful, 0.05 rad yaw tolerance: panda_mobile tuning).
+    nav2_goal_yaw_tolerance_rad: float | None = Field(default=None, gt=0.0)
+    nav2_goal_checker_stateful: bool | None = None
     # Geometric safety. ``collision_geometry`` is the lowered,
     # kernel-facing set of per-link convex primitives; ``allowed_collision_pairs``
     # is the self-collision exclusion matrix (adjacent links touch by design).
@@ -2206,6 +2210,12 @@ class RobotDescription(BaseModel):
                 "differential": "DiffDrive",
                 "ackermann": "Ackermann",
             }[self.base_kinematics]
+        if self.nav2_goal_yaw_tolerance_rad is not None:
+            overrides["yaw_goal_tolerance"] = str(self.nav2_goal_yaw_tolerance_rad)
+        if self.nav2_goal_checker_stateful is not None:
+            # a stateful checker latches xy success and then only waits on yaw: a base that
+            # turns poorly in place drifts off the goal while "finishing" (research repo F47)
+            overrides["stateful"] = "true" if self.nav2_goal_checker_stateful else "false"
         v, w = self.nav2_max_linear_speed_m_s, self.nav2_max_angular_speed_rad_s
         if v is not None:
             overrides["vx_max"] = str(v)

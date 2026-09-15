@@ -415,6 +415,11 @@ base_kinematics: "differential"
 # tuning and would put every turn over this robot's 0.5 rad/s bound.
 nav2_max_linear_speed_m_s: 0.57
 nav2_max_angular_speed_rad_s: 0.47
+# Goal checker: the 4WIS base reaches ~2/3 of an in-place turn command (research repo F43),
+# so the shared file's stateful checker + 0.05 rad yaw tolerance latched xy success and
+# then drifted 1.4 m off a 6 m goal while squaring up the heading (F47).
+nav2_goal_yaw_tolerance_rad: 0.25
+nav2_goal_checker_stateful: false
 
 sdk_kind: "open"
 hal:
