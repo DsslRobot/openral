@@ -2043,8 +2043,18 @@ def test_nav2_param_overrides_from_robot_yaml() -> None:
         "footprint": "[[0.35, 0.25], [-0.35, 0.25], [-0.35, -0.25], [0.35, -0.25]]",
         "robot_radius": "0.35",
         "inflation_radius": "0.400",
+        "robot_base_frame": "base_link",
+        "base_frame_id": "base_link",
+        "base_frame": "base_link",
         "motion_model": "Omni",
     }
+
+
+def test_nav2_param_overrides_name_the_manifest_base_frame() -> None:
+    """LunarBot's base is `chassis_base_link`; the shared Nav2 file says `base_link` (F47)."""
+    description = RobotDescription.from_yaml(str(_REPO_ROOT / "robots" / "lunar_bot" / "robot.yaml"))
+    overrides = description.nav2_param_overrides()
+    assert {overrides[k] for k in ("robot_base_frame", "base_frame_id", "base_frame")} == {"chassis_base_link"}
 
 
 def test_nav2_param_overrides_emit_the_use_the_radius_sentinel_without_a_polygon() -> None:

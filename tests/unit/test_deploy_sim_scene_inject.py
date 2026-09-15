@@ -93,3 +93,15 @@ def test_lunar_bot_srb_scene_forwards_deploy_config_in_sim_mode() -> None:
         hal_mode="sim",
     )
     assert f"deploy_config:={_SRB_SCENE.resolve()}" in inv.argv_template
+
+
+def test_srb_scenes_declare_the_sensor_bridge_for_nav2() -> None:
+    """F37: Nav2 wedges unless the SRB topic/TF bridge runs; the scene must own it."""
+    from openral_core import DeployScene
+
+    for scene in ("srb_panel_remount.yaml", "srb_panel_remount_gui.yaml", "srb_lunar_base.yaml"):
+        sim = DeployScene.from_yaml(_REPO / "scenes/deploy" / scene).simulator
+        assert sim is not None, scene
+        bridge = next(b for b in sim.bridges if b.executable == "sensor_bridge_node.py")
+        assert bridge.pass_robot_yaml
+        assert "/odom" in bridge.publishes

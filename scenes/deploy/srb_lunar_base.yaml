@@ -1,14 +1,10 @@
-# Windowed (non-headless) twin of srb_panel_remount.yaml, for interactive
-# visual verification on the dev host — watching LunarBot execute in the
-# actual Isaac Sim viewport, e.g. while manually dispatching the item-3
-# rSkills via `ros2 action send_goal`. Everything below is identical to
-# srb_panel_remount.yaml except dropping "--headless" from simulator.argv;
-# see that file for the full rationale on every other field. Headless stays
-# the default for scripted/CI/experiment runs (throughput, no display
-# needed on a cluster) — this variant exists so "run it and look at it" has
-# a tracked, reproducible config instead of an ad hoc /tmp copy.
+# LunarBot on the Connecting Ridge Outpost lunar base scene (SRB `lunar_base`), for
+# Phase C mission runs through the full OpenRAL graph (kernel + HAL + Nav2 + reasoner).
+# Same simulator/bridge wiring as srb_panel_remount.yaml (see that file for the rationale
+# on every field); only the SRB env differs. The Mission A/B task variants
+# (`lunar_base_mission_a_visual` / `lunar_base_mission_b_visual`) take `env.scenario=...`.
 #
-# Run: openral deploy sim --config scenes/deploy/srb_panel_remount_gui.yaml
+# Run: openral deploy sim --config scenes/deploy/srb_lunar_base.yaml
 
 robot_id: "lunar_bot"
 seed: 0
@@ -26,9 +22,10 @@ simulator:
     - "agent"
     - "ros"
     - "--env"
-    - "panel_remount_visual"
+    - "lunar_base_visual"
     - "env.robot=lunar_bot"
     - "env.camera_resolution=[640,480]"
+    - "--headless"
   cwd: "/mnt/SharedData/Research/Space_Robot_Harness/space_robotics_bench"
   env_unset:
     - "CONDA_PREFIX"

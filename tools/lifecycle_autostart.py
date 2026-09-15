@@ -87,6 +87,7 @@ def _drive_transition(
     transition_id: int,
     transition_label: str,
     transition_timeout_s: float,
+    response_timeout_s: float | None = None,
 ) -> None:
     req = ChangeState.Request()
     req.transition.id = transition_id
@@ -98,7 +99,15 @@ def _drive_transition(
     # fixed 30s timeout previously returned ``future.result()=None`` and
     # false-failed a transition that was about to succeed. Wait the
     # caller-supplied budget instead.
-    rclpy.spin_until_future_complete(node, future, timeout_sec=transition_timeout_s)
+    # ``response_timeout_s`` (shorter than the transition budget) is for nodes whose
+    # transition is known to be quick but whose *response* can be lost: Fast-DDS on
+    # Humble logs "failed to send response ... (timeout)" when a fresh client's reader
+    # is not matched yet, and a caller blocking for the reply then waits forever (this
+    # wedged Nav2's lifecycle_manager, research repo F47). The post-call state below
+    # is read either way.
+    rclpy.spin_until_future_complete(
+        node, future, timeout_sec=transition_timeout_s if response_timeout_s is None else response_timeout_s
+    )
     resp = future.result()
     # Post-call state is the source of truth, not ``resp.success``: Jazzy's
     # first CONFIGURE returns ``success=false`` even though the FSM
@@ -148,10 +157,68 @@ def _wait_for_topic_publishers(node: Any, topics: list[str], timeout_s: float) -
     return sorted(remaining)
 
 
+def _drive_node(node: Any, target_node: str, args: argparse.Namespace) -> int | None:
+    """Drive one node to ``args.target``; returns an exit code to stop with, or None to continue."""
+    change_state_name = _service_path(target_node, "change_state")
+    get_state_name = _service_path(target_node, "get_state")
+    try:
+        change_state_client = _wait_for_service(node, change_state_name, args.service_timeout_s, ChangeState)
+        get_state_client = _wait_for_service(node, get_state_name, args.service_timeout_s, GetState)
+    except TimeoutError as exc:
+        print(f"lifecycle-autostart: {exc}", file=sys.stderr)
+        return 0  # don't log an [ERROR] from the process; absent server is informational
+
+    labels = {
+        Transition.TRANSITION_CONFIGURE: "configure",
+        Transition.TRANSITION_ACTIVATE: "activate",
+    }
+    current = _read_state(node, target_node, get_state_client)
+    for attempt in range(max(1, args.attempts)):
+        for tid in _STATE_TO_TRANSITION[args.target]:
+            label = labels[tid]
+            if current == "active":
+                break
+            if current == "inactive" and label == "configure":
+                continue  # already configured; only need activate
+            try:
+                _drive_transition(
+                    node, target_node, change_state_client, get_state_client, tid, label,
+                    args.transition_timeout_s, args.response_timeout_s,
+                )
+            except RuntimeError:
+                if attempt + 1 >= max(1, args.attempts):
+                    raise
+            current = _read_state(node, target_node, get_state_client)
+        if current == args.target:
+            break
+        print(f"lifecycle-autostart: {target_node} at {current!r} after attempt {attempt + 1}, retrying", file=sys.stderr)
+    print(f"lifecycle-autostart: {target_node} reached state={current!r} (target={args.target!r})")
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--node", required=True, help="Target lifecycle node name (e.g. /openral_slam_toolbox)."
+        "--node",
+        required=True,
+        action="append",
+        dest="nodes",
+        help="Target lifecycle node name (e.g. /openral_slam_toolbox). Repeatable: nodes are driven in order.",
+    )
+    parser.add_argument(
+        "--response-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Stop waiting for a change_state reply after this long and read the node's "
+            "state instead (default: the full --transition-timeout-s)."
+        ),
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=1,
+        help="Re-drive a node that has not reached --target this many times in total.",
     )
     parser.add_argument(
         "--target",
@@ -208,51 +275,16 @@ def main() -> int:
                 print(
                     "lifecycle-autostart: external simulator never published "
                     f"{missing} within {args.wait_for_topics_timeout_s:.1f}s — "
-                    f"not driving {args.node!r} to {args.target!r} "
+                    f"not driving {args.nodes!r} to {args.target!r} "
                     "(the simulator process likely failed to boot; check its "
                     "own log).",
                     file=sys.stderr,
                 )
                 return 1
-        change_state_name = _service_path(args.node, "change_state")
-        get_state_name = _service_path(args.node, "get_state")
-        try:
-            change_state_client = _wait_for_service(
-                node, change_state_name, args.service_timeout_s, ChangeState
-            )
-            get_state_client = _wait_for_service(
-                node, get_state_name, args.service_timeout_s, GetState
-            )
-        except TimeoutError as exc:
-            print(f"lifecycle-autostart: {exc}", file=sys.stderr)
-            return 0  # don't log an [ERROR] from the process; absent server is informational
-
-        current = _read_state(node, args.node, get_state_client)
-        transitions = _STATE_TO_TRANSITION[args.target]
-        labels = {
-            Transition.TRANSITION_CONFIGURE: "configure",
-            Transition.TRANSITION_ACTIVATE: "activate",
-        }
-        for tid in transitions:
-            label = labels[tid]
-            if current == "active":
-                # Already at goal.
-                break
-            if current == "inactive" and label == "configure":
-                continue  # already configured; only need activate
-            _drive_transition(
-                node,
-                args.node,
-                change_state_client,
-                get_state_client,
-                tid,
-                label,
-                args.transition_timeout_s,
-            )
-            current = _read_state(node, args.node, get_state_client)
-        print(
-            f"lifecycle-autostart: {args.node} reached state={current!r} (target={args.target!r})"
-        )
+        for target_node in args.nodes:
+            rc = _drive_node(node, target_node, args)
+            if rc is not None:
+                return rc
         return 0
     finally:
         node.destroy_node()

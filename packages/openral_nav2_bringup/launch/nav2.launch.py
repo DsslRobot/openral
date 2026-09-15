@@ -294,6 +294,85 @@ def _twist_to_action_relay_nodes(*, robot_yaml: str) -> list[object]:
     ]
 
 
+def _with_use_sim_time(params_file: str, use_sim_time: bool) -> str:
+    """Copy of the params file with ``use_sim_time`` set in every ``ros__parameters`` block.
+
+    Upstream ``navigation_launch.py`` hands each server only the params file and rewrites
+    ``use_sim_time`` through ``RewrittenYaml``, which replaces keys that already exist and
+    adds none. The shared base files carry no ``use_sim_time``, so on a simulation clock
+    (SRB publishes ``/clock``) every Nav2 server still ran on wall time: paths were stamped
+    ~1.8e9 s against a TF tree at a few seconds of sim time, the controller logged "Transform
+    data too old when converting from map to odom" and reported the goal reached without
+    moving (research repo F47).
+    """
+    import tempfile
+
+    import yaml
+
+    data = yaml.safe_load(Path(params_file).read_text())
+
+    def mark(node: object) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "ros__parameters" and isinstance(v, dict):
+                    v["use_sim_time"] = use_sim_time
+                mark(v)
+
+    mark(data)
+    out = tempfile.NamedTemporaryFile("w", prefix="openral_nav2_time_", suffix=".yaml", delete=False)  # noqa: SIM115
+    with out:
+        yaml.safe_dump(data, out, sort_keys=False)
+    return out.name
+
+
+def _apply_list_overrides(params_file: str, rewrites: dict[str, str]) -> tuple[str, dict[str, str]]:
+    """Substitute overrides for keys that are lists in the base file; return (file, other rewrites).
+
+    ``RewrittenYaml(convert_types=True)`` only converts scalars: a ``"[0.57, 0.0, 0.47]"``
+    rewrite of ``velocity_smoother.max_velocity`` reaches the node as a *string* and its
+    ``configure`` throws ("parameter 'max_velocity' ... double_array ... string"), which
+    aborts ``lifecycle_manager_navigation`` before ``bt_navigator`` activates. Whether a
+    ``"[...]"`` value is a list or a string follows the base file (the costmap ``footprint``
+    is a string parameter and must stay one), so only keys whose base value is a YAML list
+    are parsed here and written into a temporary copy of the file.
+    """
+    import tempfile
+
+    import yaml
+
+    data = yaml.safe_load(Path(params_file).read_text())
+    list_keys: set[str] = set()
+
+    def collect(node: object) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, list):
+                    list_keys.add(k)
+                collect(v)
+
+    collect(data)
+    parsed = {k: yaml.safe_load(v) for k, v in rewrites.items() if k in list_keys}
+    if not parsed:
+        return params_file, rewrites
+    for k, v in parsed.items():
+        if not isinstance(v, list):
+            raise ValueError(f"Nav2 override {k}={rewrites[k]!r} is not a list, but {k} is a list in {params_file}")
+
+    def substitute(node: object) -> None:
+        if isinstance(node, dict):
+            for k in list(node):
+                if k in parsed and isinstance(node[k], list):
+                    node[k] = parsed[k]
+                else:
+                    substitute(node[k])
+
+    substitute(data)
+    out = tempfile.NamedTemporaryFile("w", prefix="openral_nav2_", suffix=".yaml", delete=False)  # noqa: SIM115
+    with out:
+        yaml.safe_dump(data, out, sort_keys=False)
+    return out.name, {k: v for k, v in rewrites.items() if k not in parsed}
+
+
 def _nav2_include_with_robot_overrides(context: object) -> list[object]:
     """Rewrite the base Nav2 params with per-robot overrides, then include.
 
@@ -326,6 +405,9 @@ def _nav2_include_with_robot_overrides(context: object) -> list[object]:
         )
 
         rewrites = RobotDescription.from_yaml(robot_yaml).nav2_param_overrides()
+        params_file, rewrites = _apply_list_overrides(params_file, rewrites)
+    use_sim_time_value = LaunchConfiguration("use_sim_time").perform(context)  # type: ignore[attr-defined]
+    params_file = _with_use_sim_time(params_file, use_sim_time_value.strip().lower() in ("true", "1", "yes"))
 
     resolved_params = RewrittenYaml(
         source_file=params_file,

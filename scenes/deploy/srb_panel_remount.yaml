@@ -33,12 +33,9 @@
 # hand-computed intrinsics for `robots/lunar_bot/robot.yaml`'s `sensors:`
 # block exactly.
 #
-# Item 2's sensor bridge (openral_hal_lunar_bot.sensor_bridge_node) is not
-# yet wired into this launch — it is a separate process today (run it by
-# hand alongside this graph). Item 2b's own exit condition (a
-# reasoner-dispatched body_twist moves the base) does not need it; wiring it
-# into deploy_e2e.launch.py generically (not a lunar_bot-specific branch —
-# this launch file is robot-agnostic by design) is a follow-up.
+# The sensor bridge (openral_hal_lunar_bot.sensor_bridge_node) is declared
+# under `simulator.bridges`: deploy_e2e.launch.py starts it with SRB and holds
+# Nav2 until it publishes /odom (the F37 lifecycle wedge).
 #
 # Run: openral deploy sim --config scenes/deploy/srb_panel_remount.yaml \
 #   --initial-task "drive forward one metre, then open the gripper"
@@ -87,3 +84,14 @@ simulator:
   # isaac_franka.yaml's 1200s for the same reason.
   boot_timeout_s: 1200.0
   publishes_clock: true
+  # Topic/TF adapter for SRB (sensor_bridge_node): /odom + odom->chassis_base_link TF,
+  # /imu, /openral/cameras/*, /openral/lidar/points. Launched with the simulator;
+  # Nav2 waits for `publishes` before its lifecycle bringup (F37 in the research repo).
+  bridges:
+    - package: "openral_hal_lunar_bot"
+      executable: "sensor_bridge_node.py"
+      name: "openral_hal_lunar_bot_sensor_bridge"
+      pass_robot_yaml: true
+      publishes:
+        - "/odom"
+        - "/openral/lidar/points"
