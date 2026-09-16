@@ -423,6 +423,9 @@ base_kinematics: "omni"
 # tuning and would put every turn over this robot's 0.5 rad/s bound.
 nav2_max_linear_speed_m_s: 0.57
 nav2_max_angular_speed_rad_s: 0.47
+# Nav2's crab cap: the kernel bounds the planar speed vector, so vx_max = sqrt(0.57^2 - 0.25^2) = 0.512
+# (a diagonal MPPI command at 0.57/0.57 E-stopped the graph, research repo F51). Nav2 only.
+nav2_max_lateral_speed_m_s: 0.25
 # Goal checker: the 4WIS base reaches ~2/3 of an in-place turn command (research repo F43),
 # so the shared file's stateful checker + 0.05 rad yaw tolerance latched xy success and
 # then drifted 1.4 m off a 6 m goal while squaring up the heading (F47).

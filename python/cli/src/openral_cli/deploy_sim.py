@@ -2249,8 +2249,11 @@ def _run_launch(argv: list[str], env: dict[str, str], *, grace_s: float = 12.0) 
         # the bulletproof backstop: it matches every graph process
         # regardless of parentage or process group. Safe because two
         # deploy graphs can't coexist (they collide on DDS/ports), so on
-        # exit the only matching processes are this run's survivors.
-        _kill_orphan_openral_graph_processes()
+        # exit the only matching processes are this run's survivors -- unless the operator runs
+        # sibling graphs on separate domains/GPUs and opted out of the sweep (research repo F51:
+        # this exit sweep killed a parallel graph the moment another run tore down).
+        if os.environ.get("OPENRAL_SKIP_ORPHAN_REAP") != "1":
+            _kill_orphan_openral_graph_processes()
     return proc.returncode if proc.returncode is not None else 0
 
 
@@ -2305,6 +2308,8 @@ def _apply_rmw_default(env: dict[str, str]) -> None:
     rmw = env.get("RMW_IMPLEMENTATION", "")
     # -1 = the operator opted out of Fast-DDS, so nothing was cleaned.
     opted_out = "rmw_cyclonedds" in rmw or "rmw_zenoh" in rmw
+    # Sibling graphs on one host (OPENRAL_SKIP_ORPHAN_REAP=1) keep their live SHM segments.
+    opted_out = opted_out or os.environ.get("OPENRAL_SKIP_ORPHAN_REAP") == "1"
     purged = -1 if opted_out else _clean_stale_fastrtps_shm()
     _console.print(
         f"  {DDS_TRANSPORT_READY_MARKER} rmw={rmw or 'default'} "

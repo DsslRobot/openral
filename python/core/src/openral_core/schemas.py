@@ -2001,6 +2001,11 @@ class RobotDescription(BaseModel):
     # keeps the base file's values.
     nav2_max_linear_speed_m_s: float | None = Field(default=None, gt=0.0)
     nav2_max_angular_speed_rad_s: float | None = Field(default=None, gt=0.0)
+    # Omni bases: MPPI and the velocity smoother bound each axis, but the kernel bounds the planar
+    # SPEED, so vx_max = vy_max = v let a diagonal crab reach sqrt(2) v and E-stop the graph
+    # (research repo F51). With this set, vy is capped here and vx_max = sqrt(v^2 - vy^2), so any
+    # Nav2 command stays inside v. Nav2's cruise envelope only; other callers still crab at v.
+    nav2_max_lateral_speed_m_s: float | None = Field(default=None, gt=0.0)
     # Nav2 goal checker for bases whose heading control is coarse. ``None`` keeps the
     # shared base file's values (stateful, 0.05 rad yaw tolerance: panda_mobile tuning).
     nav2_goal_yaw_tolerance_rad: float | None = Field(default=None, gt=0.0)
@@ -2246,18 +2251,24 @@ class RobotDescription(BaseModel):
             # turns poorly in place drifts off the goal while "finishing" (research repo F47)
             overrides["stateful"] = "true" if self.nav2_goal_checker_stateful else "false"
         v, w = self.nav2_max_linear_speed_m_s, self.nav2_max_angular_speed_rad_s
+        omni = self.base_kinematics in ("omni", "holonomic")
+        lat = self.nav2_max_lateral_speed_m_s if omni else None
         if v is not None:
-            overrides["vx_max"] = str(v)
-            if self.base_kinematics in ("omni", "holonomic"):
-                overrides["vy_max"] = str(v)
-                overrides["vy_min"] = str(-v)
+            vx = round(math.sqrt(v * v - lat * lat), 3) if lat is not None and lat < v else v
+            overrides["vx_max"] = str(vx)
+            if omni:
+                vy_cap = lat if lat is not None else v
+                overrides["vy_max"] = str(vy_cap)
+                overrides["vy_min"] = str(-vy_cap)
         if w is not None:
             overrides["wz_max"] = str(w)
         if v is not None or w is not None:
             # velocity_smoother's [x, y, theta] limits. The lateral axis is the robot's own:
             # an omni/4WIS base crabs, a differential one cannot.
             vs, ws = v if v is not None else 0.5, w if w is not None else 2.0
-            vy = vs if self.base_kinematics in ("omni", "holonomic") else 0.0
+            vy = (lat if lat is not None else vs) if omni else 0.0
+            if lat is not None and lat < vs:
+                vs = round(math.sqrt(vs * vs - lat * lat), 3)
             overrides["max_velocity"] = f"[{vs}, {vy}, {ws}]"
             overrides["min_velocity"] = f"[{-vs}, {-vy}, {-ws}]"
         if w is not None:
