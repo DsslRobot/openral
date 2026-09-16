@@ -126,6 +126,17 @@ def generate_launch_description() -> LaunchDescription:
             ),
         ),
         DeclareLaunchArgument(
+            "localization",
+            default_value="none",
+            description=(
+                "`amcl` runs `nav2_amcl` against the static `/map` (a prebuilt map served by "
+                "`nav2_map_server`, e.g. the deploy's `map_path`), with its `amcl:` block from the "
+                "same resolved params file; it authors `map -> odom`. `none` (default) leaves that "
+                "edge to SLAM or to the HAL. AMCL is a lifecycle node: whoever drives Nav2's "
+                "lifecycle must drive `/amcl` too."
+            ),
+        ),
+        DeclareLaunchArgument(
             "robot_yaml",
             default_value="",
             description=(
@@ -479,6 +490,19 @@ def _nav2_include_with_robot_overrides(context: object) -> list[object]:
             ],
         )
     ]
+    localization = LaunchConfiguration("localization").perform(context)  # type: ignore[attr-defined]
+    if localization.strip().lower() == "amcl":
+        from launch_ros.actions import Node  # reason: launch-time only
+
+        actions.append(
+            Node(
+                package="nav2_amcl",
+                executable="amcl",
+                name="amcl",
+                output="screen",
+                parameters=[resolved_params],
+            )
+        )
     payload_scan_filter = LaunchConfiguration("payload_scan_filter").perform(context)  # type: ignore[attr-defined]
     if payload_scan_filter.strip().lower() in ("true", "1", "yes"):
         use_sim_time = LaunchConfiguration("use_sim_time").perform(context)  # type: ignore[attr-defined]

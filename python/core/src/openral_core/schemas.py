@@ -9753,6 +9753,11 @@ class DeployRuntime(BaseModel):
     enable_reasoner: bool | None = None
     enable_slam: bool | None = None
     enable_nav2: bool | None = None
+    localization: Literal["amcl"] | None = None
+    """How the mobile base is localized when SLAM is off. ``"amcl"`` runs ``nav2_amcl`` inside Nav2
+    against the static map the deploy memory bundle serves (``memory_dir``'s ``map.yaml``); AMCL
+    then authors ``map -> odom``, so the robot's odom bridge must not. ``None`` = SLAM or the
+    HAL owns that edge, as before."""
     enable_octomap: bool | None = None
     enable_octomap_kernel_check: bool | None = None
     octomap_cloud_topic: str | None = None

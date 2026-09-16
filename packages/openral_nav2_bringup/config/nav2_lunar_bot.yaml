@@ -8,47 +8,59 @@
 # Values not mentioned are panda_mobile's and are yet to be re-tuned for a slow, poorly-turning
 # rover; change them here, not in the shared file.
 amcl:
+  # Localization against the surveyed base map (research repo F50 §4, user decision), selected by the
+  # deploy scene's `runtime.localization: amcl`. Odometry is the bridge's wheel-inertial estimate
+  # (`odom_source: wheel`): IMU heading is good, translation over-reads by the wheel slip (15-38 %,
+  # F50), and the rover crabs -- hence the omni model and the translation noise terms well above
+  # the heading ones. The map is exact (surveyed with the rover's own lidar slice), so the hit
+  # model is sharp. Updates every 0.1 m / 0.1 rad: the dock skill closes on `map`.
   ros__parameters:
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
-    alpha5: 0.2
-    # base_link is what the panda_mobile HAL publishes (no base_footprint
-    # frame exists). amcl is unused here (slam_toolbox provides map->odom),
-    # but keep the frame correct in case this config is reused with amcl.
-    base_frame_id: "base_link"
+    robot_model_type: "nav2_amcl::OmniMotionModel"
+    # OmniMotionModel (nav2_amcl, Humble): per update, std(trans) = sqrt(a3 dT^2 + a1 dR^2),
+    # std(rot) = sqrt(a4 dR^2 + a2 dT^2), std(strafe) = sqrt(a1 dR^2 + a5 dT^2).
+    alpha1: 0.05   # in-place turns scrub sideways (F50)
+    alpha2: 0.01   # heading from the IMU barely drifts with distance
+    alpha3: 0.15   # ~39 % of the step: slip over-reads translation by 15-38 %
+    alpha4: 0.02   # IMU heading per radian turned
+    alpha5: 0.1    # lateral slip while driving and crabbing
+    base_frame_id: "base_link"  # rewritten to the manifest's base_frame
+    global_frame_id: "map"
+    odom_frame_id: "odom"
+    scan_topic: scan
+    laser_model_type: "likelihood_field"
+    laser_min_range: 0.1
+    laser_max_range: 40.0  # Mid-360 RayCaster max distance (SRB mobile env)
+    laser_likelihood_max_dist: 2.0
+    max_beams: 90
+    sigma_hit: 0.1
+    z_hit: 0.8
+    z_rand: 0.2
+    z_max: 0.05
+    z_short: 0.05
+    lambda_short: 0.1
+    do_beamskip: false
     beam_skip_distance: 0.5
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
-    do_beamskip: false
-    global_frame_id: "map"
-    lambda_short: 0.1
-    laser_likelihood_max_dist: 2.0
-    laser_max_range: 100.0
-    laser_min_range: -1.0
-    laser_model_type: "likelihood_field"
-    max_beams: 60
-    max_particles: 2000
     min_particles: 500
-    odom_frame_id: "odom"
+    max_particles: 3000
     pf_err: 0.05
     pf_z: 0.99
     recovery_alpha_fast: 0.0
     recovery_alpha_slow: 0.0
     resample_interval: 1
-    robot_model_type: "nav2_amcl::DifferentialMotionModel"
-    save_pose_rate: 0.5
-    sigma_hit: 0.2
-    tf_broadcast: true
+    update_min_d: 0.1
+    update_min_a: 0.1
     transform_tolerance: 1.0
-    update_min_a: 0.2
-    update_min_d: 0.25
-    z_hit: 0.5
-    z_max: 0.05
-    z_rand: 0.5
-    z_short: 0.05
-    scan_topic: scan
+    tf_broadcast: true
+    save_pose_rate: 0.5
+    # The rover starts on its dock, the map origin (layout.yaml: "rover dock at the origin").
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
 
 bt_navigator:
   ros__parameters:

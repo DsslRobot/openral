@@ -37,10 +37,10 @@ composition ``docs/lunar_bot_capability_set_plan.md`` §3.2 item 1 specifies
 (``T(robot <- frame)`` from ``T(env <- robot)`` and ``T(env <- frame)``),
 done automatically by ``tf2_ros.Buffer.lookup_transform`` since both frames
 share the common parent ``srb/env0``. ``map -> odom`` is published as a
-static identity transform: in simulation localisation is ground truth, and
-this frame exists only so Nav2 / the world-state lift / the verifier
-resolve through TF exactly as they would on the real robot (where a
-localizer would author it) — stated plainly, not dressed up as SLAM.
+static identity transform when no localizer runs (``publish_map_to_odom``,
+default true) so Nav2 / the world-state lift / the verifier resolve through
+TF; with ``odom_source: wheel`` and AMCL or SLAM in the graph, that node
+authors the edge instead and this one is turned off.
 
 ``robot_tf_frame`` (default ``srb/env0/robot``) is the one genuinely open
 question this module cannot resolve by reading source: whether SRB's
@@ -330,6 +330,10 @@ if _ROS2_AVAILABLE:
             self.declare_parameter("odom_source", "truth")
             # wheel odometry takes its heading rate from the IMU (see _wheel_odometry)
             self.declare_parameter("odom_imu_yaw_rate", True)
+            # The identity `map -> odom` stands in for a localizer only when there is none. With AMCL
+            # or SLAM in the graph that node owns the edge; a second (static) publisher of the same
+            # edge makes tf2 flip between the two.
+            self.declare_parameter("publish_map_to_odom", True)
 
             robot_yaml = str(self.get_parameter("robot_yaml").value)
             description = RobotDescription.from_yaml(robot_yaml)
@@ -353,7 +357,8 @@ if _ROS2_AVAILABLE:
             self._tf_listener = TransformListener(self._tf_buffer, self)
             self._tf_broadcaster = TransformBroadcaster(self)
             self._static_tf_broadcaster = StaticTransformBroadcaster(self)
-            self._publish_static_map_to_odom()
+            if bool(self.get_parameter("publish_map_to_odom").value):
+                self._publish_static_map_to_odom()
 
             # ── /odom ─────────────────────────────────────────────────────
             self._odom_pub = self.create_publisher(Odometry, "/odom", _SENSOR_QOS)
@@ -362,7 +367,6 @@ if _ROS2_AVAILABLE:
             self._latest_ang_vel: tuple[float, float, float] = (0.0, 0.0, 0.0)
             # wheel-odometry state (only used when odom_source == "wheel")
             self._wheel_pose = [0.0, 0.0, 0.0]  # x, y, yaw integrated from the wheels
-            self._wheel_twist = (0.0, 0.0)  # (v, w) of the last estimate
             self._wheel_stamp_s: float | None = None
             self._joint_state: dict[str, tuple[float, float]] = {}  # name -> (position, velocity)
             self._truth_pub = self.create_publisher(Odometry, "/openral/pose_truth", _SENSOR_QOS)
@@ -487,16 +491,16 @@ if _ROS2_AVAILABLE:
             est = self._wheel_odometry(now_s)
             if est is None:  # no joint state yet
                 return
-            v, w = est
+            vx, vy, w, slip_var = est
             if self._wheel_stamp_s is not None:
                 dt = now_s - self._wheel_stamp_s
                 if 0.0 < dt < 1.0:
                     yaw = self._wheel_pose[2] + 0.5 * w * dt  # midpoint heading over the interval
-                    self._wheel_pose[0] += v * math.cos(yaw) * dt
-                    self._wheel_pose[1] += v * math.sin(yaw) * dt
+                    c, s = math.cos(yaw), math.sin(yaw)
+                    self._wheel_pose[0] += (vx * c - vy * s) * dt
+                    self._wheel_pose[1] += (vx * s + vy * c) * dt
                     self._wheel_pose[2] += w * dt
             self._wheel_stamp_s = now_s
-            self._wheel_twist = (v, w)
             x, y, yaw = self._wheel_pose
             qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
@@ -514,8 +518,17 @@ if _ROS2_AVAILABLE:
             odom.child_frame_id = self._base_frame
             odom.pose.pose.position.x, odom.pose.pose.position.y = x, y
             odom.pose.pose.orientation.z, odom.pose.pose.orientation.w = qz, qw
-            odom.twist.twist.linear.x = v
+            odom.twist.twist.linear.x = vx
+            odom.twist.twist.linear.y = vy
             odom.twist.twist.angular.z = w
+            # Slip-aware: the wheels disagree with a rigid-body twist exactly when they slip, so the
+            # least-squares residual variance is the planar-velocity variance. The floor is the
+            # measured straight-line slip no residual can see (all four wheels overspinning
+            # together, 15-38 %, F50): (0.2 * speed)^2.
+            speed_var = (0.2 * math.hypot(vx, vy)) ** 2
+            odom.twist.covariance[0] = odom.twist.covariance[7] = slip_var + speed_var + 1e-4
+            odom.twist.covariance[35] = 1e-4  # IMU gyro
+            odom.twist.covariance[14] = odom.twist.covariance[21] = odom.twist.covariance[28] = 1e6  # unobserved
             self._odom_pub.publish(odom)
 
         def _on_joint_state(self, msg: JointState) -> None:
@@ -523,12 +536,14 @@ if _ROS2_AVAILABLE:
             for i, name in enumerate(msg.name):
                 self._joint_state[name] = (msg.position[i], vel[i])
 
-        def _wheel_odometry(self, stamp_s: float) -> tuple[float, float] | None:
-            """Body twist (v, w) from the wheels, by least squares over the four 4WIS constraints.
+        def _wheel_odometry(self, stamp_s: float) -> tuple[float, float, float, float] | None:
+            """Body twist (vx, vy, w) from the wheels, by least squares over the four 4WIS constraints.
 
-            Each wheel i at chassis-frame ``(xi, yi)``, steered to ``ti`` and rolling at ``wi``:
-            ``wi * r * cos(ti) = v - w * yi`` and ``wi * r * sin(ti) = w * xi``. Eight equations,
-            two unknowns; the residual IS the slip, which is why this estimate drifts.
+            Each wheel i at chassis-frame ``(xi, yi)``, steered to ``ti`` and rolling at ``wi``: the
+            rigid-body velocity at the wheel is ``(vx - w * yi, vy + w * xi)``, so
+            ``wi * r * cos(ti) = vx - w * yi`` and ``wi * r * sin(ti) = vy + w * xi``. Eight
+            equations, three unknowns (the base crabs, so ``vy`` is a real unknown). The residual is
+            the slip the wheels disagree about; returned as a per-axis variance for ``/odom``.
             """
             import numpy as np  # reason: bridge-local, and only on the wheel-odometry path
 
@@ -538,17 +553,19 @@ if _ROS2_AVAILABLE:
                     return None
                 ti = self._joint_state[sj][0]
                 rim = self._joint_state[dj][1] * WHEEL_RADIUS_M
-                rows.append((1.0, -yi)); rhs.append(rim * math.cos(ti))
-                rows.append((0.0, xi)); rhs.append(rim * math.sin(ti))
-            (v, w), *_ = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)
+                rows.append((1.0, 0.0, -yi)); rhs.append(rim * math.cos(ti))
+                rows.append((0.0, 1.0, xi)); rhs.append(rim * math.sin(ti))
+            a, b = np.array(rows), np.array(rhs)
+            (vx, vy, w), *_ = np.linalg.lstsq(a, b, rcond=None)
+            slip_var = float(np.sum((a @ np.array([vx, vy, w]) - b) ** 2)) / (len(b) - 3)
             del stamp_s
             # Heading rate from the IMU, not from the wheels: an in-place turn is pure lateral scrub,
             # where the wheels realise 42-54 % of the commanded rate and the kinematic inversion
             # believes the wheels. Wheel-inertial odometry is the standard answer and it is what a real
             # rover carries (research repo F50).
             if self._use_imu_yaw_rate:
-                w = self._latest_ang_vel[2]
-            return float(v), float(w)
+                w = self._latest_ang_vel[2]  # the IMU sits on chassis_base_link with no rotation (SRB lunarbot.py)
+            return float(vx), float(vy), float(w), slip_var
 
         def _on_imu(self, msg: RosImu, *, frame_id: str) -> None:
             self._latest_ang_vel = (
@@ -647,7 +664,7 @@ if _ROS2_AVAILABLE:
             ``odom_source: truth`` republishes the simulator's own pose. ``odom_source: wheel``
             integrates the 4WIS wheel/steering kinematics instead, so the estimate drifts with wheel
             slip exactly as a real rover's does (15-38 % slip on this regolith, research repo F50) and
-            SLAM has a real ``map -> odom`` correction to make. The simulator's pose is published on
+            the localizer (AMCL on the surveyed map, or SLAM) has a real ``map -> odom`` correction to make. The simulator's pose is published on
             ``/openral/pose_truth`` either way -- for the evaluator, never for the robot.
             """
             tf = self._lookup(self._env_tf_frame, self._robot_tf_frame)

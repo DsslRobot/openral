@@ -659,7 +659,7 @@ def _simulator_bridge_topics(scene_simulator: object) -> list[str]:
 
 
 def _build_nav2_include(
-    robot_yaml: str, *, use_sim_time: bool, slam_backend: str = "lidar"
+    robot_yaml: str, *, use_sim_time: bool, slam_backend: str = "lidar", localization: str = "none"
 ) -> object:
     """Construct the IncludeLaunchDescription for upstream Nav2.
 
@@ -696,6 +696,8 @@ def _build_nav2_include(
             # visual robots get the `/map`-consuming costmap profile
             # (nav2_visual.yaml); lidar robots keep the `/scan` base config.
             "slam_backend": slam_backend,
+            # `amcl`: localize against the static /map (map_path) -- see the `localization` arg.
+            "localization": localization,
             # Lifecycle is driven by `_nav2_lifecycle_driver` instead of the in-stack
             # lifecycle_manager's autostart (see there).
             "autostart": "false",
@@ -715,7 +717,7 @@ NAV2_LIFECYCLE_NODES = (
 )
 
 
-def _nav2_lifecycle_driver() -> object:
+def _nav2_lifecycle_driver(localization: str = "none") -> object:
     """Drive the Nav2 servers to ACTIVE with a state-polling driver, not lifecycle_manager autostart.
 
     Humble's ``lifecycle_manager_navigation`` blocks on each ``change_state`` reply with no
@@ -730,7 +732,7 @@ def _nav2_lifecycle_driver() -> object:
         cmd=[
             sys.executable,
             str(_REPO_ROOT / "tools" / "lifecycle_autostart.py"),
-            *[arg for n in NAV2_LIFECYCLE_NODES for arg in ("--node", n)],
+            *[arg for n in (*NAV2_LIFECYCLE_NODES, *(("/amcl",) if localization == "amcl" else ())) for arg in ("--node", n)],
             "--target",
             "active",
             "--service-timeout-s",
@@ -980,6 +982,7 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
     # bundle's text/grid modalities alongside spatial_memory_path's scene graph.
     memory_md_path = LaunchConfiguration("memory_md_path").perform(context)
     map_path = LaunchConfiguration("map_path").perform(context)
+    localization = LaunchConfiguration("localization").perform(context).strip().lower()
     # Deploy-path selector for the reasoner's action-mode
     # palette gate. ``openral deploy sim`` shells this launch with
     # ``hal_mode:=sim`` (digital-twin path: the scene's robosuite OSC
@@ -2009,7 +2012,9 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
         # robocasa-kitchen boot lags Nav2's autostart by ~10–20 s.
         # Gate the Nav2 include on the HAL's transition to ACTIVE
         # so TF is already streaming when Nav2 sub-nodes wake up.
-        nav2_include = _build_nav2_include(robot_yaml, use_sim_time=use_sim_time, slam_backend=slam_backend)
+        nav2_include = _build_nav2_include(
+            robot_yaml, use_sim_time=use_sim_time, slam_backend=slam_backend, localization=localization
+        )
         _bridge_topics = (
             _simulator_bridge_topics(scene_simulator) if hal_mode == "sim" and scene_simulator is not None else []
         )
@@ -2034,11 +2039,11 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
             nav2_entities = [
                 _nav2_gate,
                 RegisterEventHandler(
-                    OnProcessExit(target_action=_nav2_gate, on_exit=[nav2_include, _nav2_lifecycle_driver()])
+                    OnProcessExit(target_action=_nav2_gate, on_exit=[nav2_include, _nav2_lifecycle_driver(localization)])
                 ),
             ]
         else:
-            nav2_entities = [nav2_include, _nav2_lifecycle_driver()]
+            nav2_entities = [nav2_include, _nav2_lifecycle_driver(localization)]
         extra_nodes.append(
             RegisterEventHandler(
                 OnStateTransition(
@@ -2718,6 +2723,15 @@ def generate_launch_description() -> LaunchDescription:
                 "map so the costmap + the occupancy-grid-refined approach grid have the prior at "
                 "boot. With SLAM on it is ignored (SLAM owns /map). Empty = "
                 "disabled."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "localization",
+            default_value="none",
+            description=(
+                "`amcl`: Nav2 also runs nav2_amcl against the static /map served from "
+                "`map_path` (SLAM off), and AMCL authors map -> odom -- the HAL/bridge must then "
+                "not publish that edge. `none` (default): SLAM or the HAL owns it."
             ),
         ),
         DeclareLaunchArgument(

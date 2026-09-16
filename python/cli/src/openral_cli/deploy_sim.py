@@ -1113,6 +1113,8 @@ def resolve_launch_invocation(  # noqa: PLR0912, PLR0915  # reason: a flat resol
     # Scene-only for the same reason: which topic carries the depth cloud is a
     # property of the workcell's driver, not of this invocation.
     octomap_cloud_topic: str | None = None
+    # Scene-only: how the base is localized is a property of the site (is there a surveyed map?).
+    localization = "none"
 
     # DeployScene.runtime — the committed deploy posture. Field-by-field
     # precedence: explicit CLI flag > scene runtime > auto/built-in default
@@ -1135,6 +1137,7 @@ def resolve_launch_invocation(  # noqa: PLR0912, PLR0915  # reason: a flat resol
             enable_reasoner = rt.enable_reasoner
         enable_slam = enable_slam if enable_slam is not None else rt.enable_slam
         enable_nav2 = enable_nav2 if enable_nav2 is not None else rt.enable_nav2
+        localization = rt.localization or "none"
         enable_octomap = enable_octomap if enable_octomap is not None else rt.enable_octomap
         if enable_octomap_kernel_check is None:
             enable_octomap_kernel_check = rt.enable_octomap_kernel_check
@@ -1460,6 +1463,7 @@ def resolve_launch_invocation(  # noqa: PLR0912, PLR0915  # reason: a flat resol
         f"slam_backend:={slam_backend}",
         f"slam_visual_impl:={slam_visual_impl}",
         f"enable_nav2:={'true' if enable_nav2 else 'false'}",
+        f"localization:={localization}",
         f"enable_octomap:={'true' if enable_octomap else 'false'}",
         f"enable_octomap_kernel_check:={'true' if enable_octomap_kernel_check else 'false'}",
         # OpenRAL clock authority. The launch maps this to ROS

@@ -59,6 +59,12 @@ simulator:
       executable: "sensor_bridge_node.py"
       name: "openral_hal_lunar_bot_sensor_bridge"
       pass_robot_yaml: true
+      # Realistic localization (research repo F50 §4): /odom is wheel-inertial odometry, AMCL on the
+      # surveyed base map authors map -> odom; the simulator pose goes to /openral/pose_truth for the
+      # evaluator only.
+      parameters:
+        odom_source: "wheel"
+        publish_map_to_odom: false
       publishes:
         - "/odom"
         - "/openral/lidar/points"
@@ -67,3 +73,10 @@ simulator:
 # dispatch, so the reasoner (and its LLM gateway) stays out of the graph.
 runtime:
   enable_reasoner: false
+  # No SLAM: the base is localized against the prebuilt map (memory_dir's map.yaml, surveyed with
+  # the rover's own lidar slice by SRB's assets/lunar_base/scene/srb_nav_map_survey.py).
+  enable_slam: false
+  enable_nav2: true
+  localization: "amcl"
+
+memory_dir: "/mnt/SharedData/Research/Space_Robot_Harness/space_robotics_bench/assets/lunar_base/usd/scene/lunar_base/nav_map"
