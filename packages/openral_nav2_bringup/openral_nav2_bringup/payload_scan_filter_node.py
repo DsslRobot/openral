@@ -571,6 +571,13 @@ def main(args: Any = None) -> None:
             msg.ranges = [float(r) for r in ranges]
             self._pub.publish(msg)
 
+    import signal
+
+    # rclpy installs a SIGINT handler but not a SIGTERM one; `ros2 launch` escalates SIGINT -> SIGTERM
+    # -> SIGKILL on shutdown, and without this the node ignored the SIGTERM and outlived its launch,
+    # then kept publishing into the next run (research repo F49).
+    signal.signal(signal.SIGTERM, lambda *_: rclpy.try_shutdown())
+
     rclpy.init(args=args)
     node = PayloadScanFilterNode()
     try:

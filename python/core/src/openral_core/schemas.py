@@ -2005,6 +2005,12 @@ class RobotDescription(BaseModel):
     # shared base file's values (stateful, 0.05 rad yaw tolerance: panda_mobile tuning).
     nav2_goal_yaw_tolerance_rad: float | None = Field(default=None, gt=0.0)
     nav2_goal_checker_stateful: bool | None = None
+    # MoveIt bring-up for this arm (its `<robot>_config` package's move_group launch). Declared on the
+    # robot, not the scene: it is a property of the arm, and every deploy that dispatches a MoveIt
+    # rSkill needs it. `deploy_e2e.launch.py` includes it on both the sim and the real path with the
+    # graph's clock scoped in; until this existed it was a second terminal the operator had to
+    # remember (research repo F49).
+    motion_planning: LaunchInclude | None = None
     # Geometric safety. ``collision_geometry`` is the lowered,
     # kernel-facing set of per-link convex primitives; ``allowed_collision_pairs``
     # is the self-collision exclusion matrix (adjacent links touch by design).

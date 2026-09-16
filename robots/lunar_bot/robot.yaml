@@ -210,48 +210,56 @@ joints:
   # detail the HAL translation layer owns, not this envelope. Driven via
   # GRIPPER_BINARY (>= 0.5 = open); openral_hal.lunar_bot_srb applies SRB's
   # own inverted True=close/False=open wire convention on the way out.
+  # effort_limit 4.0 N.m ~= 65 N at the pads, inside the EG2-4C2's grip-force band; the earlier
+  # 0.9 N.m (~15 N) could not hold a 1 kg payload through a lift (research repo F49).
   - name: "eg2_joint1"
     joint_type: "revolute"
     parent_link: "Link7"
     child_link: "eg2_joint1_link"
     position_limits: [0.0, 1.0]
     velocity_limit: 0.6308
-    effort_limit: 0.9
+    effort_limit: 4.0
   - name: "eg2_joint2"
     joint_type: "revolute"
     parent_link: "Link7"
     child_link: "eg2_joint2_link"
     position_limits: [0.0, 1.0]
     velocity_limit: 0.6308
-    effort_limit: 0.9
+    effort_limit: 4.0
   - name: "eg2_joint3"
     joint_type: "revolute"
     parent_link: "Link7"
     child_link: "eg2_joint3_link"
     position_limits: [0.0, 1.0]
     velocity_limit: 0.6308
-    effort_limit: 0.9
+    effort_limit: 4.0
   - name: "eg2_joint4"
     joint_type: "revolute"
     parent_link: "Link7"
     child_link: "eg2_joint4_link"
     position_limits: [0.0, 1.0]
     velocity_limit: 0.6308
-    effort_limit: 0.9
+    effort_limit: 4.0
   - name: "eg2_joint5"
     joint_type: "revolute"
     parent_link: "Link7"
     child_link: "eg2_joint5_link"
     position_limits: [0.0, 1.0]
     velocity_limit: 0.6308
-    effort_limit: 0.9
+    effort_limit: 4.0
   - name: "eg2_joint6"
     joint_type: "revolute"
     parent_link: "Link7"
     child_link: "eg2_joint6_link"
     position_limits: [0.0, 1.0]
     velocity_limit: 0.6308
-    effort_limit: 0.9
+    effort_limit: 4.0
+
+# MoveIt for the RM-75 (vendored rm_75_config, F31). deploy_e2e includes this on both paths so a
+# MoveIt rSkill never needs a second terminal (F49).
+motion_planning:
+  package: "rm_75_config"
+  launch_file: "move_group.launch.py"
 
 capabilities:
   locomotion:

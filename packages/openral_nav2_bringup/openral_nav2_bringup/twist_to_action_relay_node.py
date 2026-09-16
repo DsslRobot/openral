@@ -148,6 +148,13 @@ def main(args: Any = None) -> None:
             )
             self._hal.send_action(action)
 
+    import signal
+
+    # rclpy installs a SIGINT handler but not a SIGTERM one; `ros2 launch` escalates SIGINT -> SIGTERM
+    # -> SIGKILL on shutdown, and without this the node ignored the SIGTERM and outlived its launch,
+    # then kept publishing into the next run (research repo F49).
+    signal.signal(signal.SIGTERM, lambda *_: rclpy.try_shutdown())
+
     rclpy.init(args=args)
     node = TwistToActionRelayNode()
     try:

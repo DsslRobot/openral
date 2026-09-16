@@ -410,6 +410,40 @@ def _stereo_camera_topics(names_csv: str) -> tuple[str, str, str, str] | None:
     )
 
 
+def _build_motion_planning_include(motion_planning: object, *, use_sim_time: bool) -> object:
+    """Include the robot's MoveIt bring-up (``RobotDescription.motion_planning``).
+
+    ``move_group`` is the arm's, not the scene's: any deploy dispatching a MoveIt rSkill needs it, and
+    until this existed it was an extra terminal the operator had to remember (F33/F49 in the research
+    repo). ``use_sim_time`` is scoped in rather than passed as a launch argument, because a MoveIt
+    config's generated launch file does not declare one.
+    """
+    from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
+    from launch.actions import GroupAction, IncludeLaunchDescription
+    from launch.launch_description_sources import PythonLaunchDescriptionSource
+    from launch_ros.actions import SetParameter
+    from openral_core.exceptions import ROSConfigError
+
+    try:
+        share = get_package_share_directory(motion_planning.package)
+    except PackageNotFoundError as exc:
+        raise ROSConfigError(
+            f"robot.yaml declares motion_planning package {motion_planning.package!r}, which is not on "
+            f"the ament path — build/source the workspace that provides it, or drop `motion_planning:` "
+            f"from the manifest. Refusing rather than bringing up a graph whose MoveIt skills can never plan."
+        ) from exc
+    return GroupAction(
+        scoped=True,
+        actions=[
+            SetParameter(name="use_sim_time", value=use_sim_time),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(share, "launch", motion_planning.launch_file)),
+                launch_arguments=tuple((k, v) for k, v in motion_planning.args.items()),
+            ),
+        ],
+    )
+
+
 def _build_driver_includes(scene_drivers: list, deploy_config: str) -> list:  # type: ignore[type-arg]  # reason: openral_core.LaunchInclude, imported lazily
     """Include the vendor sensor drivers a deploy scene declares.
 
@@ -1727,6 +1761,10 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
         # read, so they go up with the graph.
         if scene_drivers:
             extra_nodes.extend(_build_driver_includes(scene_drivers, deploy_config))
+
+    # MoveIt bring-up declared by the robot manifest (both paths: the arm plans the same way in sim).
+    if description.motion_planning is not None:
+        extra_nodes.append(_build_motion_planning_include(description.motion_planning, use_sim_time=use_sim_time))
 
     urdf_asset = description.assets.urdf
     if urdf_asset is not None:

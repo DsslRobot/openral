@@ -57,3 +57,27 @@ def test_bridge_nodes_get_sim_clock_and_manifest(launch_module: object) -> None:
 def test_bridge_spec_rejects_unknown_fields() -> None:
     with pytest.raises(ValueError):
         SimulatorBridgeSpec(package="p", executable="e", name="n", remap={"a": "b"})
+
+
+def test_motion_planning_include_is_scoped_to_the_graph_clock(launch_module: object) -> None:
+    """move_group comes from the robot manifest and runs on the graph's clock (F49)."""
+    from openral_core import LaunchInclude, RobotDescription
+
+    spec = RobotDescription.from_yaml(str(REPO_ROOT / "robots/lunar_bot/robot.yaml")).motion_planning
+    assert spec == LaunchInclude(package="rm_75_config", launch_file="move_group.launch.py")
+    group = launch_module._build_motion_planning_include(spec, use_sim_time=True)
+    kinds = [type(a).__name__ for a in group.get_sub_entities()]
+    assert "SetParameter" in kinds and "IncludeLaunchDescription" in kinds
+    include = next(a for a in group.get_sub_entities() if type(a).__name__ == "IncludeLaunchDescription")
+    assert include is not None  # path comes from get_package_share_directory + the declared file name
+
+
+def test_motion_planning_include_refuses_an_unbuilt_package(launch_module: object) -> None:
+    """A manifest naming a MoveIt config that is not on the ament path fails at launch parse."""
+    from openral_core import LaunchInclude
+    from openral_core.exceptions import ROSConfigError
+
+    with pytest.raises(ROSConfigError, match="not on the ament path"):
+        launch_module._build_motion_planning_include(
+            LaunchInclude(package="no_such_moveit_config", launch_file="move_group.launch.py"), use_sim_time=True
+        )
