@@ -2005,6 +2005,29 @@ class RobotDescription(BaseModel):
     # shared base file's values (stateful, 0.05 rad yaw tolerance: panda_mobile tuning).
     nav2_goal_yaw_tolerance_rad: float | None = Field(default=None, gt=0.0)
     nav2_goal_checker_stateful: bool | None = None
+    # Base acceleration the controller may assume (m/s^2, rad/s^2; magnitudes). MPPI samples
+    # velocity sequences inside `ax_max`/`ax_min`/`az_max` and the velocity smoother ramps
+    # inside `max_accel`/`max_decel`; the shared base file's 2.5-3.5 are panda_mobile
+    # tuning. A base that brakes far slower (traction-limited on lunar-gravity regolith:
+    # LunarBot stops from 0.55 m/s in ~0.5 m, research repo F50) declares its real limits
+    # here so the controller starts braking where the vehicle actually can. ``None`` keeps
+    # the base file's values.
+    nav2_max_linear_accel_m_s2: float | None = Field(default=None, gt=0.0)
+    nav2_max_linear_decel_m_s2: float | None = Field(default=None, gt=0.0)
+    nav2_max_angular_accel_rad_s2: float | None = Field(default=None, gt=0.0)
+    # Side of the (square, rolling) global costmap in metres. The shared base file's 20 m
+    # window suits a kitchen; a goal outside it makes the planner fail outright ("goal is off
+    # the global costmap") and the BT falls into recoveries. A worksite the size of the lunar
+    # base (~50 m) declares its own. ``None`` keeps the base file's value.
+    nav2_global_costmap_size_m: float | None = Field(default=None, gt=0.0)
+    # A robot-specific Nav2 base params file (a filename in `openral_nav2_bringup/config/`). The
+    # shared file is one robot's tuning; a robot whose worksite differs in kind (terrain relief,
+    # site scale) gets its own copy and keeps the per-robot overrides above on top of it. ``None``
+    # selects the shared file by SLAM backend.
+    nav2_params_file: str | None = None
+    # A robot-specific slam_toolbox params file (a filename in `openral_slam_bringup/config/`), same
+    # rationale as `nav2_params_file`: the shared file is an indoor robot's tuning. ``None`` keeps it.
+    slam_params_file: str | None = None
     # MoveIt bring-up for this arm (its `<robot>_config` package's move_group launch). Declared on the
     # robot, not the scene: it is a property of the arm, and every deploy that dispatches a MoveIt
     # rSkill needs it. `deploy_e2e.launch.py` includes it on both the sim and the real path with the
@@ -2225,13 +2248,43 @@ class RobotDescription(BaseModel):
         v, w = self.nav2_max_linear_speed_m_s, self.nav2_max_angular_speed_rad_s
         if v is not None:
             overrides["vx_max"] = str(v)
+            if self.base_kinematics in ("omni", "holonomic"):
+                overrides["vy_max"] = str(v)
+                overrides["vy_min"] = str(-v)
         if w is not None:
             overrides["wz_max"] = str(w)
         if v is not None or w is not None:
-            # velocity_smoother's [x, y, theta] limits; y stays 0 as in the base file.
+            # velocity_smoother's [x, y, theta] limits. The lateral axis is the robot's own:
+            # an omni/4WIS base crabs, a differential one cannot.
             vs, ws = v if v is not None else 0.5, w if w is not None else 2.0
-            overrides["max_velocity"] = f"[{vs}, 0.0, {ws}]"
-            overrides["min_velocity"] = f"[{-vs}, 0.0, {-ws}]"
+            vy = vs if self.base_kinematics in ("omni", "holonomic") else 0.0
+            overrides["max_velocity"] = f"[{vs}, {vy}, {ws}]"
+            overrides["min_velocity"] = f"[{-vs}, {-vy}, {-ws}]"
+        if w is not None:
+            # behavior_server's Spin recovery publishes straight to cmd_vel, past the velocity
+            # smoother: the base file's 1.0 rad/s tripped the kernel's 0.5 rad/s envelope and
+            # E-stopped the whole graph the first time a plan failed (research repo F50)
+            overrides["max_rotational_vel"] = str(w)
+            overrides["min_rotational_vel"] = str(round(min(0.4, w / 2.0), 3))
+        a, d, aw = self.nav2_max_linear_accel_m_s2, self.nav2_max_linear_decel_m_s2, self.nav2_max_angular_accel_rad_s2
+        if a is not None:
+            overrides["ax_max"] = str(a)
+        if d is not None:
+            overrides["ax_min"] = str(-d)
+        if aw is not None:
+            overrides["az_max"] = str(aw)
+            overrides["rotational_acc_lim"] = str(aw)
+        if self.nav2_global_costmap_size_m is not None:
+            # dotted path, not a bare key: `width`/`height` also name the local costmap's window
+            for k in ("width", "height"):  # nav2_costmap_2d declares these as integers
+                overrides[f"global_costmap.global_costmap.ros__parameters.{k}"] = str(int(round(self.nav2_global_costmap_size_m)))
+        if a is not None or d is not None or aw is not None:
+            # velocity_smoother's [x, y, theta] ramps; the base file's values fill the undeclared axes.
+            aa, dd, ww = a if a is not None else 2.5, d if d is not None else 2.5, aw if aw is not None else 3.2
+            ay = aa if self.base_kinematics in ("omni", "holonomic") else 0.0
+            dy = dd if self.base_kinematics in ("omni", "holonomic") else 0.0
+            overrides["max_accel"] = f"[{aa}, {ay}, {ww}]"
+            overrides["max_decel"] = f"[{-dd}, {-dy}, {-ww}]"
         return overrides
 
     @model_validator(mode="after")

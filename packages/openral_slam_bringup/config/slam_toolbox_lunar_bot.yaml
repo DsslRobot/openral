@@ -1,0 +1,50 @@
+# slam_toolbox for LunarBot on the lunar base (research repo F50). Derived from slam_toolbox_2d.yaml
+# (panda_mobile, indoor); selected by robots/lunar_bot/robot.yaml `slam_params_file`.
+#
+# Two modes, one file each way:
+#   mapping      -- the one-off SURVEY drive that builds the base map (serialize it afterwards with
+#                   the /openral_slam_toolbox/serialize_map service).
+#   localization -- every mission run: localize against that saved map. The map is fixed, so there is
+#                   no accumulating drift -- the error left is the localization error, not the 1.0-2.3 m
+#                   an 18 m mapping drive accumulated (F50). Select it with `mode: localization` plus
+#                   `map_file_name` / `map_start_pose` (overridden at launch).
+#
+# What differs from the indoor base file and why:
+#   max_laser_range 12 -> 35 m: the lunar base is sparse (a few structures on a ~50 m site); at 12 m most
+#     scans see only terrain and the matcher is under-constrained -- the classic open-terrain degeneracy.
+#     The Mid-360 ranges 40 m; 35 m keeps the far, noisy tail out.
+#   scan_buffer_maximum_scan_distance / link_scan_maximum_distance / loop_search_maximum_distance scaled
+#     to the site: loops close across the PDU row and the depot road, not within a kitchen.
+/**:
+  ros__parameters:
+    use_lifecycle_manager: false
+    use_sim_time: false
+    odom_frame: odom
+    map_frame: map
+    base_frame: chassis_base_link
+    scan_topic: /scan
+    mode: mapping
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+    map_update_interval: 1.0
+    transform_publish_period: 0.05
+    resolution: 0.05
+    max_laser_range: 35.0
+    minimum_time_interval: 0.5
+    # continuous processing (see slam_toolbox_2d.yaml for the startup TF-race rationale)
+    minimum_travel_distance: 0.0
+    minimum_travel_heading: 0.0
+    scan_buffer_size: 20
+    scan_buffer_maximum_scan_distance: 30.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 5.0
+    loop_search_maximum_distance: 10.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45

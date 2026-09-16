@@ -1,0 +1,105 @@
+# rSkill manifest — closed-loop BODY_TWIST servo of the base to a planar pose
+# (kind: procedural). The last-metre companion of rskill-nav2-navigate-to-pose:
+# Nav2 plans and drives to within its goal tolerance; this skill docks the base
+# on an exact (x, y, yaw) from live TF, forward or in reverse, with a speed
+# profile bounded by the vehicle's declared deceleration (LunarBot brakes at
+# ~0.25 m/s^2 on regolith, research repo F50). It assumes the straight line to
+# the goal is free -- that is the caller's decision; no mission semantics here.
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-mobile_base-move_base_to_pose"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "mobile_base"
+
+actuators_required:
+  - kind: "body_twist"
+    control_mode_semantics:
+      mode: "absolute"
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Servo the mobile base to an exact planar pose (x, y, yaw) in a TF frame
+  (default odom) with closed-loop body-twist control, using the full planar
+  command (vx, vy, yaw rate) so an omnidirectional/4WIS base translates into
+  the pose while holding its heading. Use after navigate_to_pose for the final
+  approach into a work pose; it does not plan around obstacles.
+actions:
+  - "navigate"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_move_base_to_pose:MoveBaseToPoseRskill"
+  default_goal_json: |
+    {
+      "frame_id": "odom",
+      "base_frame": "chassis_base_link",
+      "position": [0.0, 0.0],
+      "yaw": 0.0,
+      "xy_tolerance_m": 0.03,
+      "yaw_tolerance_rad": 0.03,
+      "max_linear_speed_m_s": 0.15,
+      "max_angular_speed_rad_s": 0.3,
+      "decel_m_s2": 0.2,
+      "allow_reverse": true,
+      "corridor_m": 0.35,
+      "settle_s": 0.5,
+      "timeout_s": 60.0,
+      "stall_timeout_s": 8.0
+    }
+
+goal_params_schema:
+  type: object
+  description: >
+    Planar target pose of the base frame, expressed in frame_id.
+  properties:
+    frame_id:
+      type: string
+      description: "tf2 frame the target is expressed in (default odom; map also works once SLAM is up)."
+    position:
+      type: array
+      items: { type: number }
+      minItems: 2
+      maxItems: 2
+      description: "[x, y] target of the base frame origin, metres."
+    yaw:
+      type: number
+      description: "Target heading of the base +X axis, radians."
+    xy_tolerance_m:
+      type: number
+      exclusiveMinimum: 0
+    yaw_tolerance_rad:
+      type: number
+      exclusiveMinimum: 0
+    max_linear_speed_m_s:
+      type: number
+      exclusiveMinimum: 0
+      description: "Speed cap; must stay under the kernel's max_base_linear_speed_m_s."
+    max_angular_speed_rad_s:
+      type: number
+      exclusiveMinimum: 0
+    allow_reverse:
+      type: boolean
+      description: "Legacy: kept for compatibility; an omnidirectional base translates instead."
+    approach_m:
+      type: number
+      exclusiveMinimum: 0
+      description: "Corridor entry distance in front of the goal, along the goal's own axis."
+    corridor_m:
+      type: number
+      exclusiveMinimum: 0
+      description: "Half-width of the approach corridor; outside it the base returns to the entry."
+    timeout_s:
+      type: number
+      exclusiveMinimum: 0
+  required: ["position", "yaw"]

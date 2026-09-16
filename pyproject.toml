@@ -16,6 +16,10 @@ dependencies = [
     # CUDA tensor then raises NotImplementedError). Marker-scoped so x86_64 /
     # macOS / Windows resolution is byte-identical to before.
     "torchvision; platform_machine == 'aarch64' and sys_platform == 'linux'",
+    # reason: `RobotDescription.motion_planning` includes a MoveIt config's move_group launch inside
+    # `deploy_e2e.launch.py`; moveit_configs_utils -> urdf_parser_py imports lxml, which the venv did
+    # not carry, so the whole deploy launch died with "No module named 'lxml'" (research repo F50).
+    "lxml>=5.0",
 ]
 
 [tool.uv.workspace]

@@ -1,0 +1,69 @@
+# LunarBot on the Connecting Ridge Outpost lunar base scene (SRB `lunar_base`), for
+# Phase C mission runs through the full OpenRAL graph (kernel + HAL + Nav2 + reasoner).
+# Same simulator/bridge wiring as srb_panel_remount.yaml (see that file for the rationale
+# on every field); only the SRB env differs. The Mission A/B task variants
+# (`lunar_base_mission_a_visual` / `lunar_base_mission_b_visual`) take `env.scenario=...`.
+#
+# Run: openral deploy sim --config scenes/deploy/srb_lunar_base_mission_a.yaml (reasoner off: Phase D0 capability checks dispatch rSkills directly)
+
+robot_id: "lunar_bot"
+seed: 0
+
+scene:
+  id: "srb"
+  backend: "isaacsim"
+  observation_height: 480
+  observation_width: 640
+  cameras: ["front", "wrist"]
+
+simulator:
+  argv:
+    - "srb"
+    - "agent"
+    - "ros"
+    - "--env"
+    - "lunar_base_mission_a_visual"
+    - "env.robot=lunar_bot"
+    - "env.scenario=covered"
+    - "env.camera_resolution=[640,480]"
+    - "--headless"
+  cwd: "/mnt/SharedData/Research/Space_Robot_Harness/space_robotics_bench"
+  env_unset:
+    - "CONDA_PREFIX"
+    - "CONDA_EXE"
+    - "CONDA_PYTHON_EXE"
+    - "CONDA_DEFAULT_ENV"
+    - "CONDA_SHLVL"
+    - "CONDA_PROMPT_MODIFIER"
+    - "PYTHONPATH"
+  env_path_exclude_substrings:
+    - "miniconda3"
+  env_set:
+    ISAAC_SIM_PATH: "$HOME/Programs/isaac-sim"
+  ready_topics:
+    - "/clock"
+    - "/srb/env0/robot/joint_states"
+    - "/srb/env0/imu_robot"
+    - "/srb/env0/lidar_robot/pointcloud"
+    - "/srb/env0/cam_front/image_rgb"
+  # Cold Isaac Sim boot + first-render shader compile can run several
+  # minutes on this host (srb-native-install memory) — generous, matching
+  # isaac_franka.yaml's 1200s for the same reason.
+  boot_timeout_s: 1200.0
+  publishes_clock: true
+  # Topic/TF adapter for SRB (sensor_bridge_node): /odom + odom->chassis_base_link TF,
+  # /imu, /openral/cameras/*, /openral/lidar/points. Launched with the simulator;
+  # Nav2 waits for `publishes` before its lifecycle bringup (F37 in the research repo).
+  bridges:
+    - package: "openral_hal_lunar_bot"
+      executable: "sensor_bridge_node.py"
+      name: "openral_hal_lunar_bot_sensor_bridge"
+      pass_robot_yaml: true
+      publishes:
+        - "/odom"
+        - "/openral/lidar/points"
+
+# Phase D0 (execution_plan §21.4): the capability stack is exercised by direct ExecuteRskill
+# dispatch, so the reasoner (and its LLM gateway) stays out of the graph.
+runtime:
+  enable_reasoner: false

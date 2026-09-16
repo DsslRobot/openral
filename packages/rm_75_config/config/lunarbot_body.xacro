@@ -40,6 +40,40 @@
         <geometry><box size="0.291 0.082 0.291"/></geometry>
       </collision>
     </link>
+    <!-- The rover's other actuated joints. They carry no geometry (the wheels' envelope is already on
+         chassis_base_link above and steering barely changes it), but the model must KNOW them: the robot
+         publishes one 21-joint /joint_states, and MoveIt's CurrentStateMonitor logged an ERROR per unknown
+         joint per message — ~600 lines/s, enough to drown the deploy log (research repo F50). -->
+    <xacro:macro name="passive_joint" params="name parent:=chassis_base_link axis:='0 0 1' type:=revolute lower:=-3.15 upper:=3.15">
+      <link name="${name}_link"/>
+      <joint name="${name}" type="${type}">
+        <parent link="${parent}"/>
+        <child link="${name}_link"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <axis xyz="${axis}"/>
+        <xacro:if value="${type == 'revolute'}">
+          <limit lower="${lower}" upper="${upper}" effort="0" velocity="0"/>
+        </xacro:if>
+        <xacro:if value="${type == 'continuous'}">
+          <limit effort="0" velocity="0"/>
+        </xacro:if>
+      </joint>
+    </xacro:macro>
+    <xacro:passive_joint name="chassis_to_front_left_steering_joint"/>
+    <xacro:passive_joint name="chassis_to_front_right_steering_joint"/>
+    <xacro:passive_joint name="chassis_to_rear_left_steering_joint"/>
+    <xacro:passive_joint name="chassis_to_rear_right_steering_joint"/>
+    <xacro:passive_joint name="front_left_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
+    <xacro:passive_joint name="front_right_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
+    <xacro:passive_joint name="rear_left_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
+    <xacro:passive_joint name="rear_right_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
+    <xacro:passive_joint name="eg2_joint1" parent="Link7" lower="-0.9" upper="0.9"/>
+    <xacro:passive_joint name="eg2_joint2" parent="Link7" lower="-0.9" upper="0.9"/>
+    <xacro:passive_joint name="eg2_joint3" parent="Link7" lower="-0.9" upper="0.9"/>
+    <xacro:passive_joint name="eg2_joint4" parent="Link7" lower="-0.9" upper="0.9"/>
+    <xacro:passive_joint name="eg2_joint5" parent="Link7" lower="-0.9" upper="0.9"/>
+    <xacro:passive_joint name="eg2_joint6" parent="Link7" lower="-0.9" upper="0.9"/>
+
     <joint name="chassis_to_arm_mount" type="fixed">
       <parent link="chassis_base_link"/>
       <child link="base_link"/>

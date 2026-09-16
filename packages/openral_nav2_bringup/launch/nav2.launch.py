@@ -325,6 +325,39 @@ def _with_use_sim_time(params_file: str, use_sim_time: bool) -> str:
     return out.name
 
 
+def _apply_path_overrides(params_file: str, rewrites: dict[str, str]) -> tuple[str, dict[str, str]]:
+    """Substitute overrides whose key is a dotted path from the file's top level; return (file, other rewrites).
+
+    ``RewrittenYaml`` rewrites every key of that name anywhere in the file, which is right for
+    ``robot_radius`` and wrong for ``width``: the global and local costmaps both have one, and a
+    worksite-sized global window must not become the local window. A key containing ``.`` is
+    resolved as ``node.node.ros__parameters.key`` into a temporary copy of the file; scalars are
+    parsed with YAML so numbers stay numbers.
+    """
+    import tempfile
+
+    import yaml
+
+    paths = {k: v for k, v in rewrites.items() if "." in k}
+    if not paths:
+        return params_file, rewrites
+    data = yaml.safe_load(Path(params_file).read_text())
+    for key, value in paths.items():
+        node = data
+        *parents, leaf = key.split(".")
+        for p in parents:
+            node = node[p]
+        if leaf not in node:
+            raise KeyError(f"Nav2 override {key!r}: {leaf!r} is not a parameter in {params_file}")
+        parsed = yaml.safe_load(value)
+        # keep the base file's declared type: rclcpp refuses a double for an integer parameter
+        node[leaf] = int(parsed) if isinstance(node[leaf], int) and not isinstance(node[leaf], bool) else parsed
+    out = tempfile.NamedTemporaryFile("w", prefix="openral_nav2_path_", suffix=".yaml", delete=False)  # noqa: SIM115
+    with out:
+        yaml.safe_dump(data, out, sort_keys=False)
+    return out.name, {k: v for k, v in rewrites.items() if k not in paths}
+
+
 def _apply_list_overrides(params_file: str, rewrites: dict[str, str]) -> tuple[str, dict[str, str]]:
     """Substitute overrides for keys that are lists in the base file; return (file, other rewrites).
 
@@ -393,18 +426,25 @@ def _nav2_include_with_robot_overrides(context: object) -> list[object]:
     params_file = LaunchConfiguration("params_file").perform(context)  # type: ignore[attr-defined]
     robot_yaml = LaunchConfiguration("robot_yaml").perform(context)  # type: ignore[attr-defined]
     slam_backend = LaunchConfiguration("slam_backend").perform(context)  # type: ignore[attr-defined]
-    # An empty params_file selects the base config by SLAM backend
-    # (visual → nav2_visual.yaml consuming `/map`; lidar → the /scan base).
-    if not params_file:
-        params_file = _params_path_for_backend(slam_backend)
-
-    rewrites: dict[str, str] = {}
+    description = None
     if robot_yaml:
         from openral_core import (
             RobotDescription,  # reason: defer schema import to launch time
         )
 
-        rewrites = RobotDescription.from_yaml(robot_yaml).nav2_param_overrides()
+        description = RobotDescription.from_yaml(robot_yaml)
+    # An empty params_file selects the robot's own base file when it declares one
+    # (`nav2_params_file`), else the shared config by SLAM backend (visual → nav2_visual.yaml
+    # consuming `/map`; lidar → the /scan base).
+    if not params_file and description is not None and description.nav2_params_file:
+        params_file = os.path.join(get_package_share_directory("openral_nav2_bringup"), "config", description.nav2_params_file)
+    if not params_file:
+        params_file = _params_path_for_backend(slam_backend)
+
+    rewrites: dict[str, str] = {}
+    if description is not None:
+        rewrites = description.nav2_param_overrides()
+        params_file, rewrites = _apply_path_overrides(params_file, rewrites)
         params_file, rewrites = _apply_list_overrides(params_file, rewrites)
     use_sim_time_value = LaunchConfiguration("use_sim_time").perform(context)  # type: ignore[attr-defined]
     params_file = _with_use_sim_time(params_file, use_sim_time_value.strip().lower() in ("true", "1", "yes"))

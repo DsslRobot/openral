@@ -410,14 +410,14 @@ footprint_polygon:
   - [-0.6678, 0.57235]
   - [-0.6678, -0.57235]
   - [0.6378, -0.57235]
-# `(v, omega)` is the entire commanded space (four_wheel_steer.py
-# FourWheelSteerAction.action_dim == 2) -- no strafing, despite the
-# independent-steering wheels -- so "differential" (-> Nav2 MPPI
-# `motion_model: DiffDrive`) matches the real command interface; "omni"
-# would tell the planner it can command lateral velocity, which nothing
-# downstream of BODY_TWIST honours for this robot (F19,
-# `four_wheel_steer.py`'s own module docstring).
-base_kinematics: "differential"
+# The commanded space is `(vx, vy, omega)`: `FourWheelSteerAction.action_dim == 3`
+# since F50 -- all four wheels steer to the same angle and roll, so the vehicle
+# crabs, and the whole BODY_TWIST path (action group, SRB cmd_vel callback, the
+# HAL, the kernel's linear-SPEED bound, the Nav2 relay) carries `linear.y`.
+# Lateral motion is a deliberate LunarBot capability and it scrubs FAR less than
+# an in-place turn (which realises 42-54 % of command at 4x drive torque, F50),
+# so the planner is told about it: "omni" -> Nav2 MPPI `motion_model: Omni`.
+base_kinematics: "omni"
 # Nav2 plans strictly inside the kernel bounds above (a chunk over them is
 # rejected whole); the shared base file's 0.5 m/s / 1.9 rad/s are panda_mobile
 # tuning and would put every turn over this robot's 0.5 rad/s bound.
@@ -428,6 +428,20 @@ nav2_max_angular_speed_rad_s: 0.47
 # then drifted 1.4 m off a 6 m goal while squaring up the heading (F47).
 nav2_goal_yaw_tolerance_rad: 0.25
 nav2_goal_checker_stateful: false
+# Braking is traction-limited on lunar-gravity regolith, not drive-limited: a step to zero
+# from 0.55 m/s slides the 208 kg rover 0.49 m with the wheel rims already slower than the
+# body (tau ~1.0 s), i.e. ~0.5 m/s^2 at best; a 0.3 m/s^2 command ramp still stopped in
+# 1.12 m (research repo F50, assets/lunar_base/scene/srb_brake_check.py). The shared file's
+# 3.0 m/s^2 made MPPI brake ~0.05 m before the goal and overshoot by 0.5-1.35 m (F47).
+nav2_max_linear_accel_m_s2: 0.3
+nav2_max_linear_decel_m_s2: 0.25
+nav2_max_angular_accel_rad_s2: 0.4
+# The lunar base's mission sites lie up to ~15 m from the dock (depot stand at y = -14.4);
+# the shared 20 m rolling window put them off the global costmap (F50).
+nav2_global_costmap_size_m: 60.0
+# Worksite-level Nav2 tuning (terrain relief, later MPPI critic weights for a slow rover) lives in
+# LunarBot's own base file, not in the shared panda_mobile one; the overrides above still apply.
+nav2_params_file: "nav2_lunar_bot.yaml"
 
 sdk_kind: "open"
 hal:

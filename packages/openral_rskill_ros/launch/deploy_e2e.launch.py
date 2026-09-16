@@ -1951,7 +1951,7 @@ def compose_runtime_graph(context: LaunchContext, *_args: object, **_kwargs: obj
             slam_params_path = os.path.join(
                 get_package_share_directory("openral_slam_bringup"),
                 "config",
-                "slam_toolbox_2d.yaml",
+                description.slam_params_file or "slam_toolbox_2d.yaml",
             )
             slam_node = LifecycleNode(
                 package="slam_toolbox",
