@@ -390,6 +390,9 @@ if _ROS2_AVAILABLE:
                     # close over a stale (possibly `None`, post-cleanup)
                     # buffer after the first reconfigure.
                     tf_lookup_getter=lambda: self._tf_lookup,
+                    # the graph's clock, which `use_sim_time` makes the SIM clock: every skill
+                    # timeout and the MoveIt replay pacing must be measured on it (F50)
+                    clock=self._now,
                 )
 
             # F1 — ROSPublishingHAL replaces the motor-driving HAL.
@@ -565,6 +568,14 @@ if _ROS2_AVAILABLE:
                 status_fn=_status,
             )
             self._heartbeat.create_publisher()
+            try:
+                _sim = bool(self.get_parameter("use_sim_time").value)
+            except Exception:  # reason: parameter may be undeclared on a non-sim graph
+                _sim = False
+            self.get_logger().info(
+                f"rskill_runner.clock: use_sim_time={_sim} now={self._now():.3f}s "
+                "(skill timeouts and the MoveIt replay are paced on this clock)"
+            )
             self.get_logger().info(f"rskill_runner_node configured (robot={robot_name}).")
             return TransitionCallbackReturn.SUCCESS
 
@@ -1116,6 +1127,12 @@ if _ROS2_AVAILABLE:
             )
             return engine, (str(_device) if _device is not None else None), consumed
 
+        def _now(self) -> float:
+            """Seconds on the graph's clock -- the SIM clock under ``use_sim_time``. Execution budgets
+            mean 'how long may this skill run on the robot's own clock'; measured on the wall instead,
+            they fire while a rendering simulator is still mid-motion (research repo F50)."""
+            return self.get_clock().now().nanoseconds * 1e-9
+
         def _deadline_lapsed(self, start: float, budget_s: float, chunks: int) -> bool:
             """Return True once the execution budget has lapsed, reporting the miss.
 
@@ -1126,7 +1143,7 @@ if _ROS2_AVAILABLE:
             elapsed so the goal's ``failure_reason`` can quote it.
 
             Args:
-                start: ``time.monotonic()`` captured when execution began.
+                start: ``self._now()`` captured when execution began.
                 budget_s: Resolved deadline; ``<= 0`` disables the check.
                 chunks: Chunks published so far, for the operator log.
 
@@ -1135,7 +1152,7 @@ if _ROS2_AVAILABLE:
             """
             if budget_s <= 0.0:
                 return False
-            elapsed_s = time.monotonic() - start
+            elapsed_s = self._now() - start
             if elapsed_s <= budget_s:
                 return False
             from openral_observability import semconv
@@ -1187,8 +1204,8 @@ if _ROS2_AVAILABLE:
 
             rate_hz: float = self.get_parameter("rate_hz").get_parameter_value().double_value
             period_s = 1.0 / max(rate_hz, 1.0)
-            start = time.monotonic()
-            # Absolute deadlines absorb tick work into the configured period.
+            start = self._now()
+         # Absolute deadlines absorb tick work into the configured period.
             chunk_index, next_tick_deadline = 0, time.perf_counter()
             skill_info = getattr(skill, "info", None)
             skill_role = str(getattr(skill_info, "role", "")) if skill_info is not None else ""
@@ -1283,7 +1300,7 @@ if _ROS2_AVAILABLE:
 
                 feedback = ExecuteRskill.Feedback()
                 feedback.progress = (
-                    min((time.monotonic() - start) / deadline_s, 1.0) if deadline_s > 0.0 else 0.0
+                    min((self._now() - start) / deadline_s, 1.0) if deadline_s > 0.0 else 0.0
                 )
                 feedback.state = "executing"
                 feedback.chunk_index = chunk_index
@@ -2093,6 +2110,7 @@ def make_default_skill_resolver(
     scene_cameras: Sequence[str] = (),
     tf_lookup: Any = None,
     tf_lookup_getter: Any = None,
+    clock: Any = None,
 ) -> SkillResolver:
     """Build the production resolver that knows about wrapped-ROS rSkills.
 
@@ -2124,6 +2142,9 @@ def make_default_skill_resolver(
             (``human300_16d`` etc.) assemble ``observation.state`` from live TF at step time.
             ``None`` preserves the joint-space path.
         tf_lookup_getter: Zero-arg callable returning the current ``tf_lookup`` (or ``None``).
+        clock: Zero-arg callable returning seconds on the graph's clock (sim time when the node runs
+            with ``use_sim_time``). Forwarded to every skill whose timeouts/pacing must follow the
+            clock the robot actually moves on (research repo F50).
             Lets the resolver pick up a TF buffer wired after it is built; forwarded to
             ``make_local_skill_resolver``.
     """
@@ -2132,6 +2153,7 @@ def make_default_skill_resolver(
         scene_cameras=scene_cameras,
         tf_lookup=tf_lookup,
         tf_lookup_getter=tf_lookup_getter,
+        clock=clock,
     )
     # Capture the canonical node handle in the closure scope BEFORE the
     # inner resolver is defined so the body can reference it as a free
@@ -2218,6 +2240,7 @@ def make_default_skill_resolver(
                 prompt=prompt,
                 prompt_metadata_json=prompt_metadata_json,
                 goal_params_json=goal_params_json,
+                clock=clock,
             )
             skill.configure()
             skill.activate()
@@ -2241,6 +2264,7 @@ def make_default_skill_resolver(
                 prompt_metadata_json=prompt_metadata_json,
                 goal_params_json=goal_params_json,
                 tf_lookup=resolved_tf_lookup,
+                clock=clock,
             )
             skill.configure()
             skill.activate()
@@ -2265,6 +2289,7 @@ def make_local_skill_resolver(
     scene_cameras: Sequence[str] = (),
     tf_lookup: Any = None,
     tf_lookup_getter: Any = None,
+    clock: Any = None,
 ) -> SkillResolver:
     """Build a resolver that loads rSkills strictly from in-tree manifests.
 
@@ -2294,6 +2319,9 @@ def make_local_skill_resolver(
             factory time) — required when the lookup is initialised in ``on_configure`` AFTER
             this resolver factory runs (the ``compose_runtime`` path). Takes precedence over
             ``tf_lookup`` when set.
+        clock: Accepted so the two resolvers share one signature and ignored here — only the
+            procedural / ``ros_action`` branches in ``make_default_skill_resolver`` take a clock
+            (a VLA policy adapter has no timeouts of its own).
     """
     import pathlib
 

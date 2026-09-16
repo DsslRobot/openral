@@ -33,7 +33,11 @@ ARM_JOINT_NAMES: tuple[str, ...] = (
 #: fully closed, ``GRIPPER_STROKE_RAD`` = fully open.
 GRIPPER_JOINT_NAME = "eg2_joint1"
 GRIPPER_STROKE_RAD = 0.82
-GRIPPER_CLOSED_RAD = 0.0
+#: the empty jaws' pad-to-pad contact, which is also SRB's closed command target
+#: (``lunarbot.py`` ``_GRIPPER_CLOSED_RAD``): commanded to 0 the pads were driven into each
+#: other and never settled (research repo F50). A grasp stops well above this (0.296 rad on
+#: the spares' 12 mm T-handle neck).
+GRIPPER_CLOSED_RAD = 0.10
 
 #: Published by ``openral_hal_lunar_bot.sensor_bridge_node`` — ``Link7`` +
 #: the arm's TCP offset, one definition shared by this skill and the

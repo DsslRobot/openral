@@ -103,6 +103,9 @@ ros_integration:
 # Per-skill JSON Schema surfaced to the Reasoner LLM tool palette.
 # The LLM overrides the pose block's position/orientation; planner settings are
 # inherited. orientation is a quaternion in pose.quaternion_order (default xyzw).
+# `joint_constraints` (optional) is a posture preference lowered into
+# moveit_msgs/JointConstraints next to the pose (PoseGoalRskill) -- a redundant
+# arm otherwise gets whichever IK branch the sampler finds first.
 goal_params_schema:
   type: object
   description: >
@@ -130,5 +133,36 @@ goal_params_schema:
       required:
         - position
         - orientation
+    joint_constraints:
+      type: array
+      description: >
+        Optional posture preference, embodiment-agnostic: each entry becomes a
+        moveit_msgs/JointConstraint in the same goal_constraints entry as the
+        pose, so the IK/goal sampler only accepts solutions with that joint
+        inside [position - tolerance_below, position + tolerance_above]. Use it
+        to keep a redundant arm on the working branch (e.g. joint1 near 0 with
+        +/-1.5 rad) instead of a mirrored branch that pins other joints at
+        their limits. Tolerances default to 0.5 rad, weight to 1.0.
+      items:
+        type: object
+        properties:
+          joint:
+            type: string
+            description: "Joint name as in the robot description / MoveIt model."
+          position:
+            type: number
+            description: "Preferred joint position (rad)."
+          tolerance_above:
+            type: number
+            minimum: 0
+          tolerance_below:
+            type: number
+            minimum: 0
+          weight:
+            type: number
+            minimum: 0
+        required:
+          - joint
+          - position
   required:
     - pose

@@ -61,6 +61,7 @@ class ProceduralBodyTwistRskill(rSkillBase):
         prompt_metadata_json: str,
         goal_params_json: str = "",
         tf_lookup: Any = None,
+        clock: Any = None,
     ) -> None:
         del tf_lookup  # unused — a fixed body-twist hold needs no TF feedback;
         # accepted so every `kind: procedural` skill shares one constructor
@@ -82,6 +83,7 @@ class ProceduralBodyTwistRskill(rSkillBase):
             ),
         )
         self.manifest = manifest
+        self._clock = clock if clock is not None else time.monotonic
         self._description = robot_description
         self._prompt = prompt
         self._prompt_metadata_json = prompt_metadata_json
@@ -125,7 +127,7 @@ class ProceduralBodyTwistRskill(rSkillBase):
         self._goal = goal
 
     def _activate_impl(self) -> None:
-        self._start_s = time.monotonic()
+        self._start_s = self._clock()
 
     def _deactivate_impl(self) -> None:
         pass
@@ -137,7 +139,7 @@ class ProceduralBodyTwistRskill(rSkillBase):
 
     def _step_impl(self, world_state: WorldState) -> Action:
         duration_s = float(self._goal.get("duration_s", 1.0))
-        elapsed_s = time.monotonic() - self._start_s
+        elapsed_s = self._clock() - self._start_s
         if elapsed_s >= duration_s:
             raise ROSRskillGoalSatisfied(
                 f"{self.name}: body_twist held for {elapsed_s:.2f}s (duration_s={duration_s})."

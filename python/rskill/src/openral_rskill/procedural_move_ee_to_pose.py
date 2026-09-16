@@ -103,6 +103,7 @@ class MoveEEToPoseRskill(rSkillBase):
         prompt_metadata_json: str,
         goal_params_json: str = "",
         tf_lookup: TfLookup | None = None,
+        clock: Any = None,
     ) -> None:
         del robot_description  # unused — this skill closes its loop on TF, not joint_state.
         if manifest.procedural is None:
@@ -127,6 +128,7 @@ class MoveEEToPoseRskill(rSkillBase):
             ),
         )
         self.manifest = manifest
+        self._clock = clock if clock is not None else time.monotonic
         self._prompt = prompt
         self._prompt_metadata_json = prompt_metadata_json
         self._goal_params_json = goal_params_json
@@ -184,7 +186,7 @@ class MoveEEToPoseRskill(rSkillBase):
         self._target_quat = tuple(float(v) for v in quat)  # type: ignore[assignment]
 
     def _activate_impl(self) -> None:
-        self._start_s = time.monotonic()
+        self._start_s = self._clock()
         self._best_pos_err_m = math.inf
         self._best_rot_err_rad = math.inf
         self._last_improve_s = self._start_s
@@ -199,7 +201,7 @@ class MoveEEToPoseRskill(rSkillBase):
 
     def _step_impl(self, world_state: WorldState) -> Action:
         del world_state  # this skill closes its loop on live TF, not joint_state.
-        now = time.monotonic()
+        now = self._clock()
         elapsed_s = now - self._start_s
         timeout_s = float(self._goal.get("timeout_s", 20.0))
         stall_timeout_s = float(self._goal.get("stall_timeout_s", 4.0))

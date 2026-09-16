@@ -14,11 +14,14 @@ the last published command — same rationale as
 ``eg2_joint1``'s raw position/velocity from ``world_state.joint_state`` to
 detect the physical outcome:
 
-* **close (grasp):** done when the jaw has stopped moving (velocity below
-  ``velocity_eps_rad_s`` for ``stable_steps`` consecutive calls) short of
-  the fully-closed stroke — something is between the jaws. Fails
-  (``ROSRuntimeError``) if the jaw reaches the fully-closed stroke (nothing
-  grasped) or if ``timeout_s`` elapses first.
+* **close (grasp):** done when the jaw has stopped moving (its position
+  changed by less than ``_STOPPED_WINDOW_RAD`` over ``stable_steps``
+  consecutive calls — a position window, because the mimic-coupled pads
+  chatter at the closed stop and a velocity test never settled there,
+  research repo F50) short of the closed stroke — something is between the
+  jaws. Fails (``ROSRuntimeError``) if the jaw stops at the closed stroke
+  (nothing grasped: ``GRIPPER_CLOSED_RAD`` is the pads' contact position)
+  or if ``timeout_s`` elapses first.
 * **open (release):** done when the jaw reaches the open stroke. Fails on
   ``timeout_s``.
 """
@@ -56,6 +59,10 @@ _OPEN_MARGIN_RAD = 0.03
 #: velocity still reads ~0 at the very first step()) being misread as
 #: "already stopped, must be grasping something".
 _CLOSE_MOTION_MARGIN_RAD = 0.05
+#: Largest position change (rad) over ``stable_steps`` consecutive readings that still counts
+#: as "stopped". Normal jaw travel is ~0.02 rad per 30 Hz step; pad chatter at the closed stop
+#: is far below this, so the window settles where a velocity threshold kept resetting.
+_STOPPED_WINDOW_RAD = 0.005
 
 
 def _merge_goal(default: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -85,6 +92,7 @@ class GripperRskill(rSkillBase):
         prompt_metadata_json: str,
         goal_params_json: str = "",
         tf_lookup: Any = None,
+        clock: Any = None,
     ) -> None:
         del tf_lookup, robot_description  # unused — reads one named joint, not TF.
         if manifest.procedural is None:
@@ -102,6 +110,7 @@ class GripperRskill(rSkillBase):
             ),
         )
         self.manifest = manifest
+        self._clock = clock if clock is not None else time.monotonic
         self._prompt = prompt
         self._prompt_metadata_json = prompt_metadata_json
         self._goal_params_json = goal_params_json
@@ -110,6 +119,7 @@ class GripperRskill(rSkillBase):
         self._start_s: float = 0.0
         self._stable_count: int = 0
         self._close_start_position: float | None = None
+        self._positions: list[float] = []  # recent jaw readings for the stopped-position window
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -146,9 +156,10 @@ class GripperRskill(rSkillBase):
         self._mode = mode
 
     def _activate_impl(self) -> None:
-        self._start_s = time.monotonic()
+        self._start_s = self._clock()
         self._stable_count = 0
         self._close_start_position = None
+        self._positions = []
 
     def _deactivate_impl(self) -> None:
         pass
@@ -162,24 +173,27 @@ class GripperRskill(rSkillBase):
         timeout_s = float(self._goal.get("timeout_s", 5.0))
         stable_steps = int(self._goal.get("stable_steps", 3))
         velocity_eps = float(self._goal.get("velocity_eps_rad_s", 0.01))
-        elapsed_s = time.monotonic() - self._start_s
+        elapsed_s = self._clock() - self._start_s
 
+        del velocity_eps  # accepted for goal compatibility; "stopped" is a position window now
         positions = joint_positions_by_name(world_state)
-        velocities = joint_velocities_by_name(world_state)
         position = positions.get(GRIPPER_JOINT_NAME)
-        velocity = velocities.get(GRIPPER_JOINT_NAME)
 
-        if position is not None and velocity is not None and abs(velocity) < velocity_eps:
-            self._stable_count += 1
-        else:
-            self._stable_count = 0
+        # stopped: the last `stable_steps` readings (plus the one before them) span < window
+        if position is not None:
+            self._positions.append(position)
+            recent = self._positions[-(stable_steps + 1):]
+            if len(recent) == stable_steps + 1 and max(recent) - min(recent) < _STOPPED_WINDOW_RAD:
+                self._stable_count += 1
+            else:
+                self._stable_count = 0
 
         if self._mode == "close":
             if position is not None and self._close_start_position is None:
                 self._close_start_position = position
             if position is not None and self._close_start_position is not None:
                 fully_closed = position <= GRIPPER_CLOSED_RAD + _CLOSED_MARGIN_RAD
-                stopped = self._stable_count >= stable_steps
+                stopped = self._stable_count >= 1
                 moved_enough = (
                     self._close_start_position - position
                 ) >= _CLOSE_MOTION_MARGIN_RAD

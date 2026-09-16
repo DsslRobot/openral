@@ -357,7 +357,7 @@ def test_trajectory_mode_replays_waypoints_then_signals_completion() -> None:
     a2 = skill.step(world_state=None)  # type: ignore[arg-type]
     assert a2.joint_targets == [[0.5, 0.6]]
 
-    with pytest.raises(ROSRskillGoalSatisfied, match="emitted all 3 waypoints"):
+    with pytest.raises(ROSRskillGoalSatisfied, match="reached the last of 3 waypoints"):
         skill.step(world_state=None)  # type: ignore[arg-type]
 
 

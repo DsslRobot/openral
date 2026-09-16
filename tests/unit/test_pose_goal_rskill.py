@@ -141,3 +141,54 @@ def test_look_at_still_leaves_optical_roll_free() -> None:
     oc = entry["orientation_constraints"][0]
     assert oc["absolute_z_axis_tolerance"] == pytest.approx(math.pi)
     assert oc["absolute_x_axis_tolerance"] < 0.5
+
+
+# ── joint_constraints (posture preference) ────────────────────────────────────
+
+
+def _eef_pose_manifest():
+    from pathlib import Path
+
+    import yaml
+    from openral_core.schemas import RSkillManifest
+
+    root = Path(__file__).resolve().parents[2]
+    return RSkillManifest.model_validate(
+        yaml.safe_load((root / "rskills/rskill-moveit-eef-pose/rskill.yaml").read_text())
+    )
+
+
+def test_joint_constraints_are_lowered_next_to_the_pose() -> None:
+    """A posture preference becomes JointConstraints in the SAME goal_constraints entry as the pose."""
+    from openral_rskill.pose_goal_rskill import build_joint_constraints, joint_constraints_from_block
+
+    manifest = _eef_pose_manifest()
+    assert "joint_constraints" in manifest.goal_params_schema["properties"]
+    specs = joint_constraints_from_block(
+        [
+            {"joint": "joint1", "position": 0.0, "tolerance_above": 1.5, "tolerance_below": 1.5, "weight": 1.0},
+            {"joint": "joint7", "position": 0.0},  # defaults: 0.5 rad either side, weight 1.0
+        ]
+    )
+    entry = build_pose_constraints(
+        pose=Pose6D(xyz=(-0.53, 0.0, 0.173), quat_xyzw=(0.0, 0.0, 0.0, 1.0), frame_id="base_link"),
+        link_name="Link7",
+        position_tolerance_m=0.01,
+        orientation_axis_tolerances_rad=(0.05, 0.05, 0.05),
+    )
+    entry["joint_constraints"] = build_joint_constraints(specs)
+    assert entry["joint_constraints"] == [
+        {"joint_name": "joint1", "position": 0.0, "tolerance_above": 1.5, "tolerance_below": 1.5, "weight": 1.0},
+        {"joint_name": "joint7", "position": 0.0, "tolerance_above": 0.5, "tolerance_below": 0.5, "weight": 1.0},
+    ]
+    assert entry["position_constraints"][0]["link_name"] == "Link7"  # pose untouched
+
+
+def test_joint_constraints_absent_or_invalid() -> None:
+    from openral_rskill.pose_goal_rskill import joint_constraints_from_block
+
+    assert joint_constraints_from_block(None) == []
+    with pytest.raises(ROSConfigError, match="needs 'joint' and 'position'"):
+        joint_constraints_from_block([{"joint": "joint1"}])
+    with pytest.raises(ROSConfigError, match="must be a list"):
+        joint_constraints_from_block({"joint": "joint1", "position": 0.0})

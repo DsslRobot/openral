@@ -42,7 +42,7 @@ procedural:
   default_goal_json: |
     {
       "mode": "open",
-      "timeout_s": 5.0,
+      "timeout_s": 8.0,
       "stable_steps": 3,
       "velocity_eps_rad_s": 0.01
     }

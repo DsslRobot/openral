@@ -31,7 +31,13 @@ from openral_world_state.object_lift import homogeneous_from_quat_xyz
 
 from openral_rskill.ros_action_rskill import ROSActionRskill
 
-__all__ = ["PoseGoalRskill", "build_pose_constraints", "pose_from_block"]
+__all__ = [
+    "PoseGoalRskill",
+    "build_joint_constraints",
+    "build_pose_constraints",
+    "joint_constraints_from_block",
+    "pose_from_block",
+]
 
 log = structlog.get_logger(__name__)
 
@@ -187,6 +193,65 @@ def pose_from_block(block: dict[str, Any]) -> tuple[Pose6D, str, str | None, flo
     return pose, link_name, tool_frame, pos_tol, orient_tol
 
 
+#: Default half-widths (rad) of a posture preference when the caller gives only a position.
+_DEFAULT_JOINT_TOLERANCE_RAD = 0.5
+
+
+def joint_constraints_from_block(
+    block: Any,  # noqa: ANN401  # reason: validates arbitrary JSON
+) -> list[dict[str, float | str]]:
+    """Parse an optional ``joint_constraints`` goal list into ``(joint, position, tol_above, tol_below, weight)`` specs.
+
+    A posture preference, not a target: MoveIt's goal sampler picks any IK branch that
+    satisfies the pose, and on a redundant arm that can be a branch the operator never wants
+    (a joint-1 ≈ π solution that pins the shoulder/elbow at their limits, research repo F45/F50).
+    Each entry becomes a ``moveit_msgs/JointConstraint`` in the SAME ``goal_constraints`` entry
+    as the pose, so the sampler rejects IK solutions outside the window. Embodiment-agnostic:
+    joints are named, nothing here knows which arm it is.
+
+    Raises:
+        ROSConfigError: On a non-list block, an entry without ``joint``/``position``, or a
+            negative tolerance / weight.
+    """
+    if block is None:
+        return []
+    if not isinstance(block, list):
+        raise ROSConfigError(f"joint_constraints must be a list of objects; got {type(block).__name__}.")
+    specs: list[dict[str, float | str]] = []
+    for i, entry in enumerate(block):
+        if not isinstance(entry, dict) or "joint" not in entry or "position" not in entry:
+            raise ROSConfigError(f"joint_constraints[{i}] needs 'joint' and 'position'; got {entry!r}.")
+        above = float(entry.get("tolerance_above", _DEFAULT_JOINT_TOLERANCE_RAD))
+        below = float(entry.get("tolerance_below", _DEFAULT_JOINT_TOLERANCE_RAD))
+        weight = float(entry.get("weight", 1.0))
+        if above < 0.0 or below < 0.0 or weight < 0.0:
+            raise ROSConfigError(f"joint_constraints[{i}]: tolerances and weight must be >= 0; got {entry!r}.")
+        specs.append(
+            {
+                "joint": str(entry["joint"]),
+                "position": float(entry["position"]),
+                "tolerance_above": above,
+                "tolerance_below": below,
+                "weight": weight,
+            }
+        )
+    return specs
+
+
+def build_joint_constraints(specs: list[dict[str, float | str]]) -> list[dict[str, Any]]:
+    """Lower parsed posture specs into ``moveit_msgs/JointConstraint`` dicts (``_set_message_fields`` shape)."""
+    return [
+        {
+            "joint_name": str(s["joint"]),
+            "position": float(s["position"]),
+            "tolerance_above": float(s["tolerance_above"]),
+            "tolerance_below": float(s["tolerance_below"]),
+            "weight": float(s["weight"]),
+        }
+        for s in specs
+    ]
+
+
 def _is_floats(value: Any, length: int) -> bool:  # noqa: ANN401  # reason: validates arbitrary JSON values
     return (
         isinstance(value, (list, tuple))
@@ -219,6 +284,9 @@ class PoseGoalRskill(ROSActionRskill):
             self._pos_tol,
             self._orient_tol,
         ) = pose_from_block(block)
+        # Optional posture preference (see joint_constraints_from_block); popped so the raw list
+        # never reaches _set_message_fields as an unknown MoveGroup goal field.
+        self._joint_constraints = joint_constraints_from_block(self._goal_dict.pop("joint_constraints", None))
         self._constraints_lowered = False
         self._tf_buffer: Any = None
         if self._tool_frame is not None:
@@ -241,6 +309,7 @@ class PoseGoalRskill(ROSActionRskill):
             link_name=self._link_name,
             tool_frame=self._tool_frame,
             frame_id=self._pose.frame_id,
+            joint_constraints=[s["joint"] for s in self._joint_constraints],
         )
 
     def _resolve_tool_offset(self) -> NDArrayOrNone:
@@ -277,6 +346,8 @@ class PoseGoalRskill(ROSActionRskill):
             position_tolerance_m=self._pos_tol,
             orientation_axis_tolerances_rad=(self._orient_tol, self._orient_tol, self._orient_tol),
         )
+        if self._joint_constraints:
+            entry["joint_constraints"] = build_joint_constraints(self._joint_constraints)
         request = self._goal_dict.setdefault("request", {})
         request["goal_constraints"] = [entry]
         self._constraints_lowered = True

@@ -60,6 +60,7 @@ class MoveJointsRskill(rSkillBase):
         prompt_metadata_json: str,
         goal_params_json: str = "",
         tf_lookup: Any = None,
+        clock: Any = None,
     ) -> None:
         del tf_lookup  # unused — this skill closes its loop on joint_state, not TF.
         if manifest.procedural is None:
@@ -82,6 +83,7 @@ class MoveJointsRskill(rSkillBase):
             ),
         )
         self.manifest = manifest
+        self._clock = clock if clock is not None else time.monotonic
         self._description = robot_description
         self._prompt = prompt
         self._prompt_metadata_json = prompt_metadata_json
@@ -126,7 +128,7 @@ class MoveJointsRskill(rSkillBase):
         self._targets_by_name = dict(zip(ARM_JOINT_NAMES, (float(t) for t in targets), strict=True))
 
     def _activate_impl(self) -> None:
-        self._start_s = time.monotonic()
+        self._start_s = self._clock()
 
     def _deactivate_impl(self) -> None:
         pass
@@ -139,7 +141,7 @@ class MoveJointsRskill(rSkillBase):
     def _step_impl(self, world_state: WorldState) -> Action:
         timeout_s = float(self._goal.get("timeout_s", 15.0))
         tolerance_rad = float(self._goal.get("tolerance_rad", 0.02))
-        elapsed_s = time.monotonic() - self._start_s
+        elapsed_s = self._clock() - self._start_s
 
         current = joint_positions_by_name(world_state)
         errors = [
