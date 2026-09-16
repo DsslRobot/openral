@@ -5,6 +5,12 @@
     <!-- Import rm_75_description urdf file -->
     <xacro:include filename="$(find rm_description)/urdf/rm_75.urdf" />
 
+    <!-- LunarBot's chassis, wheels, gripper and TCP around the arm: the planning frame becomes
+         chassis_base_link and self-collision covers the rover, not just the seven arm links
+         (lunarbot_body.xacro, research repo F50) -->
+    <xacro:include filename="lunarbot_body.xacro" />
+    <xacro:lunarbot_body />
+
     <!-- Import control_xacro -->
     <xacro:include filename="rm_75_description.ros2_control.xacro" />
 

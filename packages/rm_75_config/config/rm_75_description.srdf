@@ -53,4 +53,13 @@
     <disable_collisions link1="Link5" link2="Link6" reason="Adjacent"/>
     <disable_collisions link1="Link5" link2="Link7" reason="Never"/>
     <disable_collisions link1="Link6" link2="Link7" reason="Adjacent"/>
+    <!-- LunarBot body (lunarbot_body.xacro): pairs that can never touch or are rigidly adjacent -->
+    <disable_collisions link1="chassis_base_link" link2="base_link" reason="Adjacent"/>
+    <disable_collisions link1="chassis_base_link" link2="Link1" reason="Never"/>
+    <disable_collisions link1="chassis_base_link" link2="Link2" reason="Never"/>
+    <disable_collisions link1="chassis_base_link" link2="Link3" reason="Never"/>
+    <disable_collisions link1="eg2_gripper" link2="Link7" reason="Adjacent"/>
+    <disable_collisions link1="eg2_gripper" link2="Link6" reason="Never"/>
+    <disable_collisions link1="eg2_gripper" link2="Link5" reason="Never"/>
+    <disable_collisions link1="eg2_gripper" link2="Link4" reason="Never"/>
 </robot>

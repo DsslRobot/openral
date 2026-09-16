@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<!--
+  LunarBot's own body around the RM-75, for MoveIt's self-collision model (research repo Phase D0, F50).
+
+  rm_75_config was the arm alone: `rm_group` planned in `base_link` with nothing but the seven links to
+  avoid, so a "collision-free" plan could sweep the deck, the wheels or the gripper through the rover.
+  Boxes below are the collision geometry SRB simulates (`lunarbot.usdc` per-link collision bounds in
+  the chassis frame, `assets/lunar_base/scene/...`/F50 dump), not the visual hull; the sensor mast has
+  no collider in the simulator and is deliberately absent here too, so what MoveIt avoids is what the
+  simulator would collide with. The arm mount is the articulation's own `base_link` pose
+  (-0.4475, 0, 0.727), identity rotation (confirmed live from SRB's TF, F50).
+
+  Making `chassis_base_link` the URDF root also makes it MoveIt's planning frame, so a goal in the
+  rover frame needs no TF re-expression; `tcp_frame` (Link7 + 0.14 m tool offset, the same frame the
+  sensor bridge publishes) is a fixed link so a goal can constrain the TCP directly.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="lunarbot_body">
+    <link name="chassis_base_link">
+      <!-- deck slab: the chassis collision box, x +-0.661, y +-0.336, z 0.485..0.612 -->
+      <collision name="deck">
+        <origin xyz="0 0 0.5485" rpy="0 0 0"/>
+        <geometry><box size="1.322 0.672 0.127"/></geometry>
+      </collision>
+      <!-- wheels as boxes bounding the 0.1453 m radius, 0.082 m wide cylinders -->
+      <collision name="wheel_front_left">
+        <origin xyz="0.4925 0.468 0.1455" rpy="0 0 0"/>
+        <geometry><box size="0.291 0.082 0.291"/></geometry>
+      </collision>
+      <collision name="wheel_front_right">
+        <origin xyz="0.4925 -0.468 0.1455" rpy="0 0 0"/>
+        <geometry><box size="0.291 0.082 0.291"/></geometry>
+      </collision>
+      <collision name="wheel_rear_left">
+        <origin xyz="-0.5225 0.468 0.1455" rpy="0 0 0"/>
+        <geometry><box size="0.291 0.082 0.291"/></geometry>
+      </collision>
+      <collision name="wheel_rear_right">
+        <origin xyz="-0.5225 -0.468 0.1455" rpy="0 0 0"/>
+        <geometry><box size="0.291 0.082 0.291"/></geometry>
+      </collision>
+    </link>
+    <joint name="chassis_to_arm_mount" type="fixed">
+      <parent link="chassis_base_link"/>
+      <child link="base_link"/>
+      <origin xyz="-0.4475 0 0.727" rpy="0 0 0"/>
+    </joint>
+
+    <!-- EG2-4C2 gripper: body + open jaws bound, in Link7's frame (jaws spread along tool x, 0.143 m long) -->
+    <link name="eg2_gripper">
+      <collision name="gripper">
+        <origin xyz="0 0 0.0715" rpy="0 0 0"/>
+        <geometry><box size="0.092 0.03 0.143"/></geometry>
+      </collision>
+    </link>
+    <joint name="link7_to_gripper" type="fixed">
+      <parent link="Link7"/>
+      <child link="eg2_gripper"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+
+    <!-- tool centre point: Link7 + _TCP_OFFSET (SRB lunarbot.py / sensor bridge `tcp_frame`) -->
+    <link name="tcp_frame"/>
+    <joint name="link7_to_tcp" type="fixed">
+      <parent link="Link7"/>
+      <child link="tcp_frame"/>
+      <origin xyz="0 0 0.14" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+</robot>
