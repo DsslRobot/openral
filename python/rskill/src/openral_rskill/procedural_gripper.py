@@ -120,6 +120,7 @@ class GripperRskill(rSkillBase):
         self._stable_count: int = 0
         self._close_start_position: float | None = None
         self._positions: list[float] = []  # recent jaw readings for the stopped-position window
+        self._last_sample_s: float | None = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -160,6 +161,7 @@ class GripperRskill(rSkillBase):
         self._stable_count = 0
         self._close_start_position = None
         self._positions = []
+        self._last_sample_s = None
 
     def _deactivate_impl(self) -> None:
         pass
@@ -173,14 +175,18 @@ class GripperRskill(rSkillBase):
         timeout_s = float(self._goal.get("timeout_s", 5.0))
         stable_steps = int(self._goal.get("stable_steps", 3))
         velocity_eps = float(self._goal.get("velocity_eps_rad_s", 0.01))
-        elapsed_s = self._clock() - self._start_s
+        now = self._clock()
+        elapsed_s = now - self._start_s
 
         del velocity_eps  # accepted for goal compatibility; "stopped" is a position window now
         positions = joint_positions_by_name(world_state)
         position = positions.get(GRIPPER_JOINT_NAME)
 
-        # stopped: the last `stable_steps` readings (plus the one before them) span < window
-        if position is not None:
+        # stopped: the last `stable_steps` readings (plus the one before them) span < window. Readings are
+        # sampled >= 50 ms apart on the clock: the runner steps faster than a slow sim advances, and
+        # identical same-frame readings mid-stroke would pass for a stopped jaw (research repo F51).
+        if position is not None and (self._last_sample_s is None or now - self._last_sample_s >= 0.05):
+            self._last_sample_s = now
             self._positions.append(position)
             recent = self._positions[-(stable_steps + 1):]
             if len(recent) == stable_steps + 1 and max(recent) - min(recent) < _STOPPED_WINDOW_RAD:

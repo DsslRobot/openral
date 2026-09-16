@@ -25,12 +25,23 @@ def _manifest(name: str) -> RSkillManifest:
     return RSkillManifest.model_validate(yaml.safe_load((ROOT / f"rskills/{name}/rskill.yaml").read_text()))
 
 
+class _Clock:
+    """The graph clock: advances only when the test says the simulator stepped."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
 def _skill(name: str) -> GripperRskill:
     skill = GripperRskill(
         manifest=_manifest(name),
         robot_description=RobotDescription.from_yaml(str(ROOT / "robots/lunar_bot/robot.yaml")),
         prompt="test",
         prompt_metadata_json="",
+        clock=_Clock(),
     )
     skill.configure()
     skill.activate()
@@ -45,9 +56,18 @@ def _ws(jaw: float, t_ns: int) -> WorldState:
     )
 
 
-def _drive(skill: GripperRskill, readings: list[float]) -> None:
+def _drive(skill: GripperRskill, readings: list[float], sim_dt_s: float = 0.06) -> None:
     for i, jaw in enumerate(readings):
         skill.step(_ws(jaw, i * 33_000_000))
+        skill._clock.t += sim_dt_s  # type: ignore[attr-defined]
+
+
+def test_same_frame_readings_mid_stroke_are_not_a_stop() -> None:
+    """The runner steps faster than a slow simulator: repeated readings within one sim frame are not a stopped jaw."""
+    skill = _skill("rskill-procedural-grasp")
+    _drive(skill, [0.9, 0.8, 0.7], sim_dt_s=0.06)
+    _drive(skill, [0.6] * 6, sim_dt_s=0.005)  # six runner steps inside 30 ms of sim time
+    assert skill.info.state is RSkillState.ACTIVE
 
 
 def test_empty_close_settling_at_the_pad_contact_reads_nothing_grasped() -> None:

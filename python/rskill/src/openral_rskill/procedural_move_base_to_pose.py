@@ -109,6 +109,7 @@ class MoveBaseToPoseRskill(rSkillBase):
         self._inside_since_s: float | None = None
         self._reverse: bool | None = None  # chosen once, at the first fix, so the base does not flip mid-approach
         self._last_fix: tuple[float, float, float] | None = None  # (x, y, t) of the previous TF fix
+        self._speed = math.inf  # ground speed over the last >= 50 ms of clock
         self._phase: str | None = None  # stage -> align -> approach (see _step_impl)
         self._phase_best = math.inf
 
@@ -137,6 +138,7 @@ class MoveBaseToPoseRskill(rSkillBase):
         self._inside_since_s = None
         self._reverse = None
         self._last_fix = None
+        self._speed = math.inf
         self._phase = None
         self._phase_best = math.inf
 
@@ -188,12 +190,17 @@ class MoveBaseToPoseRskill(rSkillBase):
 
         # ground speed from successive fixes: a base that brakes with a ~1 s lag can be inside
         # tolerance and still moving, so "settled" needs the pose AND the speed
-        speed = math.inf
-        if self._last_fix is not None:
+        # On the sim clock the runner steps faster than /clock advances, so consecutive fixes often share
+        # a stamp: keep the last estimate until the clock moves (inf on every same-stamp step never let the
+        # base count as settled, and the stall timer failed a dock sitting on its goal, research repo F51).
+        if self._last_fix is None:
+            self._last_fix = (x, y, now)
+        else:
             lx, ly, lt = self._last_fix
-            if now - lt > 1e-3:
-                speed = math.hypot(x - lx, y - ly) / (now - lt)
-        self._last_fix = (x, y, now)
+            if now - lt >= 0.05:
+                self._speed = math.hypot(x - lx, y - ly) / (now - lt)
+                self._last_fix = (x, y, now)
+        speed = self._speed
 
         inside = dist < xy_tol and abs(yaw_err) < yaw_tol and speed < 0.02
         if inside:

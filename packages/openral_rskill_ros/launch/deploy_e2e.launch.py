@@ -732,7 +732,10 @@ def _nav2_lifecycle_driver(localization: str = "none") -> object:
         cmd=[
             sys.executable,
             str(_REPO_ROOT / "tools" / "lifecycle_autostart.py"),
-            *[arg for n in (*NAV2_LIFECYCLE_NODES, *(("/amcl",) if localization == "amcl" else ())) for arg in ("--node", n)],
+            # AMCL first, as upstream brings localization up before navigation: the global costmap
+            # blocks `planner_server`'s configure until map -> base resolves, which only an ACTIVE
+            # AMCL publishes (research repo F51).
+            *[arg for n in (*(("/amcl",) if localization == "amcl" else ()), *NAV2_LIFECYCLE_NODES) for arg in ("--node", n)],
             "--target",
             "active",
             "--service-timeout-s",

@@ -268,6 +268,10 @@ def _main() -> int:  # noqa: PLR0911, PLR0912, PLR0915  # reason: linear bootstr
             search_paths=search_paths,
             scene_cameras=camera_names,
             tf_lookup_getter=lambda: getattr(skill_runner_node, "_tf_lookup", None),
+            # The graph's clock (sim time under use_sim_time): without it every procedural and
+            # ros_action skill fell back to time.monotonic, so a 0.1x sim hit its timeouts after a
+            # tenth of the motion (research repo F51; the runner's own fallback resolver had it).
+            clock=skill_runner_node._now,  # type: ignore[attr-defined]
         )
 
     try:

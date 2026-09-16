@@ -29,6 +29,9 @@ simulator:
     - "lunar_base_mission_a"
     - "env.robot=lunar_bot"
     - "env.scenario=covered"
+    # the verifier's success is observed, not acted on: a terminating episode auto-resets and teleports
+    # the rover back to the dock the moment it arrives (research repo F51)
+    - "env.terminate_on_success=false"
     - "--headless"
   cwd: "/mnt/SharedData/Research/Space_Robot_Harness/space_robotics_bench"
   env_unset:

@@ -18,7 +18,8 @@ amcl:
     robot_model_type: "nav2_amcl::OmniMotionModel"
     # OmniMotionModel (nav2_amcl, Humble): per update, std(trans) = sqrt(a3 dT^2 + a1 dR^2),
     # std(rot) = sqrt(a4 dR^2 + a2 dT^2), std(strafe) = sqrt(a1 dR^2 + a5 dT^2).
-    alpha1: 0.05   # in-place turns scrub sideways (F50)
+    alpha1: 0.3    # translation noise per radian turned: in-place turns scrub and the wheels report
+                   # translation that did not happen (0.7 m over a 45 deg stalled turn, F51)
     alpha2: 0.01   # heading from the IMU barely drifts with distance
     alpha3: 0.15   # ~39 % of the step: slip over-reads translation by 15-38 %
     alpha4: 0.02   # IMU heading per radian turned
