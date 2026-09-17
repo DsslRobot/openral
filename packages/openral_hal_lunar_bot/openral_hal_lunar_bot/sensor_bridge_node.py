@@ -99,6 +99,33 @@ SRB_SENSOR_TF_SOURCE = {
 #: (item 2's full set — see `docs/lunar_bot_capability_set_plan.md` §3.2).
 REQUIRED_SENSOR_NAMES = ("front", "front_depth", "wrist", "imu", "lidar")
 
+#: Camera extrinsics: (the SRB body the camera is mounted on, mount position, mount roll/pitch/yaw in degrees), both in
+#: IsaacLab's "world" camera convention (+X forward, +Z up) -- numerically identical to SRB's ``lunarbot.py``
+#: ``frame_front_camera`` / ``frame_wrist_camera`` (duplicated for the same reason as ``_TCP_OFFSET``). The camera frame
+#: is chained through the live body TF, as a real robot's calibrated extrinsics are: SRB's own camera TF comes from
+#: IsaacLab's camera ``data.pos_w``, which keeps the spawn pose unless ``update_latest_camera_pose`` is set, and moved
+#: neither with the rover nor with the arm (research repo F53).
+CAMERA_MOUNTS = {
+    "front": ("rgbd_camera_frame", (0.0, 0.0, 0.0), (0.0, 15.0, 0.0)),
+    "wrist": ("Link7", (0.0, -0.048, -0.018), (0.0, -73.10, 90.0)),
+}
+#: World camera convention (+X forward, +Z up) -> ROS optical frame (+Z forward, +Y down), xyzw.
+_WORLD_TO_OPTICAL_XYZW = (0.5, -0.5, 0.5, -0.5)
+
+
+def _quat_mul_xyzw(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz)
+
+
+def _rpy_deg_to_quat_xyzw(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
+    cr, cp, cy = (math.cos(math.radians(v) / 2) for v in (roll, pitch, yaw))
+    sr, sp, sy = (math.sin(math.radians(v) / 2) for v in (roll, pitch, yaw))
+    return (sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy)
+
+
 #: The arm's flange body — SRB's ``RosInterface._broadcast_transforms``
 #: publishes a live TF frame for every body of every articulation
 #: (``srb/env{i}/{asset_name}/{body_name}``, not just declared sensors), so
@@ -419,6 +446,13 @@ if _ROS2_AVAILABLE:
                 dst_topic="/openral/cameras/wrist/camera_info",
                 frame_id=self._sensors["wrist"].frame_id,
             )
+            # The wrist camera is a RealSense D435i like the front one: its depth (32FC1, metres along the optical
+            # axis, registered to the RGB image in simulation) is relayed like the front's.
+            self._relay_image(
+                src_topic=f"/{self._env_tf_frame}/cam_wrist/image_depth",
+                dst_topic="/openral/cameras/wrist_depth/image",
+                frame_id=self._sensors["wrist"].frame_id,
+            )
 
             # ── Lidar relay (data); its TF is handled by _publish_sensor_frames ──
             self._relay_pointcloud(
@@ -614,9 +648,26 @@ if _ROS2_AVAILABLE:
                 return None
 
         def _publish_sensor_frames(self) -> None:
-            """Re-root each sensor's SRB pose as ``chassis_base_link -> <manifest frame>``."""
+            """Re-root each sensor's SRB pose as ``chassis_base_link -> <manifest frame>``; cameras through their mount body."""
             stamp = self.get_clock().now().to_msg()
+            for manifest_name, (body, pos, rpy) in CAMERA_MOUNTS.items():
+                tf = self._lookup(self._robot_tf_frame, f"{self._robot_tf_frame}/{body}")
+                if tf is None:
+                    continue
+                t, r = tf.transform.translation, tf.transform.rotation
+                q_body = (r.x, r.y, r.z, r.w)
+                ox, oy, oz = rotate_vector_by_quat_xyzw(*pos, *q_body)
+                qx, qy, qz, qw = _quat_mul_xyzw(_quat_mul_xyzw(q_body, _rpy_deg_to_quat_xyzw(*rpy)), _WORLD_TO_OPTICAL_XYZW)
+                out = TransformStamped()
+                out.header.stamp = stamp
+                out.header.frame_id = self._base_frame
+                out.child_frame_id = self._sensors[manifest_name].frame_id
+                out.transform.translation.x, out.transform.translation.y, out.transform.translation.z = t.x + ox, t.y + oy, t.z + oz
+                out.transform.rotation.x, out.transform.rotation.y, out.transform.rotation.z, out.transform.rotation.w = qx, qy, qz, qw
+                self._tf_broadcaster.sendTransform(out)
             for manifest_name, srb_name in SRB_SENSOR_TF_SOURCE.items():
+                if manifest_name in CAMERA_MOUNTS:
+                    continue
                 tf = self._lookup(self._robot_tf_frame, f"{self._env_tf_frame}/{srb_name}")
                 if tf is None:
                     continue
