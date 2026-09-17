@@ -190,6 +190,7 @@ class MoveEEToPoseRskill(rSkillBase):
         self._best_pos_err_m = math.inf
         self._best_rot_err_rad = math.inf
         self._last_improve_s = self._start_s
+        self._stopped = False
 
     def _deactivate_impl(self) -> None:
         pass
@@ -252,6 +253,13 @@ class MoveEEToPoseRskill(rSkillBase):
             self._last_improve_s = now
 
         if pos_err_m < pos_tol_m and rot_err_rad < rot_tol_rad:
+            # Stop before completing: the simulator keeps applying the last twist it received until the next command,
+            # and its twist integrator holds the pose under a zero twist. Completing on a nonzero correction twist
+            # left the arm creeping at K_p * pos_err (1.5 cm/s at 0.015 m) while the caller thought (research ob5).
+            if not self._stopped:
+                self._stopped = True
+                return Action(control_mode=ControlMode.CARTESIAN_TWIST, horizon=1, cartesian_twist=[(0.0,) * 6],
+                              frame_id=self._target_frame)
             raise ROSRskillGoalSatisfied(
                 f"{self.name}: reached target (pos_err={pos_err_m:.4f} m, "
                 f"rot_err={rot_err_rad:.4f} rad) after {elapsed_s:.2f}s."
