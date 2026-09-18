@@ -138,11 +138,17 @@ class PickRskill(EyeInHandSkill):
         raise StageFailure("hold", "attempts exhausted")
 
     def vlm_call(self, stage: str, fn):
+        """One call to the vision-language model. When the service does not answer, the stage fails with that reason
+        and the evidence says the *service* failed, not the grasp: the two are different outcomes for a study of the
+        method, and only one of them is about the robot. The skill does not retry it -- that is the caller's call."""
         import openai
 
         try:
             return fn()
         except openai.APIError as exc:
+            self._evidence["dependency_unavailable"] = {"service": "vision_language_model", "model": self.goal["vlm_model"],
+                                                        "endpoint": self.goal["vlm_endpoint"], "error": type(exc).__name__,
+                                                        "stage": stage}
             raise StageFailure(stage, f"the vision-language model ({self.goal['vlm_model']}) did not answer: {type(exc).__name__}") from exc
 
     # ---- find + select --------------------------------------------------------------------------------------------------

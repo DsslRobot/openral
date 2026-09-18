@@ -213,7 +213,13 @@ class EyeInHandSkill(rSkillBase):
     def _activate_impl(self) -> None:
         self._evidence = {"stages": []}
         self._done, self._final_sent, self._q, self._twist = None, False, {}, None
-        self.camera = WristRGBD(self._node)
+        # the wrist camera belongs to the robot, not to one call: one subscriber per node, kept for its life. Creating
+        # it per skill and destroying it on shutdown raced the executor -- a subscription destroyed while the executor
+        # held it in its wait set killed the runner with InvalidHandle, and with it every later skill (F57).
+        self.camera = getattr(self._node, "_wrist_rgbd", None)
+        if self.camera is None:
+            self.camera = WristRGBD(self._node)
+            self._node._wrist_rgbd = self.camera
         self.t0 = self._clock()
         self.evidence_dir = Path(self.goal["evidence_dir"]) / f"{self.manifest.name.rsplit('-', 1)[-1]}_{time.strftime('%Y%m%d-%H%M%S')}"
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -225,8 +231,7 @@ class EyeInHandSkill(rSkillBase):
         pass
 
     def _shutdown_impl(self) -> None:
-        if self.camera is not None:
-            self.camera.close()
+        pass  # the camera subscriptions live on the node and outlive every skill instance (see _activate_impl)
 
     def evidence(self) -> dict:
         return self._evidence

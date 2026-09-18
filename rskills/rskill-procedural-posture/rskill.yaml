@@ -1,0 +1,49 @@
+# rSkill manifest -- take the arm to a joint configuration along a planned path (kind: procedural).
+# The same end state as rskill-procedural-move_joints, reached through the robot's own planner, so the path goes round
+# whatever the scene holds -- the surveyed structures and what the cameras measured standing in the work zone.
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-posture"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "joint_position"
+    control_mode_semantics:
+      mode: "absolute"
+      joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Take the arm to a joint configuration along a path the robot's planner finds through its planning scene, and follow
+  that path. Use it for postures (ready, travel) where a straight joint interpolation would sweep the arm through
+  whatever stands beside the rover. Fails with the stage reached: no path, or stopped short of the posture.
+actions:
+  - "reach"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_posture:PostureRskill"
+  default_goal_json: |
+    {
+      "joint_targets": [0.0, -0.6, 0.0, 1.2, 0.0, 0.6, 0.0],
+      "tolerance_rad": 0.08
+    }
+
+goal_params_schema:
+  type: object
+  properties:
+    joint_targets: {type: array, items: {type: number}, minItems: 7, maxItems: 7, description: "target angle per arm joint, rad"}
+    tolerance_rad: {type: number, description: "per-joint tolerance at the end of the planned path"}
+  required: ["joint_targets"]
