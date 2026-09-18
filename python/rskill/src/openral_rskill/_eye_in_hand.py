@@ -124,7 +124,12 @@ class Frame:
 
 
 class WristRGBD:
-    """The wrist D435i's colour + registered depth, subscribed on the runner node."""
+    """The wrist D435i's colour + registered depth, subscribed on the runner node.
+
+    The node owns these subscriptions for its life. A skill that created and destroyed them per call destroyed them
+    from the worker thread while the executor was spinning on its own, which raised `InvalidHandle` inside
+    `executor.spin()` and killed the runner -- every later goal on it, from any caller, then returned nothing
+    (research repo F58)."""
 
     def __init__(self, node: Any, camera: str = "wrist") -> None:
         from rclpy.qos import qos_profile_sensor_data
@@ -140,17 +145,12 @@ class WristRGBD:
             node.create_subscription(Image, f"/openral/cameras/{camera}_depth/image", lambda m: self._put(self._depth, stamp(m), m), qos_profile_sensor_data),
             node.create_subscription(CameraInfo, f"/openral/cameras/{camera}/camera_info", lambda m: setattr(self, "_info", m), qos_profile_sensor_data),
         ]
-        self._node = node
 
     def _put(self, store: dict, t: float, m: Any) -> None:
         with self._lock:
             store[t] = m
             for k in sorted(store)[:-4]:
                 del store[k]
-
-    def close(self) -> None:
-        for s in self._subs:
-            self._node.destroy_subscription(s)
 
     def latest_pair(self, after: float) -> tuple[float, Any, Any] | None:
         """The newest depth image stamped after `after`, with the colour image nearest to it in time. The two streams
@@ -220,6 +220,10 @@ class EyeInHandSkill(rSkillBase):
         if self.camera is None:
             self.camera = WristRGBD(self._node)
             self._node._wrist_rgbd = self.camera
+        # the declaration channel is opened with the skill, not at the moment it is first needed: a publisher's first
+        # message is lost before discovery completes, and that message is the one that says what the tool is about to
+        # be inside (research repo F59)
+        self.working_on(None)
         self.t0 = self._clock()
         self.evidence_dir = Path(self.goal["evidence_dir"]) / f"{self.manifest.name.rsplit('-', 1)[-1]}_{time.strftime('%Y%m%d-%H%M%S')}"
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -280,6 +284,43 @@ class EyeInHandSkill(rSkillBase):
     def hold_here(self) -> None:
         with self._cmd_lock:
             self._joints, self._twist = tuple(self.arm_q()), None
+
+    #: the space the tool itself takes up about its TCP, from the gripper's own points (`procedural_pick.BODY_POINTS`)
+    TOOL_RADIUS_M = 0.105
+
+    def working_on(self, p_base: np.ndarray | None) -> None:
+        """Say which piece of the world this skill is about to have its tool inside.
+
+        The world model puts what the cameras measure standing in the arm's work zone into the planner's scene, so the
+        arm goes round the things no map knows about (`openral_ext/planning_scene`). The thing being picked up is one
+        of those things -- and an obstacle the planner will not let the tool touch is an item the robot can never take
+        hold of: with the ORU in the measured scene, no arm configuration was allowed to put the tool at its handle,
+        while the same pose solved the moment the measurement was dropped (research repo F58).
+
+        So a skill that is working on something says where: a sphere the size of the tool itself, about the point the
+        tool is going to occupy. Inside it the measurement is not an obstacle -- it is the job. Outside it nothing
+        changes. `None` clears the declaration, and the world model drops one that stops being renewed."""
+        from geometry_msgs.msg import Pose
+        from moveit_msgs.msg import CollisionObject
+        from shape_msgs.msg import SolidPrimitive
+
+        pub = getattr(self._node, "_working_on_pub", None)
+        if pub is None:
+            pub = self._node.create_publisher(CollisionObject, "/space/manipulation_target", 1)
+            self._node._working_on_pub = pub
+        o = CollisionObject()
+        o.header.frame_id, o.id = BASE_FRAME_ID, "tool/working_on"
+        o.header.stamp = self._node.get_clock().now().to_msg()
+        if p_base is None:
+            o.operation = CollisionObject.REMOVE
+        else:
+            o.operation = CollisionObject.ADD
+            o.primitives.append(SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[self.TOOL_RADIUS_M]))
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = (float(v) for v in p_base)
+            pose.orientation.w = 1.0
+            o.primitive_poses.append(pose)
+        pub.publish(o)
 
     def stage(self, name: str, **info) -> dict:
         rec = {"stage": name, "t_sim": round(self._clock() - self.t0, 2), **info}

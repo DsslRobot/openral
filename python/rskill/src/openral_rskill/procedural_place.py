@@ -30,6 +30,12 @@ __all__ = ["PlaceRskill"]
 
 class PlaceRskill(EyeInHandSkill):
     def procedure(self) -> None:
+        try:
+            self.put_it_down()
+        finally:
+            self.working_on(None)  # the world model measures this space as it finds it again
+
+    def put_it_down(self) -> None:
         g = self.goal
         self._evidence.update(support=g["support"])
         self.stage("over")
@@ -44,7 +50,14 @@ class PlaceRskill(EyeInHandSkill):
         s = T_bm[:3, :3] @ s_map + T_bm[:3, 3]
         p0, R0 = self.tcp()
         over = np.array([s[0], s[1], p0[2]])
-        self.servo(lambda: (over, R0), "over", tol_m=0.01, tol_rad=0.05, max_joint_rate_rad_s=0.2, timeout_s=60.0)
+
+        def carrying():
+            # the item in the jaws, and the surface it is going onto, are what this skill is working on -- the planner
+            # must not treat either as an obstacle to the tool that is holding one and reaching for the other (F58)
+            self.working_on(self.tcp()[0])
+            return over, R0
+
+        self.servo(carrying, "over", tol_m=0.01, tol_rad=0.05, max_joint_rate_rad_s=0.2, timeout_s=60.0)
         self._evidence["over"] = {"support_rover": [round(float(v), 3) for v in s], "tcp": [round(float(v), 3) for v in self.tcp()[0]]}
 
         self.stage("lower")
@@ -55,6 +68,7 @@ class PlaceRskill(EyeInHandSkill):
         q_cmd = np.array(self.arm_q())
         while not contact:
             p, R = self.tcp()
+            self.working_on(p)
             if p[2] <= floor:
                 raise StageFailure("lower", f"no contact before the tool was {g['min_tool_above_support_m']} m above the "
                                             "support point", local_retry=False)

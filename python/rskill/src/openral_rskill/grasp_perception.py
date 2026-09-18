@@ -337,12 +337,24 @@ Reply with JSON only: {{"item_visible": true or false, "what_is_visible": "<shor
 
 def ask_json(client, model: str, prompt: str, images: list[np.ndarray]) -> tuple[dict, str]:
     """One vision-language question with images; the parsed JSON object (empty when the reply is not the JSON asked
-    for) and the raw reply."""
+    for) and the raw reply.
+
+    The request goes out over plain HTTP rather than through the vendor SDK: the skill runs inside the ROS runner,
+    whose interpreter carries openai 1.60, and that version left image requests hanging until the deadline while the
+    same request by hand answered in seconds (research repo F57/F58). One POST is all this needs. `client` is still the
+    caller's configured client -- its endpoint, key and deadline are read from it."""
+    import httpx
+
     urls = [f"data:image/jpeg;base64,{base64.b64encode(cv2.imencode('.jpg', im, [cv2.IMWRITE_JPEG_QUALITY, 92])[1].tobytes()).decode()}"
             for im in images]
-    r = client.chat.completions.create(model=model, messages=[{"role": "user", "content": [
-        {"type": "text", "text": prompt}, *({"type": "image_url", "image_url": {"url": u}} for u in urls)]}])
-    reply = (r.choices[0].message.content or "").strip()
+    body = {"model": model, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": prompt}, *({"type": "image_url", "image_url": {"url": u}} for u in urls)]}]}
+    timeout = getattr(client, "timeout", None)
+    r = httpx.post(f"{str(client.base_url).rstrip('/')}/chat/completions", json=body,
+                   headers={"Authorization": f"Bearer {client.api_key}"},
+                   timeout=float(timeout if isinstance(timeout, (int, float)) else 300.0))
+    r.raise_for_status()
+    reply = (r.json()["choices"][0]["message"].get("content") or "").strip()
     found = re.search(r"\{.*\}", reply, re.S)
     try:
         return (json.loads(found.group(0)) if found else {}), reply
@@ -358,26 +370,31 @@ def locate_region(client, model: str, marked_bgr: np.ndarray, target: str, part:
                 choice=choice if choice in ids else None, reason=answer.get("reason", ""), raw=reply, model=model)
 
 
-SELECT_PROMPT = """Images from the camera on a robot's gripper. Image 1 is an overview of the work area. Images 2 to {last} are closer views of it; in each, yellow bars with end ticks span parts the two fingers of the parallel-jaw gripper could close on, numbered (numbers are unique across the images).
+SELECT_PROMPT = """One view from the camera on a robot's gripper. The numbered yellow bars span parts the two fingers could close on.
 
 Task: pick up {target}, holding it by {part}.
 {convention}
-Decide from the images whether the described item is in view, then choose the numbered mark where closing the jaws would hold that item by that part so it can be lifted and carried without slipping. Only choose a mark on the described item. If the described item is not in view, or no mark is on the described part, say so.
+Choose the numbered mark where closing the jaws would hold that item by that part so it can be lifted without slipping. Only a mark on the described item counts; if none is, the choice is null.
 
-Reply with JSON only: {{"item_visible": true or false, "what_is_visible": "<short description of the items you see>", "choice": <mark number or null>, "runner_up": <mark number or null>, "reason": "<one sentence>"}}"""
+Reply with JSON only: {{"choice": <mark number or null>, "reason": "<one short sentence>"}}"""
+# One view per question, and only what the answer needs. Measured against this gateway with the same frames: three
+# images (an overview and both marked views, 265 KB) answered in 16 s once and timed out once; one marked view (54 KB)
+# answered in 7 and 15 s, both correct. Asking for a description of everything in view and a runner-up as well pushed
+# every request past 90 s. Three concurrent asks were dropped to one: on the G0 dataset a single answer and the
+# majority of three both scored 20/28 (research repo F57).
 
 
-def select_candidate(client, model: str, overview_bgr: np.ndarray, marked_views: list[np.ndarray], target: str, part: str,
+def select_candidate(client, model: str, marked_bgr: np.ndarray, target: str, part: str,
                      ids: set[int], convention: str = "") -> dict:
-    """VLM set-of-mark choice: an overview for the item's identity and one magnified marked crop per close view. Returns
-    the parsed answer plus the raw reply."""
-    prompt = SELECT_PROMPT.format(target=target, part=part, last=len(marked_views) + 1,
-                                  convention=f"\n{convention}\n" if convention else "")
-    answer, reply = ask_json(client, model, prompt, [overview_bgr, *marked_views])
+    """VLM set-of-mark choice on one magnified marked view. Returns the parsed answer plus the raw reply."""
+    prompt = SELECT_PROMPT.format(target=target, part=part, convention=f"\n{convention}\n" if convention else "")
+    answer, reply = ask_json(client, model, prompt, [marked_bgr])
     choice = answer.get("choice")
-    return dict(item_visible=bool(answer.get("item_visible")), what_is_visible=answer.get("what_is_visible", ""),
-                choice=choice if choice in ids else None, runner_up=answer.get("runner_up") if answer.get("runner_up") in ids else None,
-                reason=answer.get("reason", ""), raw=reply, model=model)
+    choice = choice if choice in ids else None
+    # a choice is the answer to "is the item there": the model is not asked for a separate flag it would have to
+    # reason about and write out (F57 -- what it is asked to produce is what it spends its time on)
+    return dict(item_visible=choice is not None, what_is_visible=answer.get("reason", ""), choice=choice,
+                runner_up=None, reason=answer.get("reason", ""), raw=reply, model=model)
 
 
 def depth_at(depth: np.ndarray, u: float, v: float, half_px: int = 3) -> float | None:

@@ -31,12 +31,13 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
-from concurrent.futures import ThreadPoolExecutor
+import time
 
 import cv2
 import numpy as np
 
-from openral_rskill._eye_in_hand import (READY, JAW_EMPTY_MAX_RAD, EyeInHandSkill, Frame, StageFailure, mat_to_rotvec)
+from openral_rskill._eye_in_hand import (READY, JAW_EMPTY_MAX_RAD, EyeInHandSkill, Frame, StageFailure, mat_to_rotvec,
+                                          rotvec_to_mat)
 from openral_rskill.grasp_perception import (Candidate, GripperGeometry, PartTracker, find_candidates, render_candidates,
                                              select_candidate, upright)
 
@@ -54,6 +55,19 @@ def tool_rotation(pitch_deg: float, yaw_deg: float, roll_deg: float = 0.0) -> np
     if abs(roll_deg - 180.0) < 1e-6:
         x = -x
     return np.stack([x, np.cross(z, x), z], axis=1)
+
+
+def turned_about_jaws(R: np.ndarray, deg: float) -> np.ndarray:
+    """The same grasp, approached from a different direction: a turn about the jaws' own closing axis.
+
+    Where the jaws close is measured on the part and is not negotiable; which way round the part the tool comes from
+    is free, and the arm does not reach every way equally. The free side decides the preference (a handle standing
+    above a box is taken from above, not through the box), and this turn is how far the skill has to give on that
+    preference to stand where it can (research repo F58/F59)."""
+    if not deg:
+        return R
+    a = R[:, 0] / max(float(np.linalg.norm(R[:, 0])), 1e-9)
+    return rotvec_to_mat(a * math.radians(deg)) @ R
 
 
 def grasp_rotation(closing_b: np.ndarray, part_b: np.ndarray, view_b: np.ndarray, R_now: np.ndarray,
@@ -109,23 +123,33 @@ class PickRskill(EyeInHandSkill):
         g = self.goal
         from openai import OpenAI
 
-        # No hidden retries: the client answers within the deadline or the stage returns with what it has. And no
-        # stale sockets: the calls of one stage are seconds apart, the stages minutes apart, and a keep-alive
-        # connection the gateway has since dropped is answered by nothing at all -- one such reused socket cost a
-        # whole pick call its 300 s deadline while the same request from a fresh client came back in 9 s (F57).
+        # No hidden retries: the model answers within the deadline or the stage returns with what it has. The deadline
+        # is generous against a measured answer (this model reads one marked view in 1-6 s), not against a service that
+        # is not answering: a stage that waits 5 minutes for a question the robot could re-ask from a better view has
+        # stopped being a robot's deadline (research repo F58).
         import httpx
 
-        http = httpx.Client(limits=httpx.Limits(max_connections=8, keepalive_expiry=30.0), timeout=300.0)
-        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=300,
+        http = httpx.Client(limits=httpx.Limits(max_connections=8, keepalive_expiry=30.0), timeout=120.0)
+        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=120,
                           max_retries=0, http_client=http)
         self.geom = GripperGeometry()
         self._evidence.update(target=g["target"], part=g["part"], attempts=[])
         self.stage("prepare")
         self.set_jaw(True, "prepare")
         tried: list[np.ndarray] = []  # grasps already tried, where they were seen in the rover frame at the time
+        try:
+            self.attempts(tried)
+        finally:
+            self.working_on(None)  # the world model measures this space as it finds it again
+
+    def attempts(self, tried: list[np.ndarray]) -> None:
+        g = self.goal
         for attempt in range(int(g["max_attempts"])):
             cand, choice = self.find_and_select(tried)
             tried.append(self._locked_frame.to_base(cand.p_cam))
+            # say what the tool is about to be inside as soon as the grasp is chosen, so the world model has rebuilt
+            # its measurement without it by the time the arm asks for a pose at the part
+            self.working_on(self._locked_frame.to_base(cand.p_cam))
             rec = {"attempt": attempt + 1, "candidate": cand.as_dict(), "vlm": choice}
             self._evidence["attempts"].append(rec)
             try:
@@ -147,11 +171,17 @@ class PickRskill(EyeInHandSkill):
         """One call to the vision-language model. When the service does not answer, the stage fails with that reason
         and the evidence says the *service* failed, not the grasp: the two are different outcomes for a study of the
         method, and only one of them is about the robot. The skill does not retry it -- that is the caller's call."""
+        import httpx
         import openai
 
+        t0 = time.time()
         try:
-            return fn()
-        except openai.APIError as exc:
+            out = fn()
+            self._evidence.setdefault("vlm_calls", []).append({"stage": stage, "s": round(time.time() - t0, 1), "answered": True})
+            return out
+        except (openai.APIError, httpx.HTTPError) as exc:
+            self._evidence.setdefault("vlm_calls", []).append({"stage": stage, "s": round(time.time() - t0, 1),
+                                                               "answered": False, "error": type(exc).__name__})
             self._evidence["dependency_unavailable"] = {"service": "vision_language_model", "model": self.goal["vlm_model"],
                                                         "endpoint": self.goal["vlm_endpoint"], "error": type(exc).__name__,
                                                         "stage": stage}
@@ -237,18 +267,22 @@ class PickRskill(EyeInHandSkill):
                 continue
             all_cands = [c for _, cs, _, _ in shot_cands for c in cs]
             self.stage("select", aim=[round(float(v), 2) for v in P], candidates=len(all_cands))
-            asks = int(g["vlm_asks"])
-            with ThreadPoolExecutor(asks) as pool:
-                answers = list(pool.map(lambda _: self.vlm_call("select", lambda: select_candidate(
-                    self.vlm, g["vlm_model"], overview, [m for _, _, m, _ in shot_cands], g["target"], g["part"],
-                    {c.id for c in all_cands}, g["handle_convention"])), range(asks)))
-            f, cands, shot_q = shot_cands[0][0], shot_cands[0][1], shot_cands[0][3]
-            a = majority(answers, all_cands, f)
-            if a["choice"] is not None:
-                f, cands, _, shot_q = next(sh for sh in shot_cands if any(c.id == a["choice"] for c in sh[1]))
+            # one question per marked view, one image in each. Measured against this gateway on these very frames:
+            # a request carrying the overview and both marked views (265 KB) timed out as often as it answered,
+            # while one marked view (54 KB) answered in 7 and 15 s and chose the same correct mark (research repo F57).
+            answers, picked = [], None
+            for shot, cands, marked, shot_q in shot_cands:
+                a = self.vlm_call("select", lambda m=marked, cs=cands: select_candidate(
+                    self.vlm, g["vlm_model"], m, g["target"], g["part"], {c.id for c in cs}, g["handle_convention"]))
+                answers.append(a)
+                if a["choice"] is not None:
+                    picked = (shot, cands, shot_q, a)
+                    break
+            a = picked[3] if picked else answers[-1]
             view["vlm"] = {k: a[k] for k in ("item_visible", "what_is_visible", "choice", "reason")} | {
                 "answers": [{k: x[k] for k in ("item_visible", "choice", "reason")} for x in answers]}
-            if a["item_visible"] and a["choice"] is not None:
+            if picked is not None:
+                f, cands, shot_q = picked[:3]
                 # stand where that image was taken: the tracker follows the part from the same side of the tool
                 if float(np.max(np.abs(np.array(self.arm_q()) - np.array(shot_q)))) > 0.03:
                     self.plan_to(shot_q, "select")
@@ -364,6 +398,7 @@ class PickRskill(EyeInHandSkill):
         self._evidence["approach_track"] = state["trace"]  # the same list: a failed approach still returns its pictures
         # the camera looks from the side the part is free on, so the fingers close from the side with less material
         # (a handle on a box: from above, not through the box). The tracker carries the roll this costs, frame by frame.
+        self.working_on(state["p_base"])
         side = free_side(f, state["p_base"], state["part_base"], self._self_depth)
         state["camera_side"] = side / max(float(np.linalg.norm(side)), 1e-9)
         self._evidence["camera_side"] = [round(float(v), 2) for v in state["camera_side"]]
@@ -384,8 +419,11 @@ class PickRskill(EyeInHandSkill):
             the goal holds its last measured place and the tool closes in straight along its axis."""
             if state.get("covered") or float(np.linalg.norm(state["p_base"] - self.tcp()[0])) < float(g["blind_ok_m"]):
                 view = state["p_base"] - state["view_base"]
-                R = grasp_rotation(state["axis_base"], state["part_base"], view / max(float(np.linalg.norm(view)), 1e-9),
-                                   self.tcp()[1], state["camera_side"], self._cam_tool)
+                R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"],
+                                                     view / max(float(np.linalg.norm(view)), 1e-9),
+                                                     self.tcp()[1], state["camera_side"], self._cam_tool),
+                                      state.get("turn_deg", 0.0))
+                self.working_on(state["p_base"])
                 return state["p_base"] - R[:, 2] * state["standoff"], R
             nf = self.frame(after=state["seen"], timeout_s=2.0)
             state["seen"] = nf.stamp
@@ -434,8 +472,11 @@ class PickRskill(EyeInHandSkill):
                                        "depth_m": round(tracker.depth, 4), "roll_deg": round(tracker.roll_deg, 1),
                                        "left_m": round(left, 4), "why": tracker.reject})
             view = state["p_base"] - state["view_base"]
-            R = grasp_rotation(state["axis_base"], state["part_base"], view / max(float(np.linalg.norm(view)), 1e-9),
-                               self.tcp()[1], state["camera_side"], self._cam_tool)
+            R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"],
+                                                 view / max(float(np.linalg.norm(view)), 1e-9),
+                                                 self.tcp()[1], state["camera_side"], self._cam_tool),
+                                  state.get("turn_deg", 0.0))
+            self.working_on(state["p_base"])
             return state["p_base"] - R[:, 2] * state["standoff"], R
 
         # close in under vision: the stand-off first, then the grasp point itself
@@ -477,16 +518,26 @@ class PickRskill(EyeInHandSkill):
         rec = {"turn_deg": round(math.degrees(float(np.linalg.norm(mat_to_rotvec(R_g @ R_now.T)))), 1), "tried": []}
         self._evidence["take_standoff"] = rec
         q = blocked = None
-        for standoff_m in standoffs_m:  # the stand-offs this skill offers, in order: a local retry on the same grasp
-            p_g = state["p_base"] - R_g[:, 2] * standoff_m
-            q = self.ik(p_g, R_g, list(self.arm_q()))
-            blocked = None if q is None else guard_or_empty(self, p_g, R_g, state)
-            rec["tried"].append({"stand_off_m": round(standoff_m, 3), "goal": [round(float(v), 3) for v in p_g],
-                                 "reachable": q is not None, "blocked": blocked})
-            if q is not None and not blocked:
-                rec["stand_off_m"] = state["standoff_used"] = round(standoff_m, 3)
+        found = False
+        for turn in [float(v) for v in self.goal["approach_turns_deg"]]:
+            R_t = turned_about_jaws(R_g, turn)
+            for standoff_m in standoffs_m:  # the stand-offs this skill offers, in order: a local retry on the same grasp
+                p_g = state["p_base"] - R_t[:, 2] * standoff_m
+                q = self.ik(p_g, R_t, list(self.arm_q()))
+                blocked = None if q is None else guard_or_empty(self, p_g, R_t, state)
+                rec["tried"].append({"turn_deg": turn, "stand_off_m": round(standoff_m, 3),
+                                     "goal": [round(float(v), 3) for v in p_g],
+                                     "reachable": q is not None, "blocked": blocked})
+                if q is not None and not blocked:
+                    rec["stand_off_m"] = state["standoff_used"] = round(standoff_m, 3)
+                    rec["approach_turn_deg"] = state["turn_deg"] = turn
+                    R_g, found = R_t, True
+                    break
+            if found:
                 break
-        rec.update(reachable=q is not None, blocked=blocked)
+        rec.update(reachable=found, blocked=blocked)
+        if not found:
+            q = None
         if q is None:
             # standing in front of the grasp is the whole premise of the approach: if the arm cannot, no amount of
             # servoing will, and what the goal needs is the rover somewhere else -- which is the caller's to decide
@@ -531,8 +582,13 @@ class PickRskill(EyeInHandSkill):
         before = self.lit_frame()
         p0, R0 = self.tcp()
         lift_v = np.array([0.0, 0.0, float(g["lift_m"])])
+
+        def rising():
+            self.working_on(self.tcp()[0])  # what is in the jaws travels with the tool
+            return p0 + lift_v, R0
+
         try:
-            self.servo_twist(lambda: (p0 + lift_v, R0), "hold", tol_m=0.01, tol_rad=0.06, max_speed_m_s=float(g["lift_speed_m_s"]),
+            self.servo_twist(rising, "hold", tol_m=0.01, tol_rad=0.06, max_speed_m_s=float(g["lift_speed_m_s"]),
                              timeout_s=90.0, stall_s=12.0)
         except StageFailure as exc:
             # a held item bends the arm down (about 4.5 cm under 1 kg, research repo F51), so the tool does not reach the
@@ -584,28 +640,6 @@ BODY_POINTS = np.array([[x, y, z] for x in (-0.055, 0.055) for y in (-0.03, 0.0,
 #: points of the tool in its own frame (x jaw axis, y up in the grip orientation, z forward): the fingertips and
 #: pads, the jaw housing, the wrist camera
 TOOL_POINTS = np.array([[x, y, z] for x in (-0.045, 0.0, 0.045) for y in (-0.03, 0.0, 0.03) for z in (0.01, -0.03, -0.08)])
-def majority(answers: list[dict], cands: list[Candidate], f: Frame, same_place_m: float = 0.03) -> dict:
-    """What most of the concurrent vision-language answers agree on. Marks less than `same_place_m` apart are the same
-    place on the part (several candidates lie along one neck), so answers choosing any of them agree. The item counts as
-    visible, and a place as chosen, only when more than half the answers say so; the chosen mark is the one picked most
-    within the agreeing place."""
-    n = len(answers)
-    visible = [a for a in answers if a["item_visible"]]
-    by_id = {c.id: f.to_base(c.p_cam) for c in cands}
-    chosen = [a["choice"] for a in visible if a["choice"] is not None]
-    best: list[int] = []
-    for c in chosen:
-        near = [d for d in chosen if np.linalg.norm(by_id[d] - by_id[c]) <= same_place_m]
-        if len(near) > len(best):
-            best = near
-    if len(visible) * 2 <= n or len(best) * 2 <= n:
-        base = visible[0] if visible else answers[0]
-        return base | {"item_visible": len(visible) * 2 > n, "choice": None, "agreed": False}
-    top = max(set(best), key=best.count)
-    agree = next(a for a in visible if a["choice"] == top)
-    return agree | {"agreed": True}
-
-
 def tool_points(T_base_tcp: np.ndarray, T_tcp_cam: np.ndarray) -> np.ndarray:
     return (T_base_tcp[:3, :3] @ np.vstack([TOOL_POINTS, T_tcp_cam[:3, 3]]).T).T + T_base_tcp[:3, 3]
 
