@@ -109,9 +109,15 @@ class PickRskill(EyeInHandSkill):
         g = self.goal
         from openai import OpenAI
 
-        # no hidden retries: the client answers within the deadline or the stage returns with what it has. The gateway
-        # answers a marked view in 2-4 minutes; its own retries turned a stalled call into half an hour of silence.
-        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=300, max_retries=0)
+        # No hidden retries: the client answers within the deadline or the stage returns with what it has. And no
+        # stale sockets: the calls of one stage are seconds apart, the stages minutes apart, and a keep-alive
+        # connection the gateway has since dropped is answered by nothing at all -- one such reused socket cost a
+        # whole pick call its 300 s deadline while the same request from a fresh client came back in 9 s (F57).
+        import httpx
+
+        http = httpx.Client(limits=httpx.Limits(max_connections=8, keepalive_expiry=30.0), timeout=300.0)
+        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=300,
+                          max_retries=0, http_client=http)
         self.geom = GripperGeometry()
         self._evidence.update(target=g["target"], part=g["part"], attempts=[])
         self.stage("prepare")
