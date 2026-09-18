@@ -54,7 +54,6 @@ procedural:
       "overview_pose": [-0.85, 0.0, 1.10, 50, 0],
       "vlm_asks": 3,
       "handle_convention": "Payloads at this site carry a standard lifting handle: a narrow neck with a wider head overhanging it. The grasp that holds such a payload is the one across that neck, directly under the head, so the head rests on the closed fingers; a grasp on the head itself, on the block under the neck, or anywhere on the payload's body does not hold it.",
-      "side_view_heights_m": [1.05, 0.83, 0.61],
       "clearance_m": 0.015,
       "image_rows_px": 480,
       "grasp_clear_radius_m": 0.10,

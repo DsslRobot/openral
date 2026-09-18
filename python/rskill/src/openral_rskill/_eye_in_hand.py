@@ -56,11 +56,13 @@ JAW_EMPTY_MAX_RAD = 0.13
 
 
 class StageFailure(Exception):
-    """A stage could not reach its end condition; `stage` and `why` go back to the caller."""
+    """A stage could not reach its end condition; `stage` and `why` go back to the caller. `local_retry` is False when
+    trying the same thing again cannot help -- the skill may only retry on the same target, so a grasp the arm cannot
+    stand in front of from where the rover is belongs to the caller, not to another attempt."""
 
-    def __init__(self, stage: str, why: str) -> None:
+    def __init__(self, stage: str, why: str, local_retry: bool = True) -> None:
         super().__init__(f"{stage}: {why}")
-        self.stage, self.why = stage, why
+        self.stage, self.why, self.local_retry = stage, why, local_retry
 
 
 def quat_to_mat(x: float, y: float, z: float, w: float) -> np.ndarray:

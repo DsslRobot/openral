@@ -129,8 +129,9 @@ class PickRskill(EyeInHandSkill):
                 return
             except StageFailure as exc:
                 rec["outcome"] = f"failed at {exc.stage}: {exc.why}"
-                if exc.stage not in ("approach", "grasp", "hold") or attempt + 1 == int(g["max_attempts"]):
-                    raise
+                if not exc.local_retry or exc.stage not in ("approach", "grasp", "hold") \
+                        or attempt + 1 == int(g["max_attempts"]):
+                    raise  # only what another attempt on the same target could fix is tried again
                 self.back_off()
         raise StageFailure("hold", "attempts exhausted")
 
@@ -167,16 +168,24 @@ class PickRskill(EyeInHandSkill):
         T_tc = self.T("tcp_frame", over.frame_id)  # the camera in the tool frame (robot geometry)
         self._cam_tool = T_tc[:3, 3].copy()  # which side of the tool axis the camera sits on, from the mount itself
         # the gripper's own place in its camera, from that mount: its depth and the image band it leaves free
-        self._tool_view = tool_in_view(over.K, np.linalg.inv(T_tc), over.depth.shape[0])
+        self._tool_view = tool_in_view(over.K, np.linalg.inv(T_tc), *over.depth.shape)
+        self._gripper_mask_path = str(self.evidence_dir / "gripper_mask.npy")
+        np.save(self._gripper_mask_path, self._tool_view["mask"])
         self._self_depth = float(self._tool_view["self_depth_m"])
         self.geom = dataclasses.replace(self.geom, self_depth_m=self._self_depth,
                                         min_part_depth_m=self._self_depth + 0.03)
-        record["tool_in_view"] = self._tool_view
+        record["tool_in_view"] = {k: v for k, v in self._tool_view.items() if k != "mask"} | {"mask": self._gripper_mask_path}
+        # where to look: what the overview measured standing above its surroundings inside the arm's work zone, tallest
+        # first. Not a fixed zone point -- an item that stands somewhere else takes its own place in this list, which is
+        # what "the item's placement is unknown" means (research repo F57).
+        aims = aim_points(surface_heights(seen, self._self_depth), float(g["reach_zone_x_m"]))
+        record["aims"] = [[round(float(v), 3) for v in P] for P in aims]
+        if not aims:
+            raise StageFailure("find", "the overview measured nothing standing in the arm's work zone behind the rover")
         next_id = 1
-        for h in g["side_view_heights_m"]:
-            view = {"height_m": h}
+        for P in aims:
+            view = {"aim": [round(float(v), 3) for v in P], "height_m": round(float(P[2]), 3)}
             record["views"].append(view)
-            P = np.array([g["reach_zone_x_m"], 0.0, h])
             pose = self.side_view_pose(P, T_tc, over.K, seen)
             if pose is None:
                 view["reachable"] = False
@@ -195,14 +204,14 @@ class PickRskill(EyeInHandSkill):
                 shots.append(rolled)
                 seen.append(rolled[1])
             self._heights = surface_heights(seen, self._self_depth)
-            np.save(self.evidence_dir / f"view_h{h:.2f}_depth.npy", f.depth)
+            np.save(self.evidence_dir / f"view_h{P[2]:.2f}_depth.npy", f.depth)
             shot_cands, marked_images = [], []
             for shot_info, shot, shot_q in shots:
                 cands = [c for c in find_candidates(shot.depth, shot.K, self.geom, max_candidates=int(g["candidates_per_view"]))
                          if all(np.linalg.norm(shot.to_base(c.p_cam) - t) > 0.02 for t in tried)]
                 for c in cands:
                     c.id, next_id = next_id, next_id + 1
-                tag = f"h{h:.2f}" + ("_rolled" if shot_info.get("roll") else "")
+                tag = f"h{P[2]:.2f}" + ("_rolled" if shot_info.get("roll") else "")
                 self.save(f"view_{tag}.jpg", upright(shot.bgr, shot.up_cam))
                 if cands:
                     marked = render_candidates(shot.bgr, cands, shot.up_cam)
@@ -213,7 +222,7 @@ class PickRskill(EyeInHandSkill):
             if not shot_cands:
                 continue
             all_cands = [c for _, cs, _, _ in shot_cands for c in cs]
-            self.stage("select", height_m=h, candidates=len(all_cands))
+            self.stage("select", aim=[round(float(v), 2) for v in P], candidates=len(all_cands))
             asks = int(g["vlm_asks"])
             with ThreadPoolExecutor(asks) as pool:
                 answers = list(pool.map(lambda _: self.vlm_call("select", lambda: select_candidate(
@@ -235,11 +244,12 @@ class PickRskill(EyeInHandSkill):
                 # and a roll of the tool turns that template upside down in the following frames
                 self._view_R = self.fk(np.array(shot_q))[:3, :3]
                 return next(c for c in cands if c.id == a["choice"]), view["vlm"]
-            if any(x["item_visible"] and x["choice"] is not None for x in answers):
-                # the item and a grasp on it are in this view, but the answers do not agree where: looking lower will not help
-                raise StageFailure("select", "the vision model's answers did not agree on a grasp on the described part")
+            # no agreed grasp in this view: it may be the wrong structure (the marks in it are not on the part at
+            # all), so the sweep goes on to the next thing that stands out, and only the last one ends the stage
         saw = [v["vlm"]["what_is_visible"] for v in record["views"] if v.get("vlm")]
-        raise StageFailure("select" if saw else "find", "no grasp on the described part of the described item in the views of the reach zone"
+        raise StageFailure("select" if saw else "find",
+                           f"none of the {len(aims)} structures the views measured in the arm's work zone carries a "
+                           "grasp on the described part of the described item"
                            + (f" (the vision model saw: {saw[0]})" if saw else ""))
 
     def rolled_view(self, info: dict, P: np.ndarray, T_tc: np.ndarray, K: np.ndarray, seen: list[Frame]):
@@ -343,14 +353,14 @@ class PickRskill(EyeInHandSkill):
         side = free_side(f, state["p_base"], state["part_base"], self._self_depth)
         state["camera_side"] = side / max(float(np.linalg.norm(side)), 1e-9)
         self._evidence["camera_side"] = [round(float(v), 2) for v in state["camera_side"]]
-        approach_from = float(g["standoff_m"][0] if isinstance(g["standoff_m"], list) else g["standoff_m"])
+        approach_from = g["standoff_m"] if isinstance(g["standoff_m"], list) else [float(g["standoff_m"])]
 
         def guard_pose(p, R):
             return guard_or_empty(self, p, R, state)
 
         # stand in front of the grasp first, in the orientation the grasp needs -- with the planner, from the view's own
         # measurement -- and only then close the loop (see take_standoff)
-        tracker = self.take_standoff(cand, state, approach_from)
+        tracker = self.take_standoff(cand, state, list(approach_from))
         if tracker is None:
             tracker = PartTracker(f.bgr, f.depth, f.K, cand, R_base_cam=f.T_base_cam[:3, :3])
 
@@ -415,7 +425,7 @@ class PickRskill(EyeInHandSkill):
             return state["p_base"] - R[:, 2] * state["standoff"], R
 
         # close in under vision: the stand-off first, then the grasp point itself
-        state["standoff"] = approach_from
+        state["standoff"] = float(state.get("standoff_used", approach_from[0]))
         info = self.servo_twist(goal_now, "approach", tol_m=0.006, tol_rad=0.04, max_speed_m_s=float(g["approach_speed_m_s"]),
                                 timeout_s=float(g["approach_timeout_s"]), stall_s=6.0, guard=guard_pose)
         self._evidence["standoff"] = {**info, "tracked_frames": state["hits"], "missed_frames": state["misses"],
@@ -436,7 +446,7 @@ class PickRskill(EyeInHandSkill):
                                       "track": state.get("trace", [])}
         self._grasp_point = state["p_base"]
 
-    def take_standoff(self, cand: Candidate, state: dict, standoff_m: float) -> PartTracker | None:
+    def take_standoff(self, cand: Candidate, state: dict, standoffs_m: list[float]) -> PartTracker | None:
         """Stand the tool in front of the chosen grasp, in the orientation the grasp needs, with the planner -- one
         reconfiguration, not a servo motion: the view is taken from wherever frames the part, the grasp comes from the
         side the part is free on, and between the two the wrist can turn half round. Turning it where the tool stands is
@@ -450,15 +460,29 @@ class PickRskill(EyeInHandSkill):
         view = state["p_base"] - state["view_base"]
         R_g = grasp_rotation(state["axis_base"], state["part_base"], view / max(float(np.linalg.norm(view)), 1e-9),
                              R_now, state["camera_side"], self._cam_tool)
-        p_g = state["p_base"] - R_g[:, 2] * standoff_m
-        rec = {"turn_deg": round(math.degrees(float(np.linalg.norm(mat_to_rotvec(R_g @ R_now.T)))), 1),
-               "stand_off_m": round(standoff_m, 3), "goal": [round(float(v), 3) for v in p_g]}
+        rec = {"turn_deg": round(math.degrees(float(np.linalg.norm(mat_to_rotvec(R_g @ R_now.T)))), 1), "tried": []}
         self._evidence["take_standoff"] = rec
-        q = self.ik(p_g, R_g, list(self.arm_q()))
-        blocked = None if q is None else guard_or_empty(self, p_g, R_g, state)
+        q = blocked = None
+        for standoff_m in standoffs_m:  # the stand-offs this skill offers, in order: a local retry on the same grasp
+            p_g = state["p_base"] - R_g[:, 2] * standoff_m
+            q = self.ik(p_g, R_g, list(self.arm_q()))
+            blocked = None if q is None else guard_or_empty(self, p_g, R_g, state)
+            rec["tried"].append({"stand_off_m": round(standoff_m, 3), "goal": [round(float(v), 3) for v in p_g],
+                                 "reachable": q is not None, "blocked": blocked})
+            if q is not None and not blocked:
+                rec["stand_off_m"] = state["standoff_used"] = round(standoff_m, 3)
+                break
         rec.update(reachable=q is not None, blocked=blocked)
-        if q is None or blocked:
-            return None  # the servo does what it can from here; the guard still holds
+        if q is None:
+            # standing in front of the grasp is the whole premise of the approach: if the arm cannot, no amount of
+            # servoing will, and what the goal needs is the rover somewhere else -- which is the caller's to decide
+            raise StageFailure("approach", "the arm cannot stand in front of this grasp from where the rover is "
+                                           f"(the grasp is {float(np.linalg.norm(state['p_base'] - self.tcp()[0])) * 100:.0f} cm "
+                                           f"from the tool, at {[round(float(v), 2) for v in state['p_base']]} in the rover frame)",
+                               local_retry=False)
+        if blocked:
+            raise StageFailure("approach", f"the tool cannot stand in front of this grasp without touching {blocked}",
+                               local_retry=False)
         self.plan_to(q, "approach")
         self.wait(0.6)
         nf = self.frame(after=self._clock() - 0.05)
@@ -507,12 +531,12 @@ class PickRskill(EyeInHandSkill):
         after = self.lit_frame()
         p1, _ = self.tcp()
         jaw = self.jaw()
-        flow = moved_with_gripper(before, after, int(self._tool_view["tool_top_row"]))
+        flow = moved_with_gripper(before, after, self._tool_view["mask"], self._self_depth)
         np.save(self.evidence_dir / "hold_before_depth.npy", before.depth)
         self._evidence["hold_check"] = {"jaw_rad": round(jaw, 4), "lift_m": round(float(p1[2] - p0[2]), 4), **flow,
                                          "before": self.save("hold_before.png", before.bgr), "after": self.save("hold_after.png", after.bgr),
                                          "before_depth": str(self.evidence_dir / "hold_before_depth.npy"), "fx": float(before.K[0, 0]),
-                                         "item_rows_px": int(self._tool_view["tool_top_row"])}
+                                         "gripper_mask": self._gripper_mask_path, "self_depth_m": self._self_depth}
         if jaw <= JAW_EMPTY_MAX_RAD:
             raise StageFailure("hold", f"the item slipped out of the jaws during the lift (jaw {jaw:.3f} rad)")
         if not flow["item_moved_with_gripper"]:
@@ -572,7 +596,7 @@ def tool_points(T_base_tcp: np.ndarray, T_tcp_cam: np.ndarray) -> np.ndarray:
     return (T_base_tcp[:3, :3] @ np.vstack([TOOL_POINTS, T_tcp_cam[:3, 3]]).T).T + T_base_tcp[:3, 3]
 
 
-def tool_in_view(K: np.ndarray, T_ct: np.ndarray, rows: int, margin_m: float = 0.02) -> dict:
+def tool_in_view(K: np.ndarray, T_ct: np.ndarray, rows: int, cols: int, margin_m: float = 0.02) -> dict:
     """Where the gripper's own body is in its own camera, and how far along the optical axis it reaches: the camera is
     bolted to the tool, so both follow from the mount (TF) and the tool's dimensions, and hold for every frame.
 
@@ -585,8 +609,35 @@ def tool_in_view(K: np.ndarray, T_ct: np.ndarray, rows: int, margin_m: float = 0
     self_depth = float(np.max(ahead[:, 2])) + margin_m if len(ahead) else margin_m
     v = K[1, 1] * ahead[:, 1] / ahead[:, 2] + K[1, 2]
     top = int(np.clip(np.min(v) if len(v) else rows, 0, rows))  # the image row the gripper first appears in
-    return {"self_depth_m": round(self_depth, 3), "tool_top_row": top, "clear_rows": top,
-            "centre_row": int(top * 0.5), "part_row": int(top * 0.75)}
+    mask = np.zeros((rows, cols), np.uint8)  # its silhouette: the fingers, not the space between them
+    for x, y, z in ahead:
+        u, vv = K[0, 0] * x / z + K[0, 2], K[1, 1] * y / z + K[1, 2]
+        cv2.circle(mask, (int(round(u)), int(round(vv))), max(2, int(K[0, 0] * 0.012 / z)), 1, -1)
+    return {"self_depth_m": round(self_depth, 3), "tool_top_row": top, "centre_row": int(top * 0.5),
+            "part_row": int(top * 0.75), "mask": mask.astype(bool)}
+
+
+def aim_points(heights: dict, zone_x_m: float, cell_m: float = 0.05, apart_m: float = 0.12, keep: int = 5,
+               stands_out_m: float = 0.04) -> list[np.ndarray]:
+    """What to point the wrist camera at, from what the views have measured: the cells that stand above their
+    surroundings inside the arm's work zone behind the rover, tallest first, one per structure. The item's own place
+    comes out of this; nothing here knows where it was put."""
+    if not heights:
+        return []
+    out: list[np.ndarray] = []
+    for (cx, cy), z in sorted(heights.items(), key=lambda kv: -kv[1]):
+        p = np.array([(cx + 0.5) * cell_m, (cy + 0.5) * cell_m, z])
+        if p[0] > zone_x_m + 0.25:  # in front of the work zone: the rover's own deck and what stands on it
+            continue
+        ring = [h for (dx, dy), h in heights.items() if 2 <= max(abs(dx - cx), abs(dy - cy)) <= 4]
+        if ring and z - float(np.median(ring)) < stands_out_m:  # not a structure, just the support surface
+            continue
+        if any(float(np.linalg.norm(p - q)) < apart_m for q in out):
+            continue
+        out.append(p)
+        if len(out) >= keep:
+            break
+    return out
 
 
 def seen_through(view: Frame, pts: np.ndarray, self_depth_m: float, margin_m: float = 0.02) -> np.ndarray:
@@ -669,15 +720,16 @@ def pose_free(views: list[Frame], heights: dict, T_base_tcp: np.ndarray, T_tcp_c
     return above_surfaces(heights, pts, clearance_m)
 
 
-def moved_with_gripper(before: Frame, after: Frame, item_rows_px: int = 216) -> dict:
+def moved_with_gripper(before: Frame, after: Frame, tool_mask: np.ndarray, self_depth_m: float,
+                       beyond_m: float = 0.12) -> dict:
     """Did the item in the gripper rise with it? Dense optical flow between the wrist images before and after the lift,
-    over what is close in front of the camera and is not the fingers themselves (a carried item hangs right in front of
-    them): a held item stays put in the image, an item left behind shifts by the lift's image displacement."""
+    over what a held item is: near the camera, within the gripper's own reach, and outside the gripper's own silhouette
+    -- which the mount's geometry gives. (A row threshold cannot say this: where the held item falls in the frame
+    depends on the camera mount, and on this one it lies in the same rows as the fingers, between them.)"""
     g0, g1 = (cv2.cvtColor(f.bgr, cv2.COLOR_BGR2GRAY) for f in (before, after))
     flow = cv2.calcOpticalFlowFarneback(g0, g1, None, 0.5, 4, 31, 5, 7, 1.5, 0)
     z = before.depth
-    near = np.isfinite(z) & (z > 0.05) & (z < 0.8)
-    near[item_rows_px:, :] = False  # the fingers fill the rest of the frame and never move in it: only what they hold counts
+    near = np.isfinite(z) & (z > 0.05) & (z < self_depth_m + beyond_m) & ~tool_mask
     if near.sum() < 200:
         return {"item_moved_with_gripper": False, "median_flow_px": None, "expected_flow_px": None, "near_pixels": int(near.sum())}
     mag = np.linalg.norm(flow[near], axis=1)
