@@ -28,6 +28,7 @@ would need the base to move, another item or another operation ends the goal wit
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -35,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
-from openral_rskill._eye_in_hand import READY, JAW_EMPTY_MAX_RAD, EyeInHandSkill, Frame, StageFailure
+from openral_rskill._eye_in_hand import (READY, JAW_EMPTY_MAX_RAD, EyeInHandSkill, Frame, StageFailure, mat_to_rotvec)
 from openral_rskill.grasp_perception import (Candidate, GripperGeometry, PartTracker, find_candidates, render_candidates,
                                              select_candidate, upright)
 
@@ -55,18 +56,13 @@ def tool_rotation(pitch_deg: float, yaw_deg: float, roll_deg: float = 0.0) -> np
     return np.stack([x, np.cross(z, x), z], axis=1)
 
 
-#: where the wrist camera sits in the tool frame (openral_hal_lunar_bot's mount): to one side of the tool axis, so the
-#: fingers fill that half of its image. Rolling the tool 180 degrees about its own axis puts the camera on the other side.
-CAMERA_SIDE_TOOL = np.array([0.0, -1.0, 0.0])
-
-
 def grasp_rotation(closing_b: np.ndarray, part_b: np.ndarray, view_b: np.ndarray, R_now: np.ndarray,
-                   free_side_b: np.ndarray | None = None) -> np.ndarray:
+                   cam_side_b: np.ndarray | None = None, cam_tool: np.ndarray | None = None) -> np.ndarray:
     """Tool rotation for a grasp: jaw axis (tool x) along the closing axis, tool z perpendicular to the part and to the
     closing axis, pointing away from the camera. The remaining choice is the 180 degree roll about the tool axis, which
-    decides which side of the part the wrist camera looks from: it goes to `free_side_b`, the side of the part with less
-    measured material, so the part and whatever overhangs it stay out of the fingers' half of the image. Without that,
-    the nearer roll to the current tool."""
+    decides which side of the part the wrist camera looks from (the fingers fill the other half of its image): the roll
+    that puts the camera -- at `cam_tool` in the tool frame, the mount's own geometry -- on the side `cam_side_b`.
+    Without that, the nearer roll to the current tool."""
     x = closing_b / np.linalg.norm(closing_b)
     z = np.cross(part_b, x)
     if np.linalg.norm(z) < 1e-6:
@@ -74,22 +70,36 @@ def grasp_rotation(closing_b: np.ndarray, part_b: np.ndarray, view_b: np.ndarray
     z /= np.linalg.norm(z)
     if np.dot(z, view_b) < 0:
         z = -z
-    if free_side_b is not None:
-        # the camera sits at CAMERA_SIDE_TOOL in the tool frame: pick the roll that points it at the free side
-        y = np.cross(z, x)
-        cam = y * CAMERA_SIDE_TOOL[1]
-        if np.dot(cam, free_side_b) < 0:
+    if cam_side_b is not None and cam_tool is not None:
+        # which side of the tool axis each roll puts the camera on (its mount offset across that axis): keep cam_side_b
+        R = np.stack([x, np.cross(z, x), z], axis=1)
+        if np.dot(R @ across_tool_axis(cam_tool), cam_side_b) < 0:
             x = -x
     elif np.dot(x, R_now[:, 0]) < 0:
         x = -x
     return np.stack([x, np.cross(z, x), z], axis=1)
 
 
-def free_side(frame: Frame, point_b: np.ndarray, part_axis_b: np.ndarray, step_m: float = 0.06) -> np.ndarray:
+def guard_or_empty(skill, p: np.ndarray, R: np.ndarray, state: dict) -> str:
+    """Why the tool's own body cannot be at this pose (a surface it would touch), or "" when it can. The part being
+    grasped is excluded: that is what the fingers are closing on."""
+    pts = (R @ BODY_POINTS.T).T + p
+    worst = lowest_clearance(skill._heights, pts, except_near=(state["p_base"], float(skill.goal["grasp_clear_radius_m"])))
+    return "" if worst[0] >= float(skill.goal["clearance_m"]) else f"a surface at {worst[2]} m under {worst[1]}"
+
+
+def across_tool_axis(v_tool: np.ndarray) -> np.ndarray:
+    """The part of a vector in the tool frame that is across the tool axis -- the part a roll about that axis turns.
+    Taken in the tool frame, not by projecting in the base frame: the camera looks along neither the tool axis nor the
+    grasp axis, so projecting out a viewing direction cancels exactly this component (research repo F57)."""
+    return np.array([v_tool[0], v_tool[1], 0.0], float)
+
+
+def free_side(frame: Frame, point_b: np.ndarray, part_axis_b: np.ndarray, self_depth_m: float, step_m: float = 0.06) -> np.ndarray:
     """Which way along the part is clearer, as this view measured it: the side whose sample sees no surface in front of
     it. A handle on top of a box is clear above and blocked below; a bar under a ledge the other way round."""
     axis = part_axis_b / max(float(np.linalg.norm(part_axis_b)), 1e-9)
-    votes = [(float(seen_through(frame, np.array([point_b + axis * step_m * s]))[0]), s) for s in (1.0, -1.0)]
+    votes = [(float(seen_through(frame, np.array([point_b + axis * step_m * s]), self_depth_m)[0]), s) for s in (1.0, -1.0)]
     votes.sort(reverse=True)
     return axis * votes[0][1]
 
@@ -143,7 +153,7 @@ class PickRskill(EyeInHandSkill):
         # an overview from above the work area: the item's identity for the vision model (the side views show mostly
         # the part), and the first free-space evidence for the side-view paths
         x, y, z, pitch, yaw = g["overview_pose"]
-        q_over = self.ik(np.array([x, y, z]), tool_rotation(pitch, yaw), READY)
+        q_over = self.ik(np.array([x, y, z]), tool_rotation(pitch, yaw, 180.0), READY)  # camera above the tool axis
         if q_over is None:
             raise StageFailure("find", "the overview posture is not reachable")
         self.plan_to(q_over, "find")
@@ -153,9 +163,15 @@ class PickRskill(EyeInHandSkill):
         record = {"views": [], "overview": self.save("overview.jpg", overview)}
         self._evidence["find"] = record
         self._heights: dict = {}
-        self._gripper_mask = getattr(self, "_gripper_mask", None)
         seen: list[Frame] = [over]
         T_tc = self.T("tcp_frame", over.frame_id)  # the camera in the tool frame (robot geometry)
+        self._cam_tool = T_tc[:3, 3].copy()  # which side of the tool axis the camera sits on, from the mount itself
+        # the gripper's own place in its camera, from that mount: its depth and the image band it leaves free
+        self._tool_view = tool_in_view(over.K, np.linalg.inv(T_tc), over.depth.shape[0])
+        self._self_depth = float(self._tool_view["self_depth_m"])
+        self.geom = dataclasses.replace(self.geom, self_depth_m=self._self_depth,
+                                        min_part_depth_m=self._self_depth + 0.03)
+        record["tool_in_view"] = self._tool_view
         next_id = 1
         for h in g["side_view_heights_m"]:
             view = {"height_m": h}
@@ -173,18 +189,15 @@ class PickRskill(EyeInHandSkill):
             f, framing = self.frame_part(f, q, info)  # what is in the view decides the framing, not the model of the camera
             view["framing"] = framing
             seen.append(f)
-            shots = [(info, f)]
+            shots = [(info, f, q)]
             rolled = self.rolled_view(info, P, T_tc, over.K, seen)  # the same place seen from the other side of the tool
             if rolled is not None:
                 shots.append(rolled)
                 seen.append(rolled[1])
-            self._heights = surface_heights(seen)
-            if self._gripper_mask is None:  # the fingers' own place in the image, taken while the jaws are empty
-                self._gripper_mask = np.isfinite(f.depth) & (f.depth > 0) & (f.depth < float(g["self_depth_m"]))
-                np.save(self.evidence_dir / "gripper_mask.npy", self._gripper_mask)
+            self._heights = surface_heights(seen, self._self_depth)
             np.save(self.evidence_dir / f"view_h{h:.2f}_depth.npy", f.depth)
             shot_cands, marked_images = [], []
-            for shot_info, shot in shots:
+            for shot_info, shot, shot_q in shots:
                 cands = [c for c in find_candidates(shot.depth, shot.K, self.geom, max_candidates=int(g["candidates_per_view"]))
                          if all(np.linalg.norm(shot.to_base(c.p_cam) - t) > 0.02 for t in tried)]
                 for c in cands:
@@ -194,30 +207,33 @@ class PickRskill(EyeInHandSkill):
                 if cands:
                     marked = render_candidates(shot.bgr, cands, shot.up_cam)
                     marked_images.append(self.save(f"candidates_{tag}.jpg", marked))
-                    shot_cands.append((shot, cands, marked))
-            view["candidates"] = sum(len(c) for _, c, _ in shot_cands)
+                    shot_cands.append((shot, cands, marked, shot_q))
+            view["candidates"] = sum(len(c) for _, c, _, _ in shot_cands)
             view["marked"] = marked_images
             if not shot_cands:
                 continue
-            all_cands = [c for _, cs, _ in shot_cands for c in cs]
+            all_cands = [c for _, cs, _, _ in shot_cands for c in cs]
             self.stage("select", height_m=h, candidates=len(all_cands))
             asks = int(g["vlm_asks"])
             with ThreadPoolExecutor(asks) as pool:
                 answers = list(pool.map(lambda _: self.vlm_call("select", lambda: select_candidate(
-                    self.vlm, g["vlm_model"], overview, [m for _, _, m in shot_cands], g["target"], g["part"],
+                    self.vlm, g["vlm_model"], overview, [m for _, _, m, _ in shot_cands], g["target"], g["part"],
                     {c.id for c in all_cands}, g["handle_convention"])), range(asks)))
-            f, cands = next(((sh, cs) for sh, cs, _ in shot_cands if any(c.id == (answers[0]["choice"] or -1) for c in cs)),
-                            (shot_cands[0][0], shot_cands[0][1]))
+            f, cands, shot_q = shot_cands[0][0], shot_cands[0][1], shot_cands[0][3]
             a = majority(answers, all_cands, f)
             if a["choice"] is not None:
-                f, cands = next((sh, cs) for sh, cs, _ in shot_cands if any(c.id == a["choice"] for c in cs))
+                f, cands, _, shot_q = next(sh for sh in shot_cands if any(c.id == a["choice"] for c in sh[1]))
             view["vlm"] = {k: a[k] for k in ("item_visible", "what_is_visible", "choice", "reason")} | {
                 "answers": [{k: x[k] for k in ("item_visible", "choice", "reason")} for x in answers]}
             if a["item_visible"] and a["choice"] is not None:
-                self._locked_frame, self._view_q = f, q
-                # keep the camera on the side of the tool it looked from: the tracker's template is that view's image
-                self._view_camera_side = f.T_base_cam[:3, :3] @ np.array([0.0, 0.0, 0.0]) if False else \
-                    (f.T_base_cam[:3, 3] - self.fk(np.array(self.arm_q()))[:3, 3])
+                # stand where that image was taken: the tracker follows the part from the same side of the tool
+                if float(np.max(np.abs(np.array(self.arm_q()) - np.array(shot_q)))) > 0.03:
+                    self.plan_to(shot_q, "select")
+                    self.wait(0.5)
+                self._locked_frame, self._view_q = f, shot_q
+                # keep the camera on the side of the tool it looked from: the tracker's template is that view's image,
+                # and a roll of the tool turns that template upside down in the following frames
+                self._view_R = self.fk(np.array(shot_q))[:3, :3]
                 return next(c for c in cands if c.id == a["choice"]), view["vlm"]
             if any(x["item_visible"] and x["choice"] is not None for x in answers):
                 # the item and a grasp on it are in this view, but the answers do not agree where: looking lower will not help
@@ -232,7 +248,7 @@ class PickRskill(EyeInHandSkill):
         R = tool_rotation(info["pitch"], 0.0, 180.0 if not info.get("roll") else 0.0)
         T = np.eye(4)
         T[:3, :3], T[:3, 3] = R, P + np.array([info["back"], 0.0, info["rise"]])
-        if not pose_free(seen, self._heights, T, T_tc, float(self.goal["clearance_m"])):
+        if not pose_free(seen, self._heights, T, T_tc, float(self.goal["clearance_m"]), self._self_depth):
             return None
         q = self.ik(T[:3, 3], R, READY)
         if q is None:
@@ -241,7 +257,7 @@ class PickRskill(EyeInHandSkill):
         self.wait(0.8)
         other = dict(info, roll=0.0 if info.get("roll") else 180.0)
         f, framing = self.frame_part(self.frame(after=self._clock() - 0.05), q, other)
-        return dict(other, framing=framing), f
+        return dict(other, framing=framing), f, q
 
     def frame_part(self, f: Frame, q: np.ndarray, info: dict) -> tuple[Frame, dict]:
         """Keep what the view shows clear of the fingers: the graspable parts must sit in the image band the fingers do
@@ -255,8 +271,9 @@ class PickRskill(EyeInHandSkill):
         depth = float(np.median([c.depth_m for c in cands]))
         rows = int(g.get("image_rows_px", 480))
         rolled = bool(info.get("roll"))
-        target = rows - float(g["part_row_px"]) if rolled else float(g["part_row_px"])
-        # the image row grows towards the fingers (away from them when the tool is rolled): move the tool that way
+        # the gripper always sits in the same place in its own camera (it is bolted to it), so the row the part should
+        # sit in does not depend on the tool's roll. The roll does flip which way the image moves when the tool moves.
+        target = float(self._tool_view["part_row"])
         shift = (v - target) * depth / f.K[1, 1] * (-1.0 if rolled else 1.0)
         out = {"part_row_px": round(v), "shift_m": round(shift, 3)}
         if abs(shift) < float(g["framing_tolerance_m"]):
@@ -278,19 +295,22 @@ class PickRskill(EyeInHandSkill):
         for back in g["side_view_back_m"]:
             for rise in g["side_view_rise_m"]:
                 for pitch in g["side_view_pitch_deg"]:
-                    for roll in (0.0, 180.0):  # which side of the tool the camera looks from
-                        R = tool_rotation(pitch, 0.0, roll)
-                        T = np.eye(4)
-                        T[:3, :3], T[:3, 3] = R, P + np.array([back, 0.0, rise])
-                        pc = np.linalg.inv(T @ T_tc) @ np.append(P, 1.0)
-                        if pc[2] < 0.25:
-                            continue
-                        u, v = K[0, 0] * pc[0] / pc[2] + K[0, 2], K[1, 1] * pc[1] / pc[2] + K[1, 2]
-                        # the part in the middle of the image area the fingers do not hide (which side that is depends on the roll)
-                        want = float(g["unoccluded_centre_row_px"]) if roll == 0.0 else rows - float(g["unoccluded_centre_row_px"])
-                        options.append((math.hypot(u - K[0, 2], v - want), T, dict(back=back, rise=rise, pitch=pitch, roll=roll)))
+                    # the camera above the tool axis: payloads stand on their supports and are taken from above, so
+                    # this is the side the fingers will come from and the side the grasp will be seen from. The
+                    # opposite side is the second shot (`rolled_view`), for a part under an overhang.
+                    R = tool_rotation(pitch, 0.0, 180.0)
+                    T = np.eye(4)
+                    T[:3, :3], T[:3, 3] = R, P + np.array([back, 0.0, rise])
+                    pc = np.linalg.inv(T @ T_tc) @ np.append(P, 1.0)
+                    if pc[2] < 0.25:
+                        continue
+                    u, v = K[0, 0] * pc[0] / pc[2] + K[0, 2], K[1, 1] * pc[1] / pc[2] + K[1, 2]
+                    # the part in the middle of the image band the gripper does not hide -- the same band in every
+                    # frame, whatever the tool's roll, because the camera is bolted to the gripper
+                    want = float(self._tool_view["centre_row"])
+                    options.append((math.hypot(u - K[0, 2], v - want), T, dict(back=back, rise=rise, pitch=pitch, roll=180.0)))
         q_from = np.array(self.arm_q())
-        heights = surface_heights(seen)
+        heights = surface_heights(seen, self._self_depth)
         clear = float(g["clearance_m"])
         for off, T, info in sorted(options, key=lambda o: o[0]):
             q = self.ik(T[:3, 3], T[:3, :3], READY)
@@ -301,7 +321,7 @@ class PickRskill(EyeInHandSkill):
             for k in range(1, 6):
                 Tk, links = self.fk(q_from + (np.array(q) - q_from) * k / 6, self.ARM_LINKS)
                 path.append((Tk, links))
-            if all(pose_free(seen, heights, Tk, T_tc, clear, links) for Tk, links in path):
+            if all(pose_free(seen, heights, Tk, T_tc, clear, self._self_depth, links) for Tk, links in path):
                 return q, info
         return None
 
@@ -314,61 +334,84 @@ class PickRskill(EyeInHandSkill):
         g = self.goal
         f = self._locked_frame
         self.stage("approach", candidate=cand.id)
-        tracker = PartTracker(f.bgr, f.depth, f.K, cand)
         state = {"p_base": f.to_base(cand.p_cam), "axis_base": f.T_base_cam[:3, :3] @ np.array(cand.axis_cam),
                  "part_base": f.T_base_cam[:3, :3] @ np.array(cand.part_axis_cam), "view_base": f.T_base_cam[:3, 3],
-                 "seen": f.stamp, "hits": 0, "misses": 0, "frames": []}
-        # the camera stays on the side of the tool axis it saw the part from, so the tracker's template keeps matching
-        side = getattr(self, "_view_camera_side", None)
-        if side is None:
-            side = free_side(f, state["p_base"], state["part_base"])
-        z_view = f.T_base_cam[:3, :3] @ np.array([0.0, 0.0, 1.0])
-        side = side - z_view * float(np.dot(side, z_view))  # only the component across the viewing direction matters
-        state["free_side"] = side / max(float(np.linalg.norm(side)), 1e-9)
-        self._evidence["camera_side"] = [round(float(v), 2) for v in state["free_side"]]
+                 "seen": f.stamp, "hits": 0, "misses": 0, "frames": [], "trace": []}
+        self._evidence["approach_track"] = state["trace"]  # the same list: a failed approach still returns its pictures
+        # the camera looks from the side the part is free on, so the fingers close from the side with less material
+        # (a handle on a box: from above, not through the box). The tracker carries the roll this costs, frame by frame.
+        side = free_side(f, state["p_base"], state["part_base"], self._self_depth)
+        state["camera_side"] = side / max(float(np.linalg.norm(side)), 1e-9)
+        self._evidence["camera_side"] = [round(float(v), 2) for v in state["camera_side"]]
         approach_from = float(g["standoff_m"][0] if isinstance(g["standoff_m"], list) else g["standoff_m"])
 
         def guard_pose(p, R):
-            pts = (R @ BODY_POINTS.T).T + p
-            near = (state["p_base"], float(g["grasp_clear_radius_m"]))
-            worst = lowest_clearance(self._heights, pts, except_near=near)
-            return "" if worst[0] >= float(g["clearance_m"]) else f"a surface at {worst[2]} m under {worst[1]}"
+            return guard_or_empty(self, p, R, state)
+
+        # stand in front of the grasp first, in the orientation the grasp needs -- with the planner, from the view's own
+        # measurement -- and only then close the loop (see take_standoff)
+        tracker = self.take_standoff(cand, state, approach_from)
+        if tracker is None:
+            tracker = PartTracker(f.bgr, f.depth, f.K, cand, R_base_cam=f.T_base_cam[:3, :3])
 
         def goal_now():
-            """The tool pose that puts the tracked part between the fingers, from the newest frame. Inside the last few
-            centimetres the fingers cover the part: the goal then holds its last measured place."""
-            if float(np.linalg.norm(state["p_base"] - self.tcp()[0])) < float(g["blind_ok_m"]):
+            """The tool pose that puts the tracked part between the fingers, from the newest frame. Once the gripper's
+            own body covers the part -- it always does, in the last stretch, since the camera looks past the fingers --
+            the goal holds its last measured place and the tool closes in straight along its axis."""
+            if state.get("covered") or float(np.linalg.norm(state["p_base"] - self.tcp()[0])) < float(g["blind_ok_m"]):
                 view = state["p_base"] - state["view_base"]
-                R = grasp_rotation(state["axis_base"], state["part_base"], view / max(float(np.linalg.norm(view)), 1e-9), self.tcp()[1])
+                R = grasp_rotation(state["axis_base"], state["part_base"], view / max(float(np.linalg.norm(view)), 1e-9),
+                                   self.tcp()[1], state["camera_side"], self._cam_tool)
                 return state["p_base"] - R[:, 2] * state["standoff"], R
             nf = self.frame(after=state["seen"], timeout_s=2.0)
             state["seen"] = nf.stamp
             p_pred_cam = nf.T_base_cam[:3, :3].T @ (state["p_base"] - nf.T_base_cam[:3, 3])
-            m = tracker.measure(nf.bgr, nf.depth, p_pred_cam)
+            m = tracker.measure(nf.bgr, nf.depth, p_pred_cam, R_base_cam=nf.T_base_cam[:3, :3],
+                                self_depth_m=self._self_depth)
+            if tracker.covered and state["hits"] > 0:
+                # the fingers are in front of the part now: measuring stops here and the last measurement carries the
+                # tool in, which is the same thing a straight close-in along the tool axis does. Before the first
+                # measurement it means the part was never seen from here, which is a lost lock, not a covered part.
+                state["covered"] = True
+                self._evidence["covered_at_m"] = round(float(np.linalg.norm(state["p_base"] - self.tcp()[0])), 4)
             if m is not None:
                 state["misses"] = 0
                 pixel, d, score = m
                 state["p_base"] = nf.to_base(tracker.point_cam(pixel, d) + np.array([0.0, 0.0, tracker.width_m / 2]))
                 state["view_base"] = nf.T_base_cam[:3, 3]
                 state["hits"] += 1
-            else:
+            elif not state.get("covered"):
                 state["misses"] += 1
                 # lost while still far from the part: the goal must not be carried on blind -- go back and identify again
                 if float(np.linalg.norm(state["p_base"] - self.tcp()[0])) > float(self.goal["blind_ok_m"]) \
                         and state["misses"] > int(self.goal["max_track_misses"]):
                     raise StageFailure("approach", f"lost sight of the chosen grasp {state['misses']} frames running "
                                                    f"while still {float(np.linalg.norm(state['p_base'] - self.tcp()[0])) * 100:.0f} cm away")
-            if len(state["frames"]) < 30 and (not state["frames"] or nf.stamp - state["frames"][-1][0] > 1.0):
+            # the tracker's own view, so a failed approach can be read off the pictures: where the part was measured
+            # (cross) or last seen, the match score, and the distance still to go
+            if len(state["frames"]) < 40 and (len(state["frames"]) < 8 or nf.stamp - state["frames"][-1][0] > 1.0):
                 mark = nf.bgr.copy()
                 pc = nf.T_base_cam[:3, :3].T @ (state["p_base"] - nf.T_base_cam[:3, 3])
                 if pc[2] > 0.05:
                     u = int(nf.K[0, 0] * pc[0] / pc[2] + nf.K[0, 2])
                     v = int(nf.K[1, 1] * pc[1] / pc[2] + nf.K[1, 2])
-                    cv2.drawMarker(mark, (u, v), (0, 255, 255), cv2.MARKER_CROSS, 24, 2)
-                state["frames"].append((nf.stamp, self.save(f"servo_{len(state['frames']):02d}.jpg", mark)))
+                    cv2.drawMarker(mark, (u, v), (0, 255, 255) if m is not None else (0, 0, 255), cv2.MARKER_CROSS, 24, 2)
+                left = float(np.linalg.norm(state["p_base"] - self.tcp()[0]))
+                cv2.circle(mark, (int(tracker.last_px[0]), int(tracker.last_px[1])), 7,
+                           (0, 255, 0) if m is not None else (0, 0, 255), 2)  # where the template matched best
+                cv2.putText(mark, f"{'hit' if m is not None else 'MISS'} score {tracker.last_score:.2f} "
+                                  f"d {tracker.depth:.3f} roll {tracker.roll_deg:+.0f} left {left * 100:.1f}cm",
+                            (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                if tracker.reject:
+                    cv2.putText(mark, tracker.reject, (6, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                path = self.save(f"servo_{len(state['frames']):02d}.jpg", mark)
+                state["frames"].append((nf.stamp, path))
+                state["trace"].append({"image": path, "hit": m is not None, "score": round(tracker.last_score, 3),
+                                       "depth_m": round(tracker.depth, 4), "roll_deg": round(tracker.roll_deg, 1),
+                                       "left_m": round(left, 4), "why": tracker.reject})
             view = state["p_base"] - state["view_base"]
             R = grasp_rotation(state["axis_base"], state["part_base"], view / max(float(np.linalg.norm(view)), 1e-9),
-                               self.tcp()[1], state["free_side"])
+                               self.tcp()[1], state["camera_side"], self._cam_tool)
             return state["p_base"] - R[:, 2] * state["standoff"], R
 
         # close in under vision: the stand-off first, then the grasp point itself
@@ -390,8 +433,50 @@ class PickRskill(EyeInHandSkill):
         p1, _ = self.tcp()
         self._evidence["close_in"] = {"remaining_m": round(float(np.linalg.norm(state["p_base"] - p1)), 4),
                                       "tracked_frames": state["hits"], "missed_frames": state["misses"],
-                                      "frames": [p for _, p in state["frames"]]}
+                                      "track": state.get("trace", [])}
         self._grasp_point = state["p_base"]
+
+    def take_standoff(self, cand: Candidate, state: dict, standoff_m: float) -> PartTracker | None:
+        """Stand the tool in front of the chosen grasp, in the orientation the grasp needs, with the planner -- one
+        reconfiguration, not a servo motion: the view is taken from wherever frames the part, the grasp comes from the
+        side the part is free on, and between the two the wrist can turn half round. Turning it where the tool stands is
+        not enough either: the camera looks 17 degrees off the tool axis, so half a turn swings its view by 34 degrees
+        and the part leaves the image (research repo F57). Standing at the stand-off instead puts the part back on the
+        tool axis, where the camera sees it and the servo can close the last stretch.
+
+        Returns the part's tracker as seen from there, or None when the pose is not reachable or not clear, in which
+        case the caller servos from where it is."""
+        p, R_now = self.tcp()
+        view = state["p_base"] - state["view_base"]
+        R_g = grasp_rotation(state["axis_base"], state["part_base"], view / max(float(np.linalg.norm(view)), 1e-9),
+                             R_now, state["camera_side"], self._cam_tool)
+        p_g = state["p_base"] - R_g[:, 2] * standoff_m
+        rec = {"turn_deg": round(math.degrees(float(np.linalg.norm(mat_to_rotvec(R_g @ R_now.T)))), 1),
+               "stand_off_m": round(standoff_m, 3), "goal": [round(float(v), 3) for v in p_g]}
+        self._evidence["take_standoff"] = rec
+        q = self.ik(p_g, R_g, list(self.arm_q()))
+        blocked = None if q is None else guard_or_empty(self, p_g, R_g, state)
+        rec.update(reachable=q is not None, blocked=blocked)
+        if q is None or blocked:
+            return None  # the servo does what it can from here; the guard still holds
+        self.plan_to(q, "approach")
+        self.wait(0.6)
+        nf = self.frame(after=self._clock() - 0.05)
+        state["seen"], state["view_base"] = nf.stamp, nf.T_base_cam[:3, 3]
+        R_c = nf.T_base_cam[:3, :3]
+        p_cam = R_c.T @ (state["p_base"] - nf.T_base_cam[:3, 3])
+        if p_cam[2] < 0.1:
+            return None
+        u = float(nf.K[0, 0] * p_cam[0] / p_cam[2] + nf.K[0, 2])
+        v = float(nf.K[1, 1] * p_cam[1] / p_cam[2] + nf.K[1, 2])
+        seen = dataclasses.replace(cand, u=u, v=v, depth_m=float(p_cam[2]) - cand.width_m / 2,
+                                   p_cam=[float(x) for x in p_cam], axis_cam=[float(x) for x in R_c.T @ state["axis_base"]],
+                                   part_axis_cam=[float(x) for x in R_c.T @ state["part_base"]])
+        mark = nf.bgr.copy()
+        cv2.drawMarker(mark, (int(u), int(v)), (0, 255, 255), cv2.MARKER_CROSS, 24, 2)
+        rec.update(stood=True, part_px=[round(u), round(v)], part_depth_m=round(float(p_cam[2]), 3),
+                   tool=[round(float(x), 3) for x in self.tcp()[0]], image=self.save("standoff_pose.jpg", mark))
+        return PartTracker(nf.bgr, nf.depth, nf.K, seen, R_base_cam=R_c)
 
     # ---- grasp + hold -----------------------------------------------------------------------------------------------------
     def grasp(self) -> float:
@@ -422,12 +507,12 @@ class PickRskill(EyeInHandSkill):
         after = self.lit_frame()
         p1, _ = self.tcp()
         jaw = self.jaw()
-        flow = moved_with_gripper(before, after, int(g["item_rows_px"]))
+        flow = moved_with_gripper(before, after, int(self._tool_view["tool_top_row"]))
         np.save(self.evidence_dir / "hold_before_depth.npy", before.depth)
         self._evidence["hold_check"] = {"jaw_rad": round(jaw, 4), "lift_m": round(float(p1[2] - p0[2]), 4), **flow,
                                          "before": self.save("hold_before.png", before.bgr), "after": self.save("hold_after.png", after.bgr),
                                          "before_depth": str(self.evidence_dir / "hold_before_depth.npy"), "fx": float(before.K[0, 0]),
-                                         "item_rows_px": int(g["item_rows_px"])}
+                                         "item_rows_px": int(self._tool_view["tool_top_row"])}
         if jaw <= JAW_EMPTY_MAX_RAD:
             raise StageFailure("hold", f"the item slipped out of the jaws during the lift (jaw {jaw:.3f} rad)")
         if not flow["item_moved_with_gripper"]:
@@ -461,8 +546,6 @@ BODY_POINTS = np.array([[x, y, z] for x in (-0.055, 0.055) for y in (-0.03, 0.0,
 #: points of the tool in its own frame (x jaw axis, y up in the grip orientation, z forward): the fingertips and
 #: pads, the jaw housing, the wrist camera
 TOOL_POINTS = np.array([[x, y, z] for x in (-0.045, 0.0, 0.045) for y in (-0.03, 0.0, 0.03) for z in (0.01, -0.03, -0.08)])
-
-
 def majority(answers: list[dict], cands: list[Candidate], f: Frame, same_place_m: float = 0.03) -> dict:
     """What most of the concurrent vision-language answers agree on. Marks less than `same_place_m` apart are the same
     place on the part (several candidates lie along one neck), so answers choosing any of them agree. The item counts as
@@ -489,7 +572,24 @@ def tool_points(T_base_tcp: np.ndarray, T_tcp_cam: np.ndarray) -> np.ndarray:
     return (T_base_tcp[:3, :3] @ np.vstack([TOOL_POINTS, T_tcp_cam[:3, 3]]).T).T + T_base_tcp[:3, 3]
 
 
-def seen_through(view: Frame, pts: np.ndarray, margin_m: float = 0.02) -> np.ndarray:
+def tool_in_view(K: np.ndarray, T_ct: np.ndarray, rows: int, margin_m: float = 0.02) -> dict:
+    """Where the gripper's own body is in its own camera, and how far along the optical axis it reaches: the camera is
+    bolted to the tool, so both follow from the mount (TF) and the tool's dimensions, and hold for every frame.
+
+    Everything the wrist views do with self-occlusion is measured against these two numbers -- which pixels are the
+    gripper, beyond which depth a surface cannot be the gripper, which image band is free for the part. Writing them
+    down as constants instead ties the skill to one camera mount: moving the camera silently turned the gripper's own
+    pixels into "an obstacle in front of every pose", and no view of the work zone was allowed any more (F57)."""
+    pts = (T_ct[:3, :3] @ np.vstack([BODY_POINTS, TOOL_POINTS]).T).T + T_ct[:3, 3]
+    ahead = pts[pts[:, 2] > 0.01]
+    self_depth = float(np.max(ahead[:, 2])) + margin_m if len(ahead) else margin_m
+    v = K[1, 1] * ahead[:, 1] / ahead[:, 2] + K[1, 2]
+    top = int(np.clip(np.min(v) if len(v) else rows, 0, rows))  # the image row the gripper first appears in
+    return {"self_depth_m": round(self_depth, 3), "tool_top_row": top, "clear_rows": top,
+            "centre_row": int(top * 0.5), "part_row": int(top * 0.75)}
+
+
+def seen_through(view: Frame, pts: np.ndarray, self_depth_m: float, margin_m: float = 0.02) -> np.ndarray:
     """Per point: +1 the view saw through it (a surface measured behind it, or nothing measured along its ray), -1 a
     surface measured in front of it (the point may be inside what was seen), 0 not judged (outside the image or behind
     the fingers in the image)."""
@@ -502,19 +602,19 @@ def seen_through(view: Frame, pts: np.ndarray, margin_m: float = 0.02) -> np.nda
         u, v = int(K[0, 0] * x / z + K[0, 2]), int(K[1, 1] * y / z + K[1, 2])
         if 0 <= u < w and 0 <= v < h:
             d = view.depth[v, u]
-            if np.isfinite(d) and d < 0.17:  # the fingers themselves in the image
+            if np.isfinite(d) and d < self_depth_m:  # the gripper itself in the image
                 continue
             out[i] = -1 if np.isfinite(d) and d < z - margin_m else 1
     return out
 
 
-def surface_heights(views: list[Frame], cell_m: float = 0.05, behind_hull_m: float = -0.6) -> dict:
+def surface_heights(views: list[Frame], self_depth_m: float, cell_m: float = 0.05, behind_hull_m: float = -0.6) -> dict:
     """What stands behind the rover, as the cameras measured it: the highest surface in each ground cell (a 2.5-D height
     map in the rover frame). No object models -- only the depth the views returned."""
     out: dict[tuple[int, int], float] = {}
     for f in views:
         z = f.depth[::4, ::4]
-        vs, us = np.nonzero(np.isfinite(z) & (z > 0.17) & (z < 1.5))
+        vs, us = np.nonzero(np.isfinite(z) & (z > self_depth_m) & (z < 1.5))
         if us.size == 0:
             continue
         d = z[vs, us]
@@ -558,13 +658,13 @@ def above_surfaces(heights: dict, pts: np.ndarray, clearance_m: float, cell_m: f
 
 
 def pose_free(views: list[Frame], heights: dict, T_base_tcp: np.ndarray, T_tcp_cam: np.ndarray, clearance_m: float,
-              arm_pts: np.ndarray | None = None) -> bool:
+              self_depth_m: float, arm_pts: np.ndarray | None = None) -> bool:
     """The tool (and, when given, the arm's links) at a pose stand clear of everything the cameras measured: no view saw
     a surface in front of a point, and no point is below a measured surface in its ground cell."""
     pts = tool_points(T_base_tcp, T_tcp_cam)
     if arm_pts is not None and len(arm_pts):
         pts = np.vstack([pts, arm_pts])
-    if any((seen_through(v, pts) == -1).any() for v in views):
+    if any((seen_through(v, pts, self_depth_m) == -1).any() for v in views):
         return False
     return above_surfaces(heights, pts, clearance_m)
 

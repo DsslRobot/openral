@@ -36,8 +36,8 @@ class GripperGeometry:
     pad_height_m: float = 0.014  # minimum extent of the part along the pads (perpendicular to closing and approach)
     min_part_width_m: float = 0.005
     depth_step_m: float = 0.030  # how far both sides must fall away behind the part's front for the fingers to pass
-    self_depth_m: float = 0.17  # nearer than this along the optical axis is the gripper itself in the wrist view
-    min_part_depth_m: float = 0.22  # a part nearer than this is already at the fingers (the TCP is 0.16 m ahead of the camera)
+    self_depth_m: float = 0.25  # nearer than this along the optical axis is the gripper itself in the wrist view
+    min_part_depth_m: float = 0.28  # a part nearer than this is already at the fingers (the TCP is 0.22 m ahead of the camera)
     max_range_m: float = 1.2
 
 
@@ -371,6 +371,14 @@ def select_candidate(client, model: str, overview_bgr: np.ndarray, marked_views:
                 reason=answer.get("reason", ""), raw=reply, model=model)
 
 
+def depth_at(depth: np.ndarray, u: float, v: float, half_px: int = 3) -> float | None:
+    """The depth of the surface at a pixel: the near quartile of a small patch, so a thin part in front of a far
+    background reads as the part, not as the background. None where nothing was measured."""
+    patch = depth[max(int(v) - half_px, 0):int(v) + half_px + 1, max(int(u) - half_px, 0):int(u) + half_px + 1]
+    patch = patch[np.isfinite(patch) & (patch > 0.05)]
+    return float(np.percentile(patch, 25)) if patch.size else None
+
+
 class PartTracker:
     """Follows the chosen grasp in the wrist image while the tool moves towards it.
 
@@ -378,8 +386,9 @@ class PartTracker:
     change in depth. A generic re-detection every frame snaps onto whatever else the narrowing view shows once the
     fingers cover the part (research repo F57); a template of the part itself does not."""
 
-    def __init__(self, frame_bgr: np.ndarray, depth: np.ndarray, K: np.ndarray, cand: Candidate, half_px: int = 28) -> None:
-        self.K, self.half = K, half_px
+    def __init__(self, frame_bgr: np.ndarray, depth: np.ndarray, K: np.ndarray, cand: Candidate, half_px: int = 28,
+                 R_base_cam: np.ndarray | None = None) -> None:
+        self.K, self.half, self.R_ref = K, half_px, R_base_cam
         u, v = int(round(cand.u)), int(round(cand.v))
         h, w = depth.shape
         self.u0, self.v0 = min(max(u, half_px), w - half_px - 1), min(max(v, half_px), h - half_px - 1)
@@ -388,19 +397,50 @@ class PartTracker:
         self.depth = float(cand.depth_m)
         self.width_m, self.axis_cam = cand.width_m, np.array(cand.axis_cam, float)
         self.part_axis_cam = np.array(cand.part_axis_cam, float)
-        self.score = 1.0
+        self.score, self.roll_deg, self.reject, self.covered = 1.0, 0.0, "", False
+        self.last_px, self.last_score = (float(self.u0), float(self.v0)), 1.0
 
     def measure(self, frame_bgr: np.ndarray, depth: np.ndarray, predicted_cam: np.ndarray, search_px: int = 60,
-                min_score: float = 0.6, max_depth_jump_m: float = 0.03):
+                min_score: float = 0.6, max_depth_jump_m: float = 0.03, refresh_score: float = 0.8,
+                R_base_cam: np.ndarray | None = None, self_depth_m: float = 0.0):
         """Where the part is in this frame: (pixel, depth, score) or None. `predicted_cam` is its 3-D point in this
-        camera as the arm's own motion predicts it."""
+        camera as the arm's own motion predicts it, `R_base_cam` the camera's orientation now.
+
+        The template is corrected for the camera's own motion since it was taken: bigger by the change in depth, and
+        turned by however much the camera has rolled about its viewing direction -- a grasp is approached with the tool
+        rolled to the side the part is free on, which can be half a turn from the view it was chosen in, and no image of
+        the part survives that untouched. A confident match (`refresh_score`) then replaces the template with what the
+        part looks like now, which carries the slower change of viewing direction.
+
+        When the depth where the part should be reads the gripper's own body instead (nearer than `self_depth_m`, the
+        robot's own reach in front of this camera), the part is not lost but covered by the hand that is reaching for
+        it: `covered` says so, and the caller closes the last stretch on its last measurement. A blocker further away
+        than the tool is something else, and counts as losing sight of the part."""
+        self.covered = False
         if predicted_cam[2] <= 0.05:
             return None
         pu = self.K[0, 0] * predicted_cam[0] / predicted_cam[2] + self.K[0, 2]
         pv = self.K[1, 1] * predicted_cam[1] / predicted_cam[2] + self.K[1, 2]
+        here = depth_at(depth, pu, pv)
+        if self_depth_m and here is not None and here < min(self_depth_m, float(predicted_cam[2]) - max_depth_jump_m):
+            self.covered, self.reject = True, f"the gripper is in front of the part ({here:.2f} m)"
+            self.last_px = (float(pu), float(pv))
+            return None
         scale = self.depth / max(float(predicted_cam[2]), 1e-6)
-        tpl = self.template if abs(scale - 1.0) < 0.05 else cv2.resize(self.template, None, fx=scale, fy=scale,
-                                                                       interpolation=cv2.INTER_LINEAR)
+        roll_deg = 0.0
+        if R_base_cam is not None and self.R_ref is not None:
+            M = np.asarray(R_base_cam, float).T @ np.asarray(self.R_ref, float)  # the template's camera seen from this one
+            roll_deg = math.degrees(math.atan2(M[1, 0], M[0, 0]))
+        if abs(roll_deg) > 3.0:
+            side = self.template.shape[0]
+            c = (side - 1) / 2.0
+            W = cv2.getRotationMatrix2D((c, c), -roll_deg, scale)
+            k = int(side * 0.35)
+            tpl = cv2.warpAffine(self.template, W, (side, side), flags=cv2.INTER_LINEAR)[
+                int(c) - k:int(c) + k + 1, int(c) - k:int(c) + k + 1]
+        else:
+            tpl = self.template if abs(scale - 1.0) < 0.05 else cv2.resize(self.template, None, fx=scale, fy=scale,
+                                                                           interpolation=cv2.INTER_LINEAR)
         th, tw = tpl.shape
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
@@ -410,21 +450,37 @@ class PartTracker:
         if window.shape[0] <= th or window.shape[1] <= tw:
             return None
         res = cv2.matchTemplate(window, tpl, cv2.TM_CCOEFF_NORMED)
-        _, best, _, loc = cv2.minMaxLoc(res)
-        if best < min_score:
+        self.roll_deg, self.reject, hit = roll_deg, "", None
+        # the best match *at the part's distance*: the narrowing view shows the fingers and the structures behind the
+        # part, which can match the template better than the part itself does, so the depth decides between the peaks
+        for idx in np.argsort(res.ravel())[::-1][:40]:
+            score = float(res.ravel()[idx])
+            if score < min_score:
+                self.reject = self.reject or f"nothing matches above {min_score:.2f}"
+                break
+            yy, xx = divmod(int(idx), res.shape[1])
+            u, v = x0 + xx + tw / 2.0, y0 + yy + th / 2.0
+            self.last_px, self.last_score = (u, v), score
+            d = depth_at(depth, u, v)
+            if d is None:
+                self.reject = "no depth where it matches"
+                continue
+            off = d - float(predicted_cam[2])
+            if abs(off) > max_depth_jump_m:
+                self.reject = f"every match is off the part's distance (best {off * 100:+.0f} cm)"
+                continue
+            hit = (u, v, d, score)
+            break
+        if hit is None:
             return None
-        u = x0 + loc[0] + tw / 2.0
-        v = y0 + loc[1] + th / 2.0
-        k = 3
-        patch = depth[int(v) - k:int(v) + k + 1, int(u) - k:int(u) + k + 1]
-        patch = patch[np.isfinite(patch) & (patch > 0.05)]
-        if not patch.size:
-            return None
-        d = float(np.percentile(patch, 25))  # the part is the foreground at its pixel, not what is behind a thin neck
-        if abs(d - float(predicted_cam[2])) > max_depth_jump_m:
-            return None  # a match at a different distance is a different surface, not the part
-        self.depth = d
-        self.score = float(best)
+        u, v, d, score = hit
+        self.reject, self.depth, self.score = "", d, score
+        best = score
+        if best >= refresh_score:
+            ui, vi = int(round(u)), int(round(v))
+            fresh = gray[vi - self.half:vi + self.half + 1, ui - self.half:ui + self.half + 1]
+            if fresh.shape == (2 * self.half + 1, 2 * self.half + 1):
+                self.template, self.R_ref = fresh, R_base_cam if R_base_cam is not None else self.R_ref
         return np.array([u, v]), d, float(best)
 
     def point_cam(self, pixel: np.ndarray, d: float) -> np.ndarray:

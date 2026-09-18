@@ -107,7 +107,7 @@ REQUIRED_SENSOR_NAMES = ("front", "front_depth", "wrist", "imu", "lidar")
 #: neither with the rover nor with the arm (research repo F53).
 CAMERA_MOUNTS = {
     "front": ("rgbd_camera_frame", (0.0, 0.0, 0.0), (0.0, 15.0, 0.0)),
-    "wrist": ("Link7", (0.0, -0.048, -0.018), (0.0, -73.10, 90.0)),
+    "wrist": ("Link7", (0.0, -0.12, -0.08), (0.0, -72.0, 90.0)),
 }
 #: World camera convention (+X forward, +Z up) -> ROS optical frame (+Z forward, +Y down), xyzw.
 _WORLD_TO_OPTICAL_XYZW = (0.5, -0.5, 0.5, -0.5)

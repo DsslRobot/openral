@@ -35,15 +35,22 @@ from openral_rskill._lunar_bot_arm import (
 from openral_rskill.base import rSkillBase
 
 #: READY posture of the RM-75 (the capability boundary's `arm_ready`): tool behind the rover, clear of the hull.
-READY = (0.0, -1.0, 0.0, -1.4, 0.0, 1.2, 0.0)
+#: The arm's seed configuration for inverse kinematics and the posture the views start from. The wrist roll is half a
+#: turn, which puts the wrist camera *above* the tool axis: payloads stand on supports and are taken from above, so the
+#: fingers come from above and the camera must look from there -- the branch with the camera under the tool axis makes
+#: every view and every grasp differ by half a turn of the wrist (research repo F57).
+READY = (0.0, -1.0, 0.0, -1.4, 0.0, 1.2, math.pi)
 #: RM-75 joint limits, joint1..joint7 (docs/lunar_bot_rm75_spec.md in the research repo)
 JOINT_LIMITS_RAD = (3.107, 2.269, 3.107, 2.356, 3.107, 2.234, 6.283)
 #: The RM-75's working branch (joint: centre, half-range, rad): shoulder and forearm roll near zero, wrist roll unflipped.
 #: Unconstrained IK on this 7-DoF arm lands on arbitrary null-space branches (shoulder turned 90 deg, wrist rolled to its
 #: stop) from which the next small motion is impossible (research repo F57); the boundary's MoveIt posture preference is
 #: the same idea.
+#: The wrist roll (joint7) is not in here: the tool rotation asked for determines it, and holding it near zero excluded
+#: every pose with the camera above the tool axis (half a turn, 3.14 rad) and made the servo's null space unroll the
+#: wrist it had just turned (research repo F57).
 POSTURE = {"joint1": (0.0, 1.5), "joint2": (-0.4, 0.9), "joint3": (0.0, 1.2), "joint4": (-1.5, 0.85),
-           "joint5": (0.0, 1.6), "joint7": (0.0, 3.0)}
+           "joint5": (0.0, 1.6)}
 JAW_OPEN_MIN_RAD = 0.78
 JAW_EMPTY_MAX_RAD = 0.13
 
@@ -515,11 +522,19 @@ class EyeInHandSkill(rSkillBase):
         pts = res.trajectory.joint_trajectory.points
         names = list(res.trajectory.joint_trajectory.joint_names)
         order = [names.index(j) for j in ARM_JOINT_NAMES]
-        for pt in pts:  # follow the planned path; the pump holds each target until the arm is near it
-            q = np.array([pt.positions[i] for i in order])
-            self.move_joints(q, stage, tol_rad=0.08, rate_rad_s=rate_rad_s, timeout_s=20.0)
-        self.move_joints(np.array(q_goal), stage, rate_rad_s=rate_rad_s)
-        return {"waypoints": len(pts)}
+        # follow the path on its own clock (waiting for each point in turn would take minutes on a long path), then let
+        # the last point settle
+        t0 = self._clock()
+        for pt in pts:
+            due = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
+            while self._clock() - t0 < due:
+                time.sleep(0.01)
+            with self._cmd_lock:
+                self._joints = tuple(float(pt.positions[i]) for i in order)
+        # the planned path ends where it ends: a few degrees of tracking error are not a failure (the visual servo and the
+        # measured tool pose take it from here)
+        self.move_joints(np.array(q_goal), stage, tol_rad=0.08, rate_rad_s=rate_rad_s, timeout_s=20.0)
+        return {"waypoints": len(pts), "sim_s": round(self._clock() - t0, 1)}
 
     def move_to(self, p: np.ndarray, R: np.ndarray, stage: str, seed=None, rate_rad_s: float = 0.4) -> None:
         """A larger reconfiguration: one IK solution for the pose (working branch, seeded at `seed` or the measured
