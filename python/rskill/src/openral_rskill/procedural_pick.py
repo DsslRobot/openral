@@ -109,7 +109,9 @@ class PickRskill(EyeInHandSkill):
         g = self.goal
         from openai import OpenAI
 
-        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=600)
+        # no hidden retries: the client answers within the deadline or the stage returns with what it has. The gateway
+        # answers a marked view in 2-4 minutes; its own retries turned a stalled call into half an hour of silence.
+        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=300, max_retries=0)
         self.geom = GripperGeometry()
         self._evidence.update(target=g["target"], part=g["part"], attempts=[])
         self.stage("prepare")

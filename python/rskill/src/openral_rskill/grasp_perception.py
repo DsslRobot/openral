@@ -68,7 +68,8 @@ def _free(z: np.ndarray, front: float, step: float) -> np.ndarray:
 
 
 def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = GripperGeometry(),
-                    angles_deg: tuple[float, ...] = tuple(range(0, 180, 15)), max_candidates: int = 12) -> list[Candidate]:
+                    angles_deg: tuple[float, ...] = tuple(range(0, 180, 15)), max_candidates: int = 12,
+                    border_px: int = 28) -> list[Candidate]:
     """Antipodal parallel-jaw candidates on a depth image (metres along the optical axis)."""
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     h, w = depth.shape
@@ -185,6 +186,14 @@ def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = Gr
         a1 = np.array([(c["part_ends"][1][0] - cx) / fx, (c["part_ends"][1][1] - cy) / fy, 1.0]) * c["part_depths"][1]
         part_axis = a1 - a0 - axis * np.dot(a1 - a0, axis)
         part_axis = part_axis / max(np.linalg.norm(part_axis), 1e-9)
+        # what this view cannot measure well is not a grasp: a part whose extent along the pads runs into the viewing
+        # ray is seen end-on, so its direction -- and with it the jaw axis -- comes out of the depth noise, and a place
+        # within a template's half-width of the border has no room for the tracker to follow it (research repo F57: a
+        # corner candidate with its axis along the ray read 0.157 rad in the jaws and slipped out under the lift)
+        if abs(float(part_axis[2])) > 0.8:
+            continue
+        if not (border_px <= c["u"] < w - border_px and border_px <= c["v"] < h - border_px):
+            continue
         # a cut across a part at an angle is wider than the perpendicular one: the true antipodal closing axis is the
         # narrowest cut at a place, so the narrowest wins there; places are then ranked by depth step and extent
         score = min(c["step"], 0.3) / 0.3 + min(c["length"], 0.06) / 0.06
