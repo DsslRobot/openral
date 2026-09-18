@@ -36,7 +36,9 @@ class PlaceRskill(EyeInHandSkill):
         # the gripper's own place in its camera, from the mount: what is nearer than this is the tool, not the scene
         f0 = self.frame(after=self._clock() - 0.05)
         self._tool_view = tool_in_view(f0.K, np.linalg.inv(self.T("tcp_frame", f0.frame_id)), *f0.depth.shape)
-        self._evidence["tool_in_view"] = {k: v for k, v in self._tool_view.items() if k != "mask"}
+        self._gripper_mask_path = str(self.evidence_dir / "gripper_mask.npy")
+        np.save(self._gripper_mask_path, self._tool_view["mask"])
+        self._evidence["tool_in_view"] = {k: v for k, v in self._tool_view.items() if k != "mask"} | {"mask": self._gripper_mask_path}
         T_bm = self.T("chassis_base_link", "map")
         s_map = np.array(g["support_xyz_map"], float)
         s = T_bm[:3, :3] @ s_map + T_bm[:3, 3]
@@ -48,26 +50,28 @@ class PlaceRskill(EyeInHandSkill):
         self.stage("lower")
         floor = s[2] + float(g["min_tool_above_support_m"])
         v_down = float(g["lower_speed_m_s"])
-        t_start = t_prev = self._clock()
+        t_start = t_cmd = self._clock()
         z_prev, slow_since, contact = p0[2], None, False
         q_cmd = np.array(self.arm_q())
         while not contact:
-            p, _ = self.tcp()
+            p, R = self.tcp()
             if p[2] <= floor:
-                raise StageFailure("lower", f"no contact before the tool was {g['min_tool_above_support_m']} m above the support point")
+                raise StageFailure("lower", f"no contact before the tool was {g['min_tool_above_support_m']} m above the "
+                                            "support point", local_retry=False)
             now = self._clock()
-            dt = max(now - t_prev, 1e-3)
-            # a waypoint half a second below the tool, over the support point, orientation kept
-            _, R = self.tcp()
-            dx = np.array([over[0] - p[0], over[1] - p[1], -v_down * 0.5])
+            # how far the joints may move this cycle is the cycle that just elapsed -- measured from when the last
+            # command went out, not from the last reading, or the step is a millisecond's worth and the arm stands still
+            dt = max(now - t_cmd, 1e-3)
+            dx = np.array([over[0] - p[0], over[1] - p[1], -v_down * 0.5])  # a waypoint half a second below, over the support
             q_cmd = self.resolved_rate_step(q_cmd, dx, mat_to_rotvec(R0 @ R.T) * 0.5, 0.3 * dt)
             with self._cmd_lock:
                 self._joints = tuple(float(v) for v in q_cmd)
+            t_cmd = now
             self.wait(0.1)
             now2 = self._clock()
             z = self.tcp()[0][2]
-            rate = (z_prev - z) / max(now2 - t_prev, 1e-3)
-            t_prev, z_prev = now2, z
+            rate = (z_prev - z) / max(now2 - now, 1e-3)  # how fast it actually fell over that cycle
+            z_prev = z
             if now2 - t_start > 1.5 and rate < 0.3 * v_down:  # commanded down, not descending: the support holds the item
                 slow_since = slow_since or now2
                 contact = now2 - slow_since > float(g["contact_confirm_s"])
@@ -92,11 +96,12 @@ class PlaceRskill(EyeInHandSkill):
         a = self.frame(after=self._clock() - 0.05)
         self.wait(float(g["settle_s"]))
         b = self.frame(after=self._clock() - 0.05)
-        flow = scene_still(a, b, float(self._tool_view["self_depth_m"]))
+        flow = scene_still(a, b, float(self._tool_view["self_depth_m"]), self._tool_view["mask"])
         jaw = self.jaw()
         np.save(self.evidence_dir / "settle_a_depth.npy", a.depth)
         self._evidence["settle"] = {**flow, "jaw_rad": round(jaw, 4), "before": self.save("settle_a.png", a.bgr), "after": self.save("settle_b.png", b.bgr),
-                                    "before_depth": str(self.evidence_dir / "settle_a_depth.npy")}
+                                    "before_depth": str(self.evidence_dir / "settle_a_depth.npy"),
+                                    "gripper_mask": self._gripper_mask_path, "self_depth_m": self._tool_view["self_depth_m"]}
         if jaw < JAW_OPEN_MIN_RAD:
             raise StageFailure("settle", f"the jaws are not open (jaw {jaw:.3f} rad)")
         if not flow["still"]:
@@ -104,13 +109,19 @@ class PlaceRskill(EyeInHandSkill):
         self._evidence["outcome"] = "placed"
 
 
-def scene_still(a, b, self_depth_m: float) -> dict:
+def scene_still(a, b, self_depth_m: float, tool_mask: np.ndarray, moved_mm: float = 3.0) -> dict:
+    """Did what the gripper just let go of stay put? Dense optical flow between two wrist frames a moment apart, over
+    what lies beyond the gripper's own body and is not the gripper itself. The threshold is a distance, not a pixel
+    count: `moved_mm` at the region's own depth, through the camera's own focal length."""
     g0, g1 = (cv2.cvtColor(f.bgr, cv2.COLOR_BGR2GRAY) for f in (a, b))
     flow = cv2.calcOpticalFlowFarneback(g0, g1, None, 0.5, 4, 31, 5, 7, 1.5, 0)
     z = a.depth
-    near = np.isfinite(z) & (z > self_depth_m) & (z < 1.0)  # beyond the gripper itself: the scene it just let go of
+    near = np.isfinite(z) & (z > self_depth_m) & (z < 1.0) & ~tool_mask
     if near.sum() < 200:
-        return {"still": True, "median_flow_px": None, "near_pixels": int(near.sum())}
+        # nothing measurable where the item was let go: that is not evidence that it stayed, and the caller is told so
+        return {"still": False, "median_flow_px": None, "near_pixels": int(near.sum()), "why": "nothing in view to judge"}
     med = float(np.median(np.linalg.norm(flow[near], axis=1)))
-    return {"still": med < 1.5, "median_flow_px": round(med, 2), "near_pixels": int(near.sum())}
+    limit = a.K[0, 0] * (moved_mm / 1000.0) / float(np.median(z[near]))
+    return {"still": med < limit, "median_flow_px": round(med, 2), "limit_px": round(float(limit), 2),
+            "near_pixels": int(near.sum())}
 
