@@ -1,0 +1,60 @@
+# rSkill manifest -- set the held item down on a named support (kind: procedural).
+# One physical operation for the reasoner; over / lower / release / retreat / settle are its internal stages
+# (openral_rskill.procedural_place). Research repo plan v4.
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-place"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "cartesian_twist"
+    control_mode_semantics:
+      mode: "absolute"
+      reference_frame: "chassis_base_link"
+  - kind: "gripper_binary"
+    control_mode_semantics:
+      mode: "absolute"
+      gripper_convention: "normalized_open_unit"
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Set the item held in the jaws down on a surveyed support: carry the tool above the support point, lower slowly
+  until the support takes the load, open, retreat clear and check in the wrist image that the item stays put.
+  Fails with the stage reached (over, lower, release, retreat, settle) and its evidence.
+actions:
+  - "place"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_place:PlaceRskill"
+  default_goal_json: |
+    {
+      "support": "",
+      "support_xyz_map": [0.0, 0.0, 0.0],
+      "evidence_dir": "/tmp/openral_evidence",
+      "carry_speed_m_s": 0.05,
+      "lower_speed_m_s": 0.02,
+      "min_tool_above_support_m": 0.15,
+      "contact_confirm_s": 0.6,
+      "retreat_m": 0.15,
+      "retreat_up_m": 0.10,
+      "settle_s": 1.5
+    }
+
+goal_params_schema:
+  type: object
+  properties:
+    support: {type: string, description: "where to set the held item down"}
+  required: ["support"]

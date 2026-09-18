@@ -1,0 +1,443 @@
+"""Class-agnostic grasp perception on one eye-in-hand RGB-D view (no object models).
+
+Used inside the LunarBot manipulation rSkills (``procedural_pick``): the stages *find* (antipodal grasp candidates from
+depth discontinuities), *select* (a vision-language model chooses among the numbered candidates drawn on the image for
+a target and part described in words -- it never outputs coordinates) and the per-frame re-association that keeps a
+chosen candidate locked while the camera moves.
+
+A candidate is a planar parallel-jaw grasp seen along the camera's viewing ray: a foreground segment whose two sides
+drop away in depth far enough for the fingers to pass, whose metric width fits inside the open jaws with clearance,
+and which continues along the jaw pads' height. It carries its centre pixel and 3-D point in the camera frame, the
+closing axis (image angle and 3-D direction), width, depth step and score. Everything is measured in the current
+image; the only geometry assumed is the gripper's own (jaw opening, finger width, pad height).
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import math
+import re
+from dataclasses import asdict, dataclass, field
+
+import cv2
+import numpy as np
+
+__all__ = ["Candidate", "GripperGeometry", "find_candidates", "render_candidates", "select_candidate", "associate", "upright", "PartTracker", "Region", "find_regions", "render_regions", "locate_region"]
+
+
+@dataclass(frozen=True)
+class GripperGeometry:
+    """The gripper's own dimensions (EG2-4C2 on the RM-75: ~66 mm opening, research repo F44)."""
+
+    open_width_m: float = 0.066
+    clearance_m: float = 0.010  # per side, between a finger and the grasped part when the jaws are open
+    finger_width_m: float = 0.016  # finger thickness along the closing axis
+    pad_height_m: float = 0.014  # minimum extent of the part along the pads (perpendicular to closing and approach)
+    min_part_width_m: float = 0.005
+    depth_step_m: float = 0.030  # how far both sides must fall away behind the part's front for the fingers to pass
+    self_depth_m: float = 0.17  # nearer than this along the optical axis is the gripper itself in the wrist view
+    min_part_depth_m: float = 0.22  # a part nearer than this is already at the fingers (the TCP is 0.16 m ahead of the camera)
+    max_range_m: float = 1.2
+
+
+@dataclass
+class Candidate:
+    id: int
+    u: float
+    v: float
+    angle_deg: float  # closing axis in the image, degrees from +u towards +v
+    width_m: float
+    depth_m: float
+    length_m: float
+    step_m: float
+    score: float
+    p_cam: list[float]
+    axis_cam: list[float]
+    part_axis_cam: list[float]  # the part's extent along the pads (perpendicular to the closing axis)
+    ends_px: list[list[float]] = field(default_factory=list)  # the two edge points across the part
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+def _free(z: np.ndarray, front: float, step: float) -> np.ndarray:
+    """Pixels behind which a finger can pass: invalid returns (sky, out of range) or deeper than the part by `step`. The
+    gripper's own pixels (masked to 0) are not free."""
+    return ~np.isfinite(z) | (z >= front + step)
+
+
+def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = GripperGeometry(),
+                    angles_deg: tuple[float, ...] = tuple(range(0, 180, 15)), max_candidates: int = 12) -> list[Candidate]:
+    """Antipodal parallel-jaw candidates on a depth image (metres along the optical axis)."""
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    h, w = depth.shape
+    z_all = depth.astype(np.float32).copy()
+    self_mask = np.isfinite(z_all) & (z_all > 0) & (z_all < geom.self_depth_m)
+    z_all[~np.isfinite(z_all) | (z_all <= 0) | (z_all > geom.max_range_m)] = np.inf
+    z_all[self_mask] = 0.0  # the gripper: neither a part nor free space
+    centre = (w / 2.0, h / 2.0)
+    raw = []
+    for ang in angles_deg:
+        # rotate so the closing axis is the image row; nearest keeps depth values honest
+        M = cv2.getRotationMatrix2D(centre, ang, 1.0)
+        diag = int(math.ceil(math.hypot(w, h)))
+        M[0, 2] += (diag - w) / 2.0
+        M[1, 2] += (diag - h) / 2.0
+        zr = cv2.warpAffine(z_all, M, (diag, diag), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=float("nan"))
+        Minv = cv2.invertAffineTransform(M)
+        runs = []  # (row, c0, c1, front)
+        for r in range(0, diag, 2):
+            row = zr[r]
+            known = ~np.isnan(row)
+            if known.sum() < 10:
+                continue
+            fin = np.where(np.isfinite(row) & (row > 0), row, np.inf)
+            jump = np.abs(np.diff(np.where(np.isinf(fin), 50.0, fin)))
+            edges = np.nonzero((jump > geom.depth_step_m) & known[:-1] & known[1:])[0]
+            for a, b in zip(edges[:-1], edges[1:]):
+                seg = fin[a + 1:b + 1]
+                if not np.all(np.isfinite(seg)) or seg.size < 2:
+                    continue
+                front = float(np.median(seg))
+                if np.ptp(seg) > geom.depth_step_m or front < geom.min_part_depth_m:
+                    continue
+                px_per_m = fx / front
+                width = seg.size / px_per_m
+                if not geom.min_part_width_m <= width <= geom.open_width_m - 2 * geom.clearance_m:
+                    continue
+                # both fingers fit: free space for clearance + finger width beyond each edge
+                reach = int(math.ceil((geom.clearance_m + geom.finger_width_m) * px_per_m))
+                left, right = row[max(a + 1 - reach, 0):a + 1], row[b + 1:b + 1 + reach]
+                if left.size < reach or right.size < reach or np.isnan(left).any() or np.isnan(right).any():
+                    continue
+                if not (_free(left, front, geom.depth_step_m).all() and _free(right, front, geom.depth_step_m).all()):
+                    continue
+                side = np.concatenate([left, right])
+                step = float(np.min(np.where(np.isfinite(side), side, front + 1.0)) - front)
+                runs.append((r, a + 1, b + 1, front, step))
+        # chain runs on neighbouring rows into parts that extend along the pads
+        runs.sort()
+        used = [False] * len(runs)
+        for i, (r0, c0, c1, f0, s0) in enumerate(runs):
+            if used[i]:
+                continue
+            chain, last = [i], i
+            for j in range(i + 1, len(runs)):
+                rj, cj0, cj1, fj, _ = runs[j]
+                rl, cl0, cl1, fl, _ = runs[last]
+                if rj - rl > 2:
+                    if rj - rl > 4:
+                        break
+                    continue
+                if rj > rl and abs((cj0 + cj1) - (cl0 + cl1)) / 2 <= 3 and abs(fj - fl) < 0.015:
+                    chain.append(j)
+                    last = j
+            for j in chain:
+                used[j] = True
+            rows = [runs[j] for j in chain]
+            front = float(np.median([x[3] for x in rows]))
+            length = (rows[-1][0] - rows[0][0] + 2) * front / fy
+            if length < geom.pad_height_m:
+                continue
+            # one candidate per pad height along a long part
+            top, bot = rows[0], rows[-1]
+            part_ends = [Minv @ np.array([(top[1] + top[2]) / 2 - 0.5, top[0], 1.0]), Minv @ np.array([(bot[1] + bot[2]) / 2 - 0.5, bot[0], 1.0])]
+            n_seg = max(1, int(length // (2 * geom.pad_height_m)))
+            for k in range(n_seg):
+                sub = rows[int(k * len(rows) / n_seg):int((k + 1) * len(rows) / n_seg)]
+                rc = float(np.mean([x[0] for x in sub]))
+                c0 = float(np.mean([x[1] for x in sub]))
+                c1 = float(np.mean([x[2] for x in sub]))
+                fr = float(np.median([x[3] for x in sub]))
+                step = float(np.min([x[4] for x in sub]))
+                ends = [Minv @ np.array([c0 - 0.5, rc, 1.0]), Minv @ np.array([c1 - 0.5, rc, 1.0])]
+                uc, vc = (ends[0] + ends[1]) / 2
+                width = (c1 - c0) * fr / fx
+                raw.append(dict(ang=ang, u=float(uc), v=float(vc), front=fr, width=width, length=length, step=step,
+                                ends=[e.tolist() for e in ends], part_ends=[e.tolist() for e in part_ends],
+                                part_depths=[top[3], bot[3]]))
+    # 3-D, score, non-maximum suppression across angles and positions
+    cands = []
+    for c in raw:
+        # antipodal refinement: the fingers close perpendicular to the part's own long axis (measured along the chain),
+        # not along the scan direction that found it; the width shrinks by the angle between the two
+        e0, e1 = np.array(c["ends"][0]), np.array(c["ends"][1])
+        pd = np.array(c["part_ends"][1]) - np.array(c["part_ends"][0])
+        if np.linalg.norm(pd) > 3.0:
+            pn = np.array([-pd[1], pd[0]]) / np.linalg.norm(pd)
+            cut = e1 - e0
+            cosang = abs(float(np.dot(cut / max(np.linalg.norm(cut), 1e-9), pn)))
+            half = np.linalg.norm(cut) * cosang / 2
+            mid = (e0 + e1) / 2
+            pn = pn if np.dot(pn, cut) >= 0 else -pn
+            c["ends"] = [(mid - pn * half).tolist(), (mid + pn * half).tolist()]
+            c["width"] = c["width"] * cosang
+            c["ang"] = round(math.degrees(math.atan2(pn[1], pn[0])) % 180.0, 1)
+        if not geom.min_part_width_m <= c["width"]:
+            continue
+        p = np.array([(c["u"] - cx) / fx, (c["v"] - cy) / fy, 1.0]) * (c["front"] + c["width"] / 2)  # the part's centre, not its face
+        e0 = np.array([(c["ends"][0][0] - cx) / fx, (c["ends"][0][1] - cy) / fy, 1.0]) * c["front"]
+        e1 = np.array([(c["ends"][1][0] - cx) / fx, (c["ends"][1][1] - cy) / fy, 1.0]) * c["front"]
+        axis = (e1 - e0) / max(np.linalg.norm(e1 - e0), 1e-9)
+        # each end of the part at its own depth: a part leaning towards the camera is not in the image plane
+        a0 = np.array([(c["part_ends"][0][0] - cx) / fx, (c["part_ends"][0][1] - cy) / fy, 1.0]) * c["part_depths"][0]
+        a1 = np.array([(c["part_ends"][1][0] - cx) / fx, (c["part_ends"][1][1] - cy) / fy, 1.0]) * c["part_depths"][1]
+        part_axis = a1 - a0 - axis * np.dot(a1 - a0, axis)
+        part_axis = part_axis / max(np.linalg.norm(part_axis), 1e-9)
+        # a cut across a part at an angle is wider than the perpendicular one: the true antipodal closing axis is the
+        # narrowest cut at a place, so the narrowest wins there; places are then ranked by depth step and extent
+        score = min(c["step"], 0.3) / 0.3 + min(c["length"], 0.06) / 0.06
+        cands.append(dict(c, p=p, axis=axis, part_axis=part_axis, score=score))
+    cands.sort(key=lambda c: c["width"])
+    kept = []
+    for c in cands:
+        if all(np.linalg.norm(c["p"] - k["p"]) > 0.02 for k in kept):
+            kept.append(c)
+    kept = sorted(kept, key=lambda c: -c["score"])[:max_candidates]
+    return [Candidate(id=i + 1, u=round(c["u"], 1), v=round(c["v"], 1), angle_deg=float(c["ang"]), width_m=round(c["width"], 4),
+                      depth_m=round(c["front"], 4), length_m=round(c["length"], 4), step_m=round(min(c["step"], 9.9), 3),
+                      score=round(c["score"], 3), p_cam=[round(float(v), 4) for v in c["p"]],
+                      axis_cam=[round(float(v), 4) for v in c["axis"]],
+                      part_axis_cam=[round(float(v), 4) for v in c["part_axis"]], ends_px=[[round(v, 1) for v in e] for e in c["ends"]])
+            for i, c in enumerate(kept)]
+
+
+def upright_turn(up_cam: np.ndarray):
+    """The quarter turn that shows the image gravity-up, from the world up direction in the camera frame."""
+    return {0: None, 1: cv2.ROTATE_90_COUNTERCLOCKWISE, 2: cv2.ROTATE_180, 3: cv2.ROTATE_90_CLOCKWISE}[
+        round(math.atan2(up_cam[0], -up_cam[1]) / (math.pi / 2)) % 4]
+
+
+def _turn_point(u, v, w, h, turn):
+    return {None: (u, v), cv2.ROTATE_90_COUNTERCLOCKWISE: (v, w - 1 - u), cv2.ROTATE_180: (w - 1 - u, h - 1 - v),
+            cv2.ROTATE_90_CLOCKWISE: (h - 1 - v, u)}[turn]
+
+
+def render_candidates(bgr: np.ndarray, cands: list[Candidate], up_cam: np.ndarray | None = None, zoom_px: int = 640) -> np.ndarray:
+    """Numbered marks for set-of-mark selection on a magnified crop around the candidates, turned gravity-up: each
+    candidate is drawn as the jaw span across the part (a bar with two finger ticks) and its number. Marks are drawn
+    after magnification so they stay small against the part and the digits stay legible."""
+    h, w = bgr.shape[:2]
+    us = [e[0] for c in cands for e in c.ends_px] + [c.u for c in cands]
+    vs = [e[1] for c in cands for e in c.ends_px] + [c.v for c in cands]
+    half = max(max(us) - min(us), max(vs) - min(vs)) / 2 + 50
+    cu, cv_ = (max(us) + min(us)) / 2, (max(vs) + min(vs)) / 2
+    x0, y0 = int(max(cu - half, 0)), int(max(cv_ - half, 0))
+    x1, y1 = int(min(cu + half, w)), int(min(cv_ + half, h))
+    scale = zoom_px / max(x1 - x0, y1 - y0)
+    img = cv2.resize(bgr[y0:y1, x0:x1], None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    zh, zw = img.shape[:2]
+    to_z = lambda u, v: ((u - x0) * scale, (v - y0) * scale)  # noqa: E731
+    for c in cands:
+        (u0, v0), (u1, v1) = (to_z(*e) for e in c.ends_px)
+        d = np.array([u1 - u0, v1 - v0])
+        d = d / max(np.linalg.norm(d), 1e-9)
+        n = np.array([-d[1], d[0]])
+        a, b = np.array([u0, v0]) - d * 10, np.array([u1, v1]) + d * 10
+        cv2.line(img, tuple(map(int, a)), tuple(map(int, b)), (0, 255, 255), 2, cv2.LINE_AA)
+        for q in (a, b):
+            cv2.line(img, tuple(map(int, q - n * 7)), tuple(map(int, q + n * 7)), (0, 255, 255), 2, cv2.LINE_AA)
+    turn = upright_turn(up_cam) if up_cam is not None else None
+    out = img if turn is None else cv2.rotate(img, turn)
+    for c in cands:  # labels after the turn so the digits read upright; placed off the jaw span
+        (u0, v0), (u1, v1) = (to_z(*e) for e in c.ends_px)
+        x, y = _turn_point(u1, v1, zw, zh, turn)
+        label = str(c.id)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        org = (int(x) + 10, int(y) + th // 2)
+        cv2.rectangle(out, (org[0] - 3, org[1] - th - 3), (org[0] + tw + 3, org[1] + 4), (0, 0, 0), -1)
+        cv2.putText(out, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+
+def upright(bgr: np.ndarray, up_cam: np.ndarray | None) -> np.ndarray:
+    turn = upright_turn(up_cam) if up_cam is not None else None
+    return bgr if turn is None else cv2.rotate(bgr, turn)
+
+
+@dataclass
+class Region:
+    id: int
+    u: float
+    v: float
+    area_px: int
+    depth_m: float
+    p_cam: list[float]
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+def find_regions(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = GripperGeometry(), max_regions: int = 15,
+                 min_area_px: int = 150) -> list[Region]:
+    """Surfaces in view: connected areas of the depth image split at depth discontinuities, each marked at its most
+    interior pixel with the 3-D point there. Region marks let the vision model say *where* the described part is without
+    giving coordinates."""
+    z = depth.astype(np.float32)
+    valid = np.isfinite(z) & (z > geom.self_depth_m) & (z < geom.max_range_m)
+    zz = np.where(valid, z, 100.0)
+    edge = np.zeros_like(valid)
+    edge[:, 1:] |= np.abs(np.diff(zz, axis=1)) > 0.02
+    edge[1:, :] |= np.abs(np.diff(zz, axis=0)) > 0.02
+    edge = cv2.dilate(edge.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((valid & ~edge).astype(np.uint8), connectivity=4)
+    order = sorted(range(1, n), key=lambda i: -stats[i, cv2.CC_STAT_AREA])
+    out = []
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    for i in order:
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area_px or len(out) >= max_regions:
+            break
+        m = (lab == i).astype(np.uint8)
+        dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+        v, u = np.unravel_index(int(np.argmax(dist)), dist.shape)
+        d = float(z[v, u])
+        out.append(Region(id=len(out) + 1, u=float(u), v=float(v), area_px=area, depth_m=round(d, 4),
+                          p_cam=[round(float((u - cx) / fx * d), 4), round(float((v - cy) / fy * d), 4), round(d, 4)]))
+    return out
+
+
+def render_regions(bgr: np.ndarray, regions: list[Region], up_cam: np.ndarray | None = None) -> np.ndarray:
+    """Numbered dots on the surfaces, on the image turned gravity-up."""
+    img = bgr.copy()
+    h, w = img.shape[:2]
+    for r in regions:
+        cv2.circle(img, (int(r.u), int(r.v)), 6, (0, 0, 0), -1)
+        cv2.circle(img, (int(r.u), int(r.v)), 4, (0, 255, 255), -1)
+    turn = upright_turn(up_cam) if up_cam is not None else None
+    out = img if turn is None else cv2.rotate(img, turn)
+    for r in regions:
+        x, y = _turn_point(r.u, r.v, w, h, turn)
+        label = str(r.id)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        org = (int(x) + 8, int(y) + th // 2)
+        cv2.rectangle(out, (org[0] - 2, org[1] - th - 3), (org[0] + tw + 2, org[1] + 3), (0, 0, 0), -1)
+        cv2.putText(out, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+
+LOCATE_PROMPT = """This image is from the camera on a robot's gripper, looking over its work area. Numbered yellow dots mark separate surfaces in view.
+
+Task: pick up {target}, holding it by {part}.
+
+Is the described item in view? If so, which numbered dot lies on {part} of that item (or, if no dot is exactly on it, the dot on the item nearest to that part)? Only choose a dot on the described item.
+
+Reply with JSON only: {{"item_visible": true or false, "what_is_visible": "<short description of the items you see>", "choice": <dot number or null>, "reason": "<one sentence>"}}"""
+
+
+def ask_json(client, model: str, prompt: str, images: list[np.ndarray]) -> tuple[dict, str]:
+    """One vision-language question with images; the parsed JSON object (empty when the reply is not the JSON asked
+    for) and the raw reply."""
+    urls = [f"data:image/jpeg;base64,{base64.b64encode(cv2.imencode('.jpg', im, [cv2.IMWRITE_JPEG_QUALITY, 92])[1].tobytes()).decode()}"
+            for im in images]
+    r = client.chat.completions.create(model=model, messages=[{"role": "user", "content": [
+        {"type": "text", "text": prompt}, *({"type": "image_url", "image_url": {"url": u}} for u in urls)]}])
+    reply = (r.choices[0].message.content or "").strip()
+    found = re.search(r"\{.*\}", reply, re.S)
+    try:
+        return (json.loads(found.group(0)) if found else {}), reply
+    except json.JSONDecodeError:  # a reply that is not the JSON asked for is no answer; the raw reply stays in the record
+        return {}, reply
+
+
+def locate_region(client, model: str, marked_bgr: np.ndarray, target: str, part: str, regions: list[Region]) -> dict:
+    answer, reply = ask_json(client, model, LOCATE_PROMPT.format(target=target, part=part), [marked_bgr])
+    ids = {r.id for r in regions}
+    choice = answer.get("choice")
+    return dict(item_visible=bool(answer.get("item_visible")), what_is_visible=answer.get("what_is_visible", ""),
+                choice=choice if choice in ids else None, reason=answer.get("reason", ""), raw=reply, model=model)
+
+
+SELECT_PROMPT = """Images from the camera on a robot's gripper. Image 1 is an overview of the work area. Images 2 to {last} are closer views of it; in each, yellow bars with end ticks span parts the two fingers of the parallel-jaw gripper could close on, numbered (numbers are unique across the images).
+
+Task: pick up {target}, holding it by {part}.
+{convention}
+Decide from the images whether the described item is in view, then choose the numbered mark where closing the jaws would hold that item by that part so it can be lifted and carried without slipping. Only choose a mark on the described item. If the described item is not in view, or no mark is on the described part, say so.
+
+Reply with JSON only: {{"item_visible": true or false, "what_is_visible": "<short description of the items you see>", "choice": <mark number or null>, "runner_up": <mark number or null>, "reason": "<one sentence>"}}"""
+
+
+def select_candidate(client, model: str, overview_bgr: np.ndarray, marked_views: list[np.ndarray], target: str, part: str,
+                     ids: set[int], convention: str = "") -> dict:
+    """VLM set-of-mark choice: an overview for the item's identity and one magnified marked crop per close view. Returns
+    the parsed answer plus the raw reply."""
+    prompt = SELECT_PROMPT.format(target=target, part=part, last=len(marked_views) + 1,
+                                  convention=f"\n{convention}\n" if convention else "")
+    answer, reply = ask_json(client, model, prompt, [overview_bgr, *marked_views])
+    choice = answer.get("choice")
+    return dict(item_visible=bool(answer.get("item_visible")), what_is_visible=answer.get("what_is_visible", ""),
+                choice=choice if choice in ids else None, runner_up=answer.get("runner_up") if answer.get("runner_up") in ids else None,
+                reason=answer.get("reason", ""), raw=reply, model=model)
+
+
+class PartTracker:
+    """Follows the chosen grasp in the wrist image while the tool moves towards it.
+
+    Template matching around where the camera's own motion says the part must now be, with the template rescaled by the
+    change in depth. A generic re-detection every frame snaps onto whatever else the narrowing view shows once the
+    fingers cover the part (research repo F57); a template of the part itself does not."""
+
+    def __init__(self, frame_bgr: np.ndarray, depth: np.ndarray, K: np.ndarray, cand: Candidate, half_px: int = 28) -> None:
+        self.K, self.half = K, half_px
+        u, v = int(round(cand.u)), int(round(cand.v))
+        h, w = depth.shape
+        self.u0, self.v0 = min(max(u, half_px), w - half_px - 1), min(max(v, half_px), h - half_px - 1)
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        self.template = gray[self.v0 - half_px:self.v0 + half_px + 1, self.u0 - half_px:self.u0 + half_px + 1]
+        self.depth = float(cand.depth_m)
+        self.width_m, self.axis_cam = cand.width_m, np.array(cand.axis_cam, float)
+        self.part_axis_cam = np.array(cand.part_axis_cam, float)
+        self.score = 1.0
+
+    def measure(self, frame_bgr: np.ndarray, depth: np.ndarray, predicted_cam: np.ndarray, search_px: int = 60,
+                min_score: float = 0.6, max_depth_jump_m: float = 0.03):
+        """Where the part is in this frame: (pixel, depth, score) or None. `predicted_cam` is its 3-D point in this
+        camera as the arm's own motion predicts it."""
+        if predicted_cam[2] <= 0.05:
+            return None
+        pu = self.K[0, 0] * predicted_cam[0] / predicted_cam[2] + self.K[0, 2]
+        pv = self.K[1, 1] * predicted_cam[1] / predicted_cam[2] + self.K[1, 2]
+        scale = self.depth / max(float(predicted_cam[2]), 1e-6)
+        tpl = self.template if abs(scale - 1.0) < 0.05 else cv2.resize(self.template, None, fx=scale, fy=scale,
+                                                                       interpolation=cv2.INTER_LINEAR)
+        th, tw = tpl.shape
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        x0, y0 = int(max(pu - search_px - tw // 2, 0)), int(max(pv - search_px - th // 2, 0))
+        x1, y1 = int(min(pu + search_px + tw // 2, w)), int(min(pv + search_px + th // 2, h))
+        window = gray[y0:y1, x0:x1]
+        if window.shape[0] <= th or window.shape[1] <= tw:
+            return None
+        res = cv2.matchTemplate(window, tpl, cv2.TM_CCOEFF_NORMED)
+        _, best, _, loc = cv2.minMaxLoc(res)
+        if best < min_score:
+            return None
+        u = x0 + loc[0] + tw / 2.0
+        v = y0 + loc[1] + th / 2.0
+        k = 3
+        patch = depth[int(v) - k:int(v) + k + 1, int(u) - k:int(u) + k + 1]
+        patch = patch[np.isfinite(patch) & (patch > 0.05)]
+        if not patch.size:
+            return None
+        d = float(np.percentile(patch, 25))  # the part is the foreground at its pixel, not what is behind a thin neck
+        if abs(d - float(predicted_cam[2])) > max_depth_jump_m:
+            return None  # a match at a different distance is a different surface, not the part
+        self.depth = d
+        self.score = float(best)
+        return np.array([u, v]), d, float(best)
+
+    def point_cam(self, pixel: np.ndarray, d: float) -> np.ndarray:
+        return np.array([(pixel[0] - self.K[0, 2]) / self.K[0, 0] * d, (pixel[1] - self.K[1, 2]) / self.K[1, 1] * d, d])
+
+
+def associate(prev: Candidate, prev_p_now: np.ndarray, cands: list[Candidate], max_dist_m: float = 0.02) -> Candidate | None:  # noqa: D401
+    """The candidate in the current view that is the locked one: its 3-D point predicted into the current camera frame
+    (`prev_p_now`, from the camera's own motion) and matched by position, width and closing axis."""
+    best, best_d = None, max_dist_m
+    for c in cands:
+        d = float(np.linalg.norm(np.array(c.p_cam) - prev_p_now))
+        same_axis = abs(float(np.dot(c.axis_cam, prev.axis_cam))) > 0.8
+        if d < best_d and abs(c.width_m - prev.width_m) < 0.008 and same_axis:
+            best, best_d = c, d
+    return best

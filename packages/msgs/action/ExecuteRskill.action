@@ -25,6 +25,9 @@ PlaceDeclaration place_declaration
 bool success
 string failure_reason      # empty on success
 string trace_id            # OTel trace id for replay
+string evidence_json       # the skill's own record of what it did and saw (JSON object; {} when it keeps none):
+                            #   stages reached, measurements, evidence file paths. Raw evidence for the caller,
+                            #   never a verdict -- success/failure_reason stay the outcome.
 
 # failure_kind — typed cause mirroring the CLAUDE.md §5 exception hierarchy, for
 # machine consumers (the reasoner's replanning ladder) to classify on instead of

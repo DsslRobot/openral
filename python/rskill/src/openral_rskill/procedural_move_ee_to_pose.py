@@ -104,6 +104,7 @@ class MoveEEToPoseRskill(rSkillBase):
         goal_params_json: str = "",
         tf_lookup: TfLookup | None = None,
         clock: Any = None,
+        ros_node: Any = None,  # the runner node; unused -- this skill subscribes to nothing
     ) -> None:
         del robot_description  # unused — this skill closes its loop on TF, not joint_state.
         if manifest.procedural is None:

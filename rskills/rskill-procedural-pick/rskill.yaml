@@ -1,0 +1,93 @@
+# rSkill manifest -- pick up an item described in words by a described part (kind: procedural).
+# One physical operation for the reasoner; find / select / approach / grasp / hold are its internal stages
+# (openral_rskill.procedural_pick). Research repo plan v4 (docs/semantic_to_metric_manipulation_plan.md).
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-pick"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "cartesian_twist"
+    control_mode_semantics:
+      mode: "absolute"
+      reference_frame: "chassis_base_link"
+  - kind: "joint_position"
+    control_mode_semantics:
+      mode: "absolute"
+      joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+  - kind: "gripper_binary"
+    control_mode_semantics:
+      mode: "absolute"
+      gripper_convention: "normalized_open_unit"
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Pick up an item described in words by a described part, from the wrist RGB-D camera: antipodal grasp candidates on
+  the current view, a vision-language model's choice among them, visual servo to a stand-off, guarded close-in, jaw
+  closure and a lift with a hold check. Retries on the same item only; fails with the stage reached and its evidence.
+actions:
+  - "pick"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_pick:PickRskill"
+  default_goal_json: |
+    {
+      "target": "",
+      "part": "",
+      "evidence_dir": "/tmp/openral_evidence",
+      "vlm_model": "GLM-5.3-Flash",
+      "vlm_endpoint": "https://llmapi.paratera.com/v1",
+      "reach_zone_x_m": -1.07,
+      "overview_pose": [-0.85, 0.0, 1.10, 50, 0],
+      "vlm_asks": 3,
+      "handle_convention": "Payloads at this site carry a standard lifting handle: a narrow neck with a wider head overhanging it. The grasp that holds such a payload is the one across that neck, directly under the head, so the head rests on the closed fingers; a grasp on the head itself, on the block under the neck, or anywhere on the payload's body does not hold it.",
+      "side_view_heights_m": [1.05, 0.83, 0.61],
+      "unoccluded_centre_row_px": 108,
+      "part_row_px": 150,
+      "clearance_m": 0.015,
+      "self_depth_m": 0.20,
+      "item_rows_px": 216,
+      "image_rows_px": 480,
+      "grasp_clear_radius_m": 0.10,
+      "lift_when_below_m": 0.10,
+      "framing_tolerance_m": 0.03,
+      "side_view_back_m": [0.15, 0.22, 0.28, 0.34],
+      "side_view_rise_m": [0.0, 0.05, 0.10, 0.15],
+      "side_view_pitch_deg": [10, 20, 30, 40],
+      "candidates_per_view": 6,
+      "standoff_m": [0.10, 0.14, 0.07],
+      "pad_offset_m": 0.012,
+      "approach_speed_m_s": 0.05,
+      "approach_timeout_s": 60.0,
+      "close_in_speed_m_s": 0.025,
+      "close_in_short_ok_m": 0.02,
+      "blind_ok_m": 0.06,
+      "max_track_misses": 6,
+      "max_corrections": 2,
+      "track_gate_m": 0.02,
+      "correction_done_m": 0.006,
+      "lift_m": 0.15,
+      "lift_speed_m_s": 0.04,
+      "min_lift_m": 0.06,
+      "max_attempts": 3
+    }
+
+goal_params_schema:
+  type: object
+  properties:
+    target: {type: string, description: "the item to pick, described in words"}
+    part: {type: string, description: "the part to hold it by, described in words"}
+  required: ["target", "part"]

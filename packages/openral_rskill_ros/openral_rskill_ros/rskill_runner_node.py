@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import math
 import os
 import sys
@@ -1039,6 +1040,9 @@ if _ROS2_AVAILABLE:
                     self._reset_active_goal()
                     return result
                 finally:
+                    # the record must survive even a value the encoder does not know (a numpy scalar from a skill's
+                    # measurement): an unreadable field is better than an empty result
+                    result.evidence_json = json.dumps(skill.evidence(), default=str)
                     self._publish_episode_end(
                         task_string=episode_task, success=bool(result.success)
                     )
@@ -2257,6 +2261,8 @@ def make_default_skill_resolver(
             # by skills that don't need it, e.g. body_twist) — only
             # `move_ee_to_pose` closes its loop against live TF.
             resolved_tf_lookup = tf_lookup_getter() if tf_lookup_getter is not None else tf_lookup
+            # The host node goes to every procedural skill like `tf_lookup` (ignored by those that
+            # need no topics); eye-in-hand manipulation skills subscribe to the wrist camera on it.
             skill = entrypoint_cls(
                 manifest=manifest,
                 robot_description=description,
@@ -2265,6 +2271,7 @@ def make_default_skill_resolver(
                 goal_params_json=goal_params_json,
                 tf_lookup=resolved_tf_lookup,
                 clock=clock,
+                ros_node=ros_node_captured,
             )
             skill.configure()
             skill.activate()

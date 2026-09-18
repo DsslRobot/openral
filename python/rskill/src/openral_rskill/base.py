@@ -307,6 +307,15 @@ class rSkillBase(abc.ABC):  # noqa: N801  # reason: rSkill is the official packa
         Default is a no-op; override to call the model once with dummy input.
         """
 
+    def evidence(self) -> dict:
+        """The skill's own record of the goal it ran (stages reached, measurements, evidence file paths).
+
+        Read by the runner when the goal ends, on every outcome, and returned as
+        ``ExecuteRskill.Result.evidence_json``. Raw evidence for the caller, never a verdict.
+        Default: nothing recorded.
+        """
+        return {}
+
     # ── Abstract implementation hooks ─────────────────────────────────────────
 
     @abc.abstractmethod
