@@ -417,7 +417,10 @@ class EyeInHandSkill(rSkillBase):
         req.robot_state.joint_state.name = list(ARM_JOINT_NAMES)
         req.robot_state.joint_state.position = [float(v) for v in q]
         fut = self._fk_client.call_async(req)
+        t = time.monotonic()
         while not fut.done():
+            if time.monotonic() - t > 5.0:  # every service call ends, or the stage does: a wedged planner is a failure
+                raise StageFailure(self._evidence.get("stage", "?"), "the arm's forward kinematics service did not answer")
             time.sleep(0.005)
         res = fut.result()
         by_name = dict(zip(res.fk_link_names, res.pose_stamped))

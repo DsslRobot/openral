@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 
 from openral_rskill._eye_in_hand import JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure, mat_to_rotvec
+from openral_rskill.procedural_pick import tool_in_view
 
 __all__ = ["PlaceRskill"]
 
@@ -32,6 +33,10 @@ class PlaceRskill(EyeInHandSkill):
         g = self.goal
         self._evidence.update(support=g["support"])
         self.stage("over")
+        # the gripper's own place in its camera, from the mount: what is nearer than this is the tool, not the scene
+        f0 = self.frame(after=self._clock() - 0.05)
+        self._tool_view = tool_in_view(f0.K, np.linalg.inv(self.T("tcp_frame", f0.frame_id)), *f0.depth.shape)
+        self._evidence["tool_in_view"] = {k: v for k, v in self._tool_view.items() if k != "mask"}
         T_bm = self.T("chassis_base_link", "map")
         s_map = np.array(g["support_xyz_map"], float)
         s = T_bm[:3, :3] @ s_map + T_bm[:3, 3]
@@ -87,7 +92,7 @@ class PlaceRskill(EyeInHandSkill):
         a = self.frame(after=self._clock() - 0.05)
         self.wait(float(g["settle_s"]))
         b = self.frame(after=self._clock() - 0.05)
-        flow = scene_still(a, b)
+        flow = scene_still(a, b, float(self._tool_view["self_depth_m"]))
         jaw = self.jaw()
         np.save(self.evidence_dir / "settle_a_depth.npy", a.depth)
         self._evidence["settle"] = {**flow, "jaw_rad": round(jaw, 4), "before": self.save("settle_a.png", a.bgr), "after": self.save("settle_b.png", b.bgr),
@@ -99,11 +104,11 @@ class PlaceRskill(EyeInHandSkill):
         self._evidence["outcome"] = "placed"
 
 
-def scene_still(a, b) -> dict:
+def scene_still(a, b, self_depth_m: float) -> dict:
     g0, g1 = (cv2.cvtColor(f.bgr, cv2.COLOR_BGR2GRAY) for f in (a, b))
     flow = cv2.calcOpticalFlowFarneback(g0, g1, None, 0.5, 4, 31, 5, 7, 1.5, 0)
     z = a.depth
-    near = np.isfinite(z) & (z > 0.17) & (z < 1.0)
+    near = np.isfinite(z) & (z > self_depth_m) & (z < 1.0)  # beyond the gripper itself: the scene it just let go of
     if near.sum() < 200:
         return {"still": True, "median_flow_px": None, "near_pixels": int(near.sum())}
     med = float(np.median(np.linalg.norm(flow[near], axis=1)))
