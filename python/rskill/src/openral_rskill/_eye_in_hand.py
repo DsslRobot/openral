@@ -797,11 +797,13 @@ class EyeInHandSkill(rSkillBase):
               max_joint_rate_rad_s: float = 0.3, timeout_s: float = 40.0, stall_s: float = 4.0, settle_cycles: int = 3,
               step_m: float = 0.04, step_rad: float = 0.2, guard: Callable[[np.ndarray], str] | None = None,
               null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
-              max_speed_m_s: float | None = None) -> dict:
+              max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
         servoing); `goal()` returning None keeps the last goal. Each cycle the goal, corrected by the integral of the
         remaining position error (arm sag under a load), goes through the arm's inverse kinematics on its working branch
-        seeded at the measured joints, and the joint targets move towards the solution at a limited rate."""
+        seeded at the measured joints, and the joint targets move towards the solution at a limited rate.
+        A short empty-jaw insertion turns off the sag integral and the posture pull: with the joints lagging their
+        targets by up to a second, both carried the tool past and beside a close-in goal (g8q replay, F78)."""
         t0 = t_prev = self._clock()
         best, t_best, inside, last_goal, integ, blocked = math.inf, t0, 0, None, np.zeros(3), 0
         trace: list[dict] = []
@@ -845,7 +847,7 @@ class EyeInHandSkill(rSkillBase):
                                           + ("; at a joint stop: " + ", ".join(at_stop) if at_stop else ""))
             if now - t0 > timeout_s:
                 raise StageFailure(stage, f"arm timed out {en * 100:.1f} cm / {math.degrees(rn):.0f} deg from its goal")
-            if en < 0.03:
+            if sag_integral and en < 0.03:
                 integ = np.clip(integ + e * dt * 0.8, -0.05, 0.05)
             # move the tool a short way along the straight line to the goal, through the Jacobian: a step, not a new
             # arm configuration
@@ -854,7 +856,7 @@ class EyeInHandSkill(rSkillBase):
                 dx *= min(1.0, max_speed_m_s * dt / max(float(np.linalg.norm(dx)), 1e-9))
             dw = r * min(1.0, step_rad / max(rn, 1e-6))
             q_meas = np.array(self.arm_q())
-            q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt,
+            q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt, posture_gain=posture_gain,
                                              null_grad=None if null_objective is None else null_objective(q_meas))
             why = "" if self.state_valid(q_next) else "the robot's own planning scene"
             if not why and guard is not None:

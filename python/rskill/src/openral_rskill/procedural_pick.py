@@ -593,7 +593,7 @@ class PickRskill(EyeInHandSkill):
         info = self.servo(goal_now, "approach", tol_m=0.005, tol_rad=0.04,
                           max_speed_m_s=float(g["close_in_speed_m_s"]),
                           max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
-                          timeout_s=60.0, stall_s=6.0)
+                          timeout_s=60.0, stall_s=6.0, sag_integral=False, posture_gain=0.0)
         self._closure_goal = goal_now()
         p1, _ = self.tcp()
         self._evidence["close_in"] = {**info, "remaining_m": round(float(np.linalg.norm(state["p_base"] - p1)), 4),
