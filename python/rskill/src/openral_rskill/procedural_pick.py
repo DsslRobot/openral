@@ -139,7 +139,7 @@ class PickRskill(EyeInHandSkill):
         cand, choice = self.find_and_select()
         self.contact_scene(True)
         self.working_on(self._locked_frame.to_base(cand.p_cam))
-        rec = {"attempt": 1, "candidate": cand.as_dict(), "vlm": choice,
+        rec = {"attempt": 1, "candidate": cand.as_dict(), "vlm": choice, "selection_fx": float(self._locked_frame.K[0, 0]),
                "evidence_dir": str(self.evidence_dir), "find": self._evidence["find"]}
         self._evidence["attempts"].append(rec)
         try:
@@ -774,8 +774,10 @@ class PickRskill(EyeInHandSkill):
             return p0 + lift_v, R0
 
         try:
-            self.servo_twist(rising, "hold", tol_m=0.01, tol_rad=0.06, max_speed_m_s=float(g["lift_speed_m_s"]),
-                             timeout_s=90.0, stall_s=12.0)
+            # Joint-target servo, as bring_in: in the twist path the lift realised ~3 % of its commanded speed and ran
+            # into the 90 s timeout with the wrist at its torque limit (g9a, research F78).
+            self.servo(rising, "hold", tol_m=0.01, tol_rad=0.06, max_speed_m_s=float(g["lift_speed_m_s"]),
+                       max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]), timeout_s=90.0, stall_s=12.0)
         except StageFailure as exc:
             # a held item bends the arm down (about 4.5 cm under 1 kg, research repo F51), so the tool does not reach the
             # commanded height: what counts is how far it rose, and whether the item came with it
