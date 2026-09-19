@@ -775,9 +775,12 @@ class PickRskill(EyeInHandSkill):
 
         try:
             # Joint-target servo, as bring_in: in the twist path the lift realised ~3 % of its commanded speed and ran
-            # into the 90 s timeout with the wrist at its torque limit (g9a, research F78).
+            # into the 90 s timeout with the wrist at its torque limit (g9a, research F78). The scene snapshot still
+            # holds the item where it stood, and the lift carries the item with the tool straight up out of it: the
+            # snapshot is not checked for this stroke, as the twist path never did (g9d stopped at 0 cm).
             self.servo(rising, "hold", tol_m=0.01, tol_rad=0.06, max_speed_m_s=float(g["lift_speed_m_s"]),
-                       max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]), timeout_s=90.0, stall_s=12.0)
+                       max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]), timeout_s=90.0, stall_s=12.0,
+                       check_scene=False)
         except StageFailure as exc:
             # a held item bends the arm down (about 4.5 cm under 1 kg, research repo F51), so the tool does not reach the
             # commanded height: what counts is how far it rose, and whether the item came with it

@@ -871,7 +871,8 @@ class EyeInHandSkill(rSkillBase):
               max_joint_rate_rad_s: float = 0.3, timeout_s: float = 40.0, stall_s: float = 4.0, settle_cycles: int = 3,
               step_m: float = 0.04, step_rad: float = 0.2, guard: Callable[[np.ndarray], str] | None = None,
               null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
-              max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4) -> dict:
+              max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4,
+              check_scene: bool = True) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
         servoing); `goal()` returning None keeps the last goal. Each cycle the goal, corrected by the integral of the
         remaining position error (arm sag under a load), goes through the arm's inverse kinematics on its working branch
@@ -932,7 +933,7 @@ class EyeInHandSkill(rSkillBase):
             q_meas = np.array(self.arm_q())
             q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt, posture_gain=posture_gain,
                                              null_grad=None if null_objective is None else null_objective(q_meas))
-            why = "" if self.state_valid(q_next) else "the robot's own planning scene"
+            why = "" if not check_scene or self.state_valid(q_next) else "the robot's own planning scene"
             if not why and guard is not None:
                 why = guard(q_next)
             if why:
