@@ -94,6 +94,16 @@ def grasp_rotation(closing_b: np.ndarray, part_b: np.ndarray, view_b: np.ndarray
     return np.stack([x, np.cross(z, x), z], axis=1)
 
 
+def set_view_dir(state: dict, cam_base: np.ndarray) -> None:
+    """Fix the direction the grasp is taken from: from this camera position towards the part, as a unit vector.
+
+    Called when a view is *chosen* (the candidate's own frame, and again once the tool stands at the stand-off),
+    never from inside the servo loop -- that is what made the goal pose depend on the tool's own pose."""
+    v = np.asarray(state["p_base"]) - np.asarray(cam_base)
+    state["view_base"] = np.asarray(cam_base)
+    state["view_dir"] = v / max(float(np.linalg.norm(v)), 1e-9)
+
+
 def guard_or_empty(skill, p: np.ndarray, R: np.ndarray, state: dict) -> str:
     """Why the tool's own body cannot be at this pose (a surface it would touch), or "" when it can. The part being
     grasped is excluded: that is what the fingers are closing on."""
@@ -451,6 +461,15 @@ class PickRskill(EyeInHandSkill):
         state = {"p_base": f.to_base(cand.p_cam), "axis_base": f.T_base_cam[:3, :3] @ np.array(cand.axis_cam),
                  "part_base": f.T_base_cam[:3, :3] @ np.array(cand.part_axis_cam), "view_base": f.T_base_cam[:3, 3],
                  "seen": f.stamp, "hits": 0, "misses": 0, "frames": [], "trace": []}
+        # Which side the grasp is approached from is decided once, by the view that chose it, and then held. It used
+        # to be recomputed every frame from where the camera had got to -- and the camera is bolted to the tool, so
+        # the goal pose was a function of the tool's own pose: `grasp_rotation` points the tool's z away from the
+        # camera, the tool swung past the part, the camera changed sides, z flipped 180 degrees, and the tool swung
+        # back. g6a and g5p show the ring it makes -- the error running 0.009 -> 0.020 -> 0.009 m without ever
+        # closing, the part sliding out of frame, and the approach ending on a lost lock 13-15 cm out, further away
+        # than it had been ten frames earlier. Tracking still updates *where* the part is; only the direction it is
+        # taken from is fixed (research repo F64).
+        set_view_dir(state, f.T_base_cam[:3, 3])
         self._evidence["approach_track"] = state["trace"]  # the same list: a failed approach still returns its pictures
         # the item this grasp is on is not an obstacle to reaching it: its own measured surface comes out of the guard
         state["item_cells"] = item_cells(self._heights, state["p_base"])
@@ -477,9 +496,7 @@ class PickRskill(EyeInHandSkill):
             own body covers the part -- it always does, in the last stretch, since the camera looks past the fingers --
             the goal holds its last measured place and the tool closes in straight along its axis."""
             if state.get("covered") or float(np.linalg.norm(state["p_base"] - self.tcp()[0])) < float(g["blind_ok_m"]):
-                view = state["p_base"] - state["view_base"]
-                R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"],
-                                                     view / max(float(np.linalg.norm(view)), 1e-9),
+                R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
                                                      self.tcp()[1], state["camera_side"], self._cam_tool),
                                       state.get("turn_deg", 0.0))
                 self.working_on(state["p_base"])
@@ -499,8 +516,7 @@ class PickRskill(EyeInHandSkill):
                 state["misses"] = 0
                 pixel, d, score = m
                 state["p_base"] = nf.to_base(tracker.point_cam(pixel, d) + np.array([0.0, 0.0, tracker.width_m / 2]))
-                state["view_base"] = nf.T_base_cam[:3, 3]
-                state["hits"] += 1
+                state["hits"] += 1  # where the part is, not which side it is taken from: `view_dir` stays put
             elif not state.get("covered"):
                 state["misses"] += 1
                 # lost while still far from the part: the goal must not be carried on blind -- go back and identify again
@@ -530,9 +546,7 @@ class PickRskill(EyeInHandSkill):
                 state["trace"].append({"image": path, "hit": m is not None, "score": round(tracker.last_score, 3),
                                        "depth_m": round(tracker.depth, 4), "roll_deg": round(tracker.roll_deg, 1),
                                        "left_m": round(left, 4), "why": tracker.reject})
-            view = state["p_base"] - state["view_base"]
-            R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"],
-                                                 view / max(float(np.linalg.norm(view)), 1e-9),
+            R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
                                                  self.tcp()[1], state["camera_side"], self._cam_tool),
                                   state.get("turn_deg", 0.0))
             self.working_on(state["p_base"])
@@ -580,8 +594,7 @@ class PickRskill(EyeInHandSkill):
         Returns the part's tracker as seen from there, or None when the pose is not reachable or not clear, in which
         case the caller servos from where it is."""
         p, R_now = self.tcp()
-        view = state["p_base"] - state["view_base"]
-        R_g = grasp_rotation(state["axis_base"], state["part_base"], view / max(float(np.linalg.norm(view)), 1e-9),
+        R_g = grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
                              R_now, state["camera_side"], self._cam_tool)
         rec = {"turn_deg": round(math.degrees(float(np.linalg.norm(mat_to_rotvec(R_g @ R_now.T)))), 1), "tried": []}
         self._evidence["take_standoff"] = rec
@@ -621,7 +634,7 @@ class PickRskill(EyeInHandSkill):
         self.plan_to(q, "approach")
         self.wait(0.6)
         nf = self.frame(after=self._clock() - 0.05)
-        state["seen"], state["view_base"] = nf.stamp, nf.T_base_cam[:3, 3]
+        state["seen"] = nf.stamp  # the stand-off is on `view_dir` by construction: standing there does not redefine it
         R_c = nf.T_base_cam[:3, :3]
         p_cam = R_c.T @ (state["p_base"] - nf.T_base_cam[:3, 3])
         if p_cam[2] < 0.1:
