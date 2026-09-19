@@ -540,7 +540,13 @@ class PartTracker:
                 if score < predict_depth_min_score:
                     self.reject = "no depth where it matches"
                     continue
-                self.depth_predicted, hit = True, (u, v, float(predicted_cam[2]), score)
+                # ...and the range is not invented either. A first attempt at this returned the predicted distance
+                # as if it had been measured, and the caller rebuilt the part's point from it: the prediction comes
+                # from that same point, so the point walked away down the line of sight -- 10.0 cm to 36.4 cm in
+                # nineteen seconds (g6c). The part is a static rigid body. Its place is already known; this frame
+                # only has to say it is still there and still matched, so the range comes back as None and the
+                # caller keeps the point it has.
+                self.depth_predicted, hit = True, (u, v, None, score)
                 break
             off = d - float(predicted_cam[2])
             if abs(off) > max_depth_jump_m:
@@ -551,7 +557,9 @@ class PartTracker:
         if hit is None:
             return None
         u, v, d, score = hit
-        self.reject, self.depth, self.score = "", d, score
+        self.reject, self.score = "", score
+        if d is not None:  # an unranged frame keeps the last distance for the record; it returns None to the caller
+            self.depth = d
         best = score
         if best >= refresh_score:
             ui, vi = int(round(u)), int(round(v))

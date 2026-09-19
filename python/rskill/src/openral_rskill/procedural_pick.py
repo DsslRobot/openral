@@ -515,7 +515,9 @@ class PickRskill(EyeInHandSkill):
             if m is not None:
                 state["misses"] = 0
                 pixel, d, score = m
-                state["p_base"] = nf.to_base(tracker.point_cam(pixel, d) + np.array([0.0, 0.0, tracker.width_m / 2]))
+                if d is not None:  # an unranged frame says the part is still there and still matched, nothing more:
+                    #                the part does not move, so its point stands until a frame can measure it again
+                    state["p_base"] = nf.to_base(tracker.point_cam(pixel, d) + np.array([0.0, 0.0, tracker.width_m / 2]))
                 state["hits"] += 1  # where the part is, not which side it is taken from: `view_dir` stays put
             elif not state.get("covered"):
                 state["misses"] += 1
