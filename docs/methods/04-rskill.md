@@ -2,6 +2,24 @@
 
 > Part of the OpenRAL [public-symbol inventory](../METHODS.md). Hand-curated; `(LNN)` markers are refreshed by `tools/refresh_methods_linenos.py`.
 
+### `python/rskill/src/openral_rskill/grasp_perception.py`
+
+- `refine_contact(depth, K, candidate, geom) -> tuple[Candidate, dict]` — Refine the selected contact's closing/part axes from the observed local depth surface before target commitment. Returns surface-fit evidence; no object model or world-truth input.
+
+### `python/rskill/src/openral_rskill/procedural_pick.py`
+
+- `grasp_camera_sides(part_axis_b) -> list[np.ndarray]` — Enumerate both antipodal jaw rolls. A single offset pixel never prunes a legal pose; shared IK, collision and insertion observation checks decide executability before motion. No tilted fallback.
+- `PickRskill.contact_path_observed(tool_points, tool_links, start, end, rotation) -> dict` — Check measured free rays for the actual open-gripper surface along insertion; invalid/occluded pixels remain unknown; declared contact-link samples inside the locked patch are counted separately as expected contact.
+
+### `python/rskill/src/openral_rskill/_eye_in_hand.py`
+
+- `EyeInHandSkill.contact_permission(phase, region=None, dimensions=None, evidence_ref="")` — Declare an immutable measured contact patch; acknowledge endpoint-check/insertion permission and revocation.
+- `EyeInHandSkill.contact_scene(prepare: bool) -> None` — Acquire/release the applied stationary-contact scene through acknowledged shared services; retain scene/evidence references.
+- `EyeInHandSkill.gripper_surface_points(with_links=False)` — Articulated collision-mesh vertices in TCP coordinates, from installed robot geometry and measured joint-state FK; optionally retain each vertex's owning link.
+- `Frame.depth_semantics` — Optional sensor-sourced range/no-return metadata retained with the observation; `WristRGBD` receives it from the camera bridge. Missing metadata does not authorize infinite-depth rays.
+- `EyeInHandSkill.servo(..., max_speed_m_s=None) -> dict` — Existing per-step whole-robot collision-checked joint servo; optional Cartesian increment limit preserves approach speed limits.
+- Removed pick's `guard_or_empty` and `item_cells`: contact planning/approach no longer authorize motion through separate height-map target exclusions.
+
 ### `python/rskill/src/openral_rskill/base.py`
 _rSkillBase — abstract base class with lifecycle state machine._
 
@@ -19,6 +37,9 @@ _rSkillBase — abstract base class with lifecycle state machine._
   - `on_unload_weights() -> None` — Hook: release weights, called by `shutdown()` (VRAM eviction). (L286)
   - `on_quantize() -> None` — Hook: apply quantization. (L296)
   - `on_warmup() -> None` — Hook: dummy forward pass, called by `activate()` before `_activate_impl`. Default is a no-op. **Implemented on the deploy path** by `_PolicyAdapterSkill.on_warmup` (`packages/openral_rskill_ros/openral_rskill_ros/rskill_runner_node.py`), which delegates to `_vla_core.warm_up_lerobot_policy` and swallows+logs any failure. (L303)
+  - `evidence() -> dict` — Raw stage/measurement record returned on all outcomes; default empty.
+  - `stop_actions(world_state: WorldState) -> list[Action]` — Revoke asynchronous work and propose final holding actions through the existing safety/HAL path; default empty. Command application is not a physical-rest acknowledgement.
+  - `finish_stop() -> None` — Join background work after holding commands have been applied; default no-op.
   - `_configure_impl/_activate_impl/_deactivate_impl/_shutdown_impl/_step_impl()` [@abstractmethod] (L313)
   - private: `_transition`, `_update`, `_require_transition`, `_enter_error`
 

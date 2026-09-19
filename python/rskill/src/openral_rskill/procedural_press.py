@@ -174,6 +174,7 @@ class PressRskill(EyeInHandSkill):
             dt = max(now - t_cmd, 1e-3)
             q_cmd = self.resolved_rate_step(q_cmd, -n * v_in * 0.5, mat_to_rotvec(R @ R_now.T) * 0.5, 0.3 * dt)
             with self._cmd_lock:
+                self._check_stop()
                 self._joints = tuple(float(v) for v in q_cmd)
             t_cmd = now
             self.wait(0.1)

@@ -55,3 +55,4 @@ float32 progress           # 0..1
 string state               # "loading"|"warming"|"executing"|"replanning"|"recovering"
 uint32 chunk_index
 uint32 chunks_total
+string evidence_json       # current semantic stage/event; empty for skills without staged evidence

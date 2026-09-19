@@ -1,0 +1,10 @@
+# Stationary visual-contact scene. Register immutable measured region, then
+# enable for endpoint_check/insertion, or revoke before free-space motion.
+# The scene owner supplies the robot's allowed contact links, never the caller.
+string phase
+geometry_msgs/PoseStamped region
+geometry_msgs/Vector3 dimensions
+string evidence_ref
+---
+bool success
+string evidence_json

@@ -10,7 +10,7 @@ Stages:
 2. lower   -- straight down at a slow speed until contact: the tool stops descending while still commanded down (the
               support takes the load); a floor just above the support ends the stage as "no contact".
 3. release -- open the jaws.
-4. retreat -- straight back out along the tool axis, then up, clear of the item.
+4. retreat -- withdraw under the interface's release constraint, then up, clear of the item.
 5. settle  -- two wrist images a moment apart after the retreat: the item stays where it was set (no image motion on
               the near foreground), and it is no longer in the jaws (jaw open).
 
@@ -57,7 +57,7 @@ class PlaceRskill(EyeInHandSkill):
             self.working_on(self.tcp()[0])
             return over, R0
 
-        self.servo(carrying, "over", tol_m=0.01, tol_rad=0.05, max_joint_rate_rad_s=0.2, timeout_s=60.0)
+        self.servo(carrying, "over", **g["carry_servo"])
         self._evidence["over"] = {"support_rover": [round(float(v), 3) for v in s], "tcp": [round(float(v), 3) for v in self.tcp()[0]]}
 
         self.stage("lower")
@@ -79,6 +79,7 @@ class PlaceRskill(EyeInHandSkill):
             dx = np.array([over[0] - p[0], over[1] - p[1], -v_down * 0.5])  # a waypoint half a second below, over the support
             q_cmd = self.resolved_rate_step(q_cmd, dx, mat_to_rotvec(R0 @ R.T) * 0.5, 0.3 * dt)
             with self._cmd_lock:
+                self._check_stop()
                 self._joints = tuple(float(v) for v in q_cmd)
             t_cmd = now
             self.wait(0.1)
@@ -101,7 +102,19 @@ class PlaceRskill(EyeInHandSkill):
 
         self.stage("retreat")
         p, R = self.tcp()
-        back = p - R[:, 2] * float(g["retreat_m"])
+        withdraw = -R[:, 2].copy()
+        if g["release_constraint"] == "below_overhang":
+            # This operation lowers onto a horizontal support. An overhang above a side grasp must not be
+            # lifted by the retreat, even if the loaded wrist tilted during transport (research repo F73).
+            withdraw[2] = 0.0
+            length = float(np.linalg.norm(withdraw))
+            if length == 0.0:
+                raise StageFailure("retreat", "below_overhang requires a side grasp; a vertical tool has no sideways withdrawal direction",
+                                   local_retry=False)
+            withdraw /= length
+        back = p + withdraw * float(g["retreat_m"])
+        self._evidence["retreat"] = {"release_constraint": g["release_constraint"], "from": p.tolist(),
+                                    "withdraw_to": back.tolist()}
         self.servo(lambda: (back, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0)
         up = back + np.array([0.0, 0.0, float(g["retreat_up_m"])])
         self.servo(lambda: (up, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0)
@@ -113,7 +126,8 @@ class PlaceRskill(EyeInHandSkill):
         flow = scene_still(a, b, float(self._tool_view["self_depth_m"]), self._tool_view["mask"])
         jaw = self.jaw()
         np.save(self.evidence_dir / "settle_a_depth.npy", a.depth)
-        self._evidence["settle"] = {**flow, "jaw_rad": round(jaw, 4), "before": self.save("settle_a.png", a.bgr), "after": self.save("settle_b.png", b.bgr),
+        self._evidence["settle"] = {**flow, "jaw_rad": round(jaw, 4), "fx": float(a.K[0, 0]),
+                                    "before": self.save("settle_a.png", a.bgr), "after": self.save("settle_b.png", b.bgr),
                                     "before_depth": str(self.evidence_dir / "settle_a_depth.npy"),
                                     "gripper_mask": self._gripper_mask_path, "self_depth_m": self._tool_view["self_depth_m"]}
         if jaw < JAW_OPEN_MIN_RAD:
@@ -138,4 +152,3 @@ def scene_still(a, b, self_depth_m: float, tool_mask: np.ndarray, moved_mm: floa
     limit = a.K[0, 0] * (moved_mm / 1000.0) / float(np.median(z[near]))
     return {"still": med < limit, "median_flow_px": round(med, 2), "limit_px": round(float(limit), 2),
             "near_pixels": int(near.sum())}
-

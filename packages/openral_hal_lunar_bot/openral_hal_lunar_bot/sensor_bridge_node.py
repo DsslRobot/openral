@@ -455,6 +455,13 @@ if _ROS2_AVAILABLE:
             )
 
             # ── Lidar relay (data); its TF is handled by _publish_sensor_frames ──
+            # Relay the sensor's own depth-return semantics unchanged. Hardware
+            # without such metadata does not acquire simulated free-ray evidence.
+            from std_msgs.msg import String
+            for camera in ("front", "wrist"):
+                metadata_pub = self.create_publisher(String, f"/openral/cameras/{camera}/depth_semantics", _SENSOR_QOS)
+                self.create_subscription(String, f"/{self._env_tf_frame}/cam_{camera}/depth_semantics",
+                                         lambda msg, pub=metadata_pub: pub.publish(msg), _SENSOR_QOS)
             self._relay_pointcloud(
                 src_topic=f"/{self._env_tf_frame}/lidar_robot/pointcloud",
                 dst_topic="/openral/lidar/points",

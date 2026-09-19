@@ -47,6 +47,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   action/ExecuteRskill.action
   # Snap a HAL's MuJoCo qpos to a manifest.starting_pose before the
   # skill_runner's first inference tick (fix for pi0.5 OOD drift).
+  srv/ConfigureContact.srv
   srv/ResetToPose.srv
   # reasoner's read-only locate_in_view query against a live VLM detector.
   srv/LocateInView.srv

@@ -29,6 +29,7 @@ would need the base to move, another item or another operation ends the goal wit
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import os
 import time
@@ -55,19 +56,6 @@ def tool_rotation(pitch_deg: float, yaw_deg: float, roll_deg: float = 0.0) -> np
     if abs(roll_deg - 180.0) < 1e-6:
         x = -x
     return np.stack([x, np.cross(z, x), z], axis=1)
-
-
-def turned_about_jaws(R: np.ndarray, deg: float) -> np.ndarray:
-    """The same grasp, approached from a different direction: a turn about the jaws' own closing axis.
-
-    Where the jaws close is measured on the part and is not negotiable; which way round the part the tool comes from
-    is free, and the arm does not reach every way equally. The free side decides the preference (a handle standing
-    above a box is taken from above, not through the box), and this turn is how far the skill has to give on that
-    preference to stand where it can (research repo F58/F59)."""
-    if not deg:
-        return R
-    a = R[:, 0] / max(float(np.linalg.norm(R[:, 0])), 1e-9)
-    return rotvec_to_mat(a * math.radians(deg)) @ R
 
 
 def grasp_rotation(closing_b: np.ndarray, part_b: np.ndarray, view_b: np.ndarray, R_now: np.ndarray,
@@ -104,15 +92,6 @@ def set_view_dir(state: dict, cam_base: np.ndarray) -> None:
     state["view_dir"] = v / max(float(np.linalg.norm(v)), 1e-9)
 
 
-def guard_or_empty(skill, p: np.ndarray, R: np.ndarray, state: dict) -> str:
-    """Why the tool's own body cannot be at this pose (a surface it would touch), or "" when it can. The part being
-    grasped is excluded: that is what the fingers are closing on."""
-    pts = (R @ BODY_POINTS.T).T + p
-    worst = lowest_clearance(skill._heights, pts, except_near=(state["p_base"], float(skill.goal["grasp_clear_radius_m"])),
-                             except_cells=state.get("item_cells"))
-    return "" if worst[0] >= float(skill.goal["clearance_m"]) else f"a surface at {worst[2]} m under {worst[1]}"
-
-
 def across_tool_axis(v_tool: np.ndarray) -> np.ndarray:
     """The part of a vector in the tool frame that is across the tool axis -- the part a roll about that axis turns.
     Taken in the tool frame, not by projecting in the base frame: the camera looks along neither the tool axis nor the
@@ -120,13 +99,14 @@ def across_tool_axis(v_tool: np.ndarray) -> np.ndarray:
     return np.array([v_tool[0], v_tool[1], 0.0], float)
 
 
-def free_side(frame: Frame, point_b: np.ndarray, part_axis_b: np.ndarray, self_depth_m: float, step_m: float = 0.06) -> np.ndarray:
-    """Which way along the part is clearer, as this view measured it: the side whose sample sees no surface in front of
-    it. A handle on top of a box is clear above and blocked below; a bar under a ledge the other way round."""
+def grasp_camera_sides(part_axis_b: np.ndarray) -> list[np.ndarray]:
+    """Both antipodal jaw rolls; measured geometry decides executability.
+
+    Visibility of one offset point cannot authorize or reject an entire tool
+    posture. Each roll must pass the same IK, collision and insertion evidence.
+    """
     axis = part_axis_b / max(float(np.linalg.norm(part_axis_b)), 1e-9)
-    votes = [(float(seen_through(frame, np.array([point_b + axis * step_m * s]), self_depth_m)[0]), s) for s in (1.0, -1.0)]
-    votes.sort(reverse=True)
-    return axis * votes[0][1]
+    return [axis, -axis]
 
 
 class PickRskill(EyeInHandSkill):
@@ -147,37 +127,37 @@ class PickRskill(EyeInHandSkill):
         self._evidence.update(target=g["target"], part=g["part"], attempts=[])
         self.stage("prepare")
         self.set_jaw(True, "prepare")
-        tried: list[np.ndarray] = []  # grasps already tried, where they were seen in the rover frame at the time
         try:
-            self.attempts(tried)
+            self.attempt()
         finally:
-            self.working_on(None)  # the world model measures this space as it finds it again
+            self.working_on(None)
 
-    def attempts(self, tried: list[np.ndarray]) -> None:
-        g = self.goal
-        for attempt in range(int(g["max_attempts"])):
-            cand, choice = self.find_and_select(tried)
-            tried.append(self._locked_frame.to_base(cand.p_cam))
-            # say what the tool is about to be inside as soon as the grasp is chosen, so the world model has rebuilt
-            # its measurement without it by the time the arm asks for a pose at the part
-            self.working_on(self._locked_frame.to_base(cand.p_cam))
-            rec = {"attempt": attempt + 1, "candidate": cand.as_dict(), "vlm": choice}
-            self._evidence["attempts"].append(rec)
-            try:
-                self.approach(cand)
-                jaw = self.grasp()
-                self.hold(jaw)
-                rec["outcome"] = "held"
-                self._evidence["outcome"] = "held"
-                self.bring_in()
-                return
-            except StageFailure as exc:
-                rec["outcome"] = f"failed at {exc.stage}: {exc.why}"
-                if not exc.local_retry or exc.stage not in ("approach", "grasp", "hold") \
-                        or attempt + 1 == int(g["max_attempts"]):
-                    raise  # only what another attempt on the same target could fix is tried again
-                self.back_off()
-        raise StageFailure("hold", "attempts exhausted")
+    def attempt(self) -> None:
+        """One selected contact per call; a new observation/selection belongs to the caller."""
+        self.evidence_dir = self.evidence_dir / "attempt_01"
+        self.evidence_dir.mkdir()
+        cand, choice = self.find_and_select()
+        self.contact_scene(True)
+        self.working_on(self._locked_frame.to_base(cand.p_cam))
+        rec = {"attempt": 1, "candidate": cand.as_dict(), "vlm": choice,
+               "evidence_dir": str(self.evidence_dir), "find": self._evidence["find"]}
+        self._evidence["attempts"].append(rec)
+        try:
+            self.approach(cand)
+            jaw = self.grasp()
+            self.contact_permission("revoke")
+            self.hold(jaw)
+            self.bring_in()
+            rec["outcome"] = "held"
+            self._evidence["outcome"] = "held"
+        except StageFailure as exc:
+            rec["outcome"] = f"failed at {exc.stage}: {exc.why}"
+            raise
+        finally:
+            rec["approach_track"] = self._evidence.get("approach_track", [])
+            rec["take_standoff"] = self._evidence.get("take_standoff")
+            rec["target_lock"] = self._evidence.get("target_lock")
+            (self.evidence_dir / "attempt.json").write_text(json.dumps(rec, indent=2) + "\n")
 
     def vlm_call(self, stage: str, fn):
         """One call to the vision-language model. When the service does not answer, the stage fails with that reason
@@ -200,7 +180,7 @@ class PickRskill(EyeInHandSkill):
             raise StageFailure(stage, f"the vision-language model ({self.goal['vlm_model']}) did not answer: {type(exc).__name__}") from exc
 
     # ---- find + select --------------------------------------------------------------------------------------------------
-    def find_and_select(self, tried: list[np.ndarray]) -> tuple[Candidate, dict]:
+    def find_and_select(self) -> tuple[Candidate, dict]:
         """Side views of the arm's reach zone from the top of the grasp band downwards. Each view pose, and the joint path
         to it, must lie in space the views already taken saw through (the first is above the band). Every view is taken
         before anything is chosen, and the vision-language model then judges the marks of all of them in one question:
@@ -312,8 +292,7 @@ class PickRskill(EyeInHandSkill):
             np.save(self.evidence_dir / f"view_p{int(pitch):02d}_depth.npy", f.depth)
             shot_cands, marked_images = [], []
             for shot_info, shot, shot_q in shots:
-                cands = [c for c in find_candidates(shot.depth, shot.K, self.geom, max_candidates=int(g["candidates_per_view"]))
-                         if all(np.linalg.norm(shot.to_base(c.p_cam) - t) > 0.02 for t in tried)]
+                cands = find_candidates(shot.depth, shot.K, self.geom, max_candidates=int(g["candidates_per_view"]))
                 for c in cands:
                     c.id, next_id = next_id, next_id + 1
                 tag = f"p{int(pitch):02d}" + ("_rolled" if shot_info.get("roll") else "")
@@ -339,18 +318,21 @@ class PickRskill(EyeInHandSkill):
         if a["choice"] is None:
             raise StageFailure("select", f"none of the {len(all_cands)} marks in the {len(gathered)} views is on the "
                                          "described part of the described item")
-        f, cands, _, shot_q = next(t for t in gathered if any(c.id == a["choice"] for c in t[1]))
-        # The arm does not travel back to where the chosen view was taken. `approach` works from the frame itself --
-        # the grasp point, the part's axes and the tracker's template all carry that frame's own TF -- and the planner
-        # takes the tool to the stand-off from wherever it stands. Going back was a no-op while the chosen view was
-        # the one the arm was already standing in; once every view is taken before the choice it became a move right
-        # across the work zone, and in g4r it stalled against the depot stand and failed the whole call. `_view_q` is
-        # kept for back_off, which runs from the grasp itself and retreats along a path just travelled.
-        self._locked_frame, self._view_q = f, shot_q
-        # keep the camera on the side of the tool it looked from: the tracker's template is that view's image,
-        # and a roll of the tool turns that template upside down in the following frames
-        self._view_R = self.fk(np.array(shot_q))[:3, :3]
-        return next(c for c in cands if c.id == a["choice"]), record["select"]
+        f, cands, _, _ = next(t for t in gathered if any(c.id == a["choice"] for c in t[1]))
+        # Approach uses this observation's own geometry; no return to its viewing posture.
+        from openral_rskill.grasp_perception import refine_contact
+
+        selected = next(c for c in cands if c.id == a["choice"])
+        try:
+            selected, geometry = refine_contact(f.depth, f.K, selected, self.geom)
+        except ValueError as exc:
+            raise StageFailure("select", str(exc)) from exc
+        record["contact_geometry"] = geometry
+        np.save(self.evidence_dir / "selected_depth.npy", f.depth)
+        self.save("selected_rgb.png", f.bgr)
+        self._locked_frame = f
+        self._contact_views = seen
+        return selected, record["select"]
 
     def rolled_view(self, info: dict, P: np.ndarray, T_tc: np.ndarray, K: np.ndarray, seen: list[Frame]):
         """The same place seen from the other side of the tool: the fingers hide the opposite half of the image there, so
@@ -451,10 +433,12 @@ class PickRskill(EyeInHandSkill):
 
     # ---- approach -----------------------------------------------------------------------------------------------------
     def approach(self, cand: Candidate) -> None:
-        """Visual servo onto the chosen grasp: every camera frame measures where the part is, the goal follows it, and the
-        tool closes in until the part sits between the fingers. The part is tracked by its own image template (the
-        generic detector re-run per frame snaps onto other structures once the fingers cover it, research repo F57); when
-        the fingers finally hide it, the last measurement holds the goal for the last centimetres."""
+        """Approach a stationary, visually selected contact using measured robot pose feedback.
+
+        Commit the contact in odom, so arm/base motion changes its robot-relative coordinates,
+        not its identity. Image matching checks visibility; it cannot silently move the contact.
+        Loss of visibility before the terminal self-occlusion region returns a failure.
+        """
         g = self.goal
         f = self._locked_frame
         self.stage("approach", candidate=cand.id)
@@ -467,44 +451,67 @@ class PickRskill(EyeInHandSkill):
         # camera, the tool swung past the part, the camera changed sides, z flipped 180 degrees, and the tool swung
         # back. g6a and g5p show the ring it makes -- the error running 0.009 -> 0.020 -> 0.009 m without ever
         # closing, the part sliding out of frame, and the approach ending on a lost lock 13-15 cm out, further away
-        # than it had been ten frames earlier. Tracking still updates *where* the part is; only the direction it is
-        # taken from is fixed (research repo F64).
+        # than it had been ten frames earlier (research repo F64). Both the position and direction are now
+        # committed in odom; image matches check visibility without rewriting this contact.
         set_view_dir(state, f.T_base_cam[:3, 3])
         self._evidence["approach_track"] = state["trace"]  # the same list: a failed approach still returns its pictures
-        # the item this grasp is on is not an obstacle to reaching it: its own measured surface comes out of the guard
-        state["item_cells"] = item_cells(self._heights, state["p_base"])
-        self._evidence["item_cells"] = len(state["item_cells"])
         # the camera looks from the side the part is free on, so the fingers close from the side with less material
         # (a handle on a box: from above, not through the box). The tracker carries the roll this costs, frame by frame.
         self.working_on(state["p_base"])
-        side = free_side(f, state["p_base"], state["part_base"], self._self_depth)
-        state["camera_side"] = side / max(float(np.linalg.norm(side)), 1e-9)
+        state["camera_sides"] = grasp_camera_sides(state["part_base"])
+        state["camera_side"] = state["camera_sides"][0]
         self._evidence["camera_side"] = [round(float(v), 2) for v in state["camera_side"]]
-        approach_from = g["standoff_m"] if isinstance(g["standoff_m"], list) else [float(g["standoff_m"])]
+        T_ob = self.T("odom", "chassis_base_link")
+        contact_odom = T_ob[:3, :3] @ state["p_base"] + T_ob[:3, 3]
+        axes_odom = {key: T_ob[:3, :3] @ state[key]
+                     for key in ("axis_base", "part_base", "view_dir", "camera_side")}
+        self._evidence["target_lock"] = {
+            "status": "committed", "candidate": cand.id, "frame": "odom", "position_m": contact_odom.tolist(),
+            "source": "selected wrist RGB-D candidate and robot TF",
+            "tracking_role": "visibility check; no contact-point replacement",
+        }
 
-        def guard_pose(p, R):
-            return guard_or_empty(self, p, R, state)
+        def refresh_contact_frame(camera_side=None):
+            if camera_side is not None:
+                axes_odom["camera_side"] = self.T("odom", "chassis_base_link")[:3, :3] @ camera_side
+            T_bo = self.T("chassis_base_link", "odom")
+            state["p_base"] = T_bo[:3, :3] @ contact_odom + T_bo[:3, 3]
+            for key, axis in axes_odom.items():
+                state[key] = T_bo[:3, :3] @ axis
+
+        # Bound permission to the selected measured patch, never the item or work zone.
+        region = np.eye(4)
+        region[:3, 3] = contact_odom
+        x, y = axes_odom["axis_base"], axes_odom["part_base"]
+        region[:3, :3] = np.column_stack((x, y, np.cross(x, y)))
+        dimensions = np.array([cand.width_m, cand.length_m, self.geom.depth_step_m])
+        self._contact_region = (region, dimensions)
+        self.contact_permission("register", region, dimensions, str(self.evidence_dir / "selected_depth.npy"))
+
+        approach_from = g["standoff_m"] if isinstance(g["standoff_m"], list) else [float(g["standoff_m"])]
 
         # stand in front of the grasp first, in the orientation the grasp needs -- with the planner, from the view's own
         # measurement -- and only then close the loop (see take_standoff)
-        tracker = self.take_standoff(cand, state, list(approach_from))
+        tracker = self.take_standoff(cand, state, list(approach_from), refresh_contact_frame)
+        # The antipodal roll is chosen before servo, with both contact and stand-off
+        # IK checked. Preserve that roll in the same fixed frame as the contact.
+        self._evidence["camera_side"] = state["camera_side"].tolist()
         if tracker is None:
-            tracker = PartTracker(f.bgr, f.depth, f.K, cand, R_base_cam=f.T_base_cam[:3, :3])
+            tracker = PartTracker(f.bgr, f.depth, f.K, cand, R_base_cam=T_ob[:3, :3] @ f.T_base_cam[:3, :3])
 
         def goal_now():
-            """The tool pose that puts the tracked part between the fingers, from the newest frame. Once the gripper's
-            own body covers the part -- it always does, in the last stretch, since the camera looks past the fingers --
-            the goal holds its last measured place and the tool closes in straight along its axis."""
+            """Re-express the committed contact using robot TF; check visibility without relocating it."""
+            refresh_contact_frame()
             if state.get("covered") or float(np.linalg.norm(state["p_base"] - self.tcp()[0])) < float(g["blind_ok_m"]):
-                R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
-                                                     self.tcp()[1], state["camera_side"], self._cam_tool),
-                                      state.get("turn_deg", 0.0))
+                R = grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
+                                   self.tcp()[1], state["camera_side"], self._cam_tool)
                 self.working_on(state["p_base"])
                 return state["p_base"] - R[:, 2] * state["standoff"], R
             nf = self.frame(after=state["seen"], timeout_s=2.0)
             state["seen"] = nf.stamp
             p_pred_cam = nf.T_base_cam[:3, :3].T @ (state["p_base"] - nf.T_base_cam[:3, 3])
-            m = tracker.measure(nf.bgr, nf.depth, p_pred_cam, R_base_cam=nf.T_base_cam[:3, :3],
+            R_odom_cam = self.T("odom", "chassis_base_link")[:3, :3] @ nf.T_base_cam[:3, :3]
+            m = tracker.measure(nf.bgr, nf.depth, p_pred_cam, R_base_cam=R_odom_cam,
                                 self_depth_m=self._self_depth)
             if tracker.covered and state["hits"] > 0:
                 # the fingers are in front of the part now: measuring stops here and the last measurement carries the
@@ -515,19 +522,25 @@ class PickRskill(EyeInHandSkill):
             if m is not None:
                 state["misses"] = 0
                 pixel, d, score = m
-                if d is not None:  # an unranged frame says the part is still there and still matched, nothing more:
-                    #                the part does not move, so its point stands until a frame can measure it again
-                    state["p_base"] = nf.to_base(tracker.point_cam(pixel, d) + np.array([0.0, 0.0, tracker.width_m / 2]))
-                state["hits"] += 1  # where the part is, not which side it is taken from: `view_dir` stays put
+                if d is not None:
+                    measured = nf.to_base(tracker.point_cam(pixel, d) + np.array([0.0, 0.0, tracker.width_m / 2]))
+                    self._evidence["target_lock"]["last_match_offset_m"] = float(np.linalg.norm(measured - state["p_base"]))
+                    if self._evidence["target_lock"]["last_match_offset_m"] > float(g["track_gate_m"]):
+                        self._evidence["target_lock"].update(status="invalidated", reason="selected contact moved or tracking disagrees")
+                        raise StageFailure("approach", "current measurement disagrees with the committed contact; observation required",
+                                           local_retry=False)
+                state["hits"] += 1
             elif not state.get("covered"):
                 state["misses"] += 1
                 # lost while still far from the part: the goal must not be carried on blind -- go back and identify again
                 if float(np.linalg.norm(state["p_base"] - self.tcp()[0])) > float(self.goal["blind_ok_m"]) \
                         and state["misses"] > int(self.goal["max_track_misses"]):
-                    raise StageFailure("approach", f"lost sight of the chosen grasp {state['misses']} frames running "
-                                                   f"while still {float(np.linalg.norm(state['p_base'] - self.tcp()[0])) * 100:.0f} cm away")
-            # the tracker's own view, so a failed approach can be read off the pictures: where the part was measured
-            # (cross) or last seen, the match score, and the distance still to go
+                    why = (f"lost sight of the chosen grasp {state['misses']} frames running "
+                           f"while still {float(np.linalg.norm(state['p_base'] - self.tcp()[0])) * 100:.0f} cm away")
+                    self._evidence["target_lock"].update(status="invalidated", reason=why)
+                    raise StageFailure("approach", why, local_retry=False)
+            # Cross: committed contact projection. Circle: current image match. Keep them distinct so a
+            # visually plausible match cannot conceal drift away from the selected contact.
             if len(state["frames"]) < 40 and (len(state["frames"]) < 8 or nf.stamp - state["frames"][-1][0] > 1.0):
                 mark = nf.bgr.copy()
                 pc = nf.T_base_cam[:3, :3].T @ (state["p_base"] - nf.T_base_cam[:3, 3])
@@ -550,44 +563,45 @@ class PickRskill(EyeInHandSkill):
                                        "depth_m": round(tracker.depth, 4), "depth_predicted": tracker.depth_predicted,
                                        "roll_deg": round(tracker.roll_deg, 1),
                                        "left_m": round(left, 4), "why": tracker.reject})
-            R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
-                                                 self.tcp()[1], state["camera_side"], self._cam_tool),
-                                  state.get("turn_deg", 0.0))
+            R = grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
+                               self.tcp()[1], state["camera_side"], self._cam_tool)
             self.working_on(state["p_base"])
             return state["p_base"] - R[:, 2] * state["standoff"], R
 
         # close in under vision: the stand-off first, then the grasp point itself
         state["standoff"] = float(state.get("standoff_used", approach_from[0]))
         try:
-            info = self.servo_twist(goal_now, "approach", tol_m=0.006, tol_rad=0.04, max_speed_m_s=float(g["approach_speed_m_s"]),
-                                    timeout_s=float(g["approach_timeout_s"]), stall_s=6.0, guard=guard_pose)
+            info = self.servo(goal_now, "approach", tol_m=0.006, tol_rad=0.04,
+                              max_speed_m_s=float(g["approach_speed_m_s"]),
+                              max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
+                              timeout_s=float(g["approach_timeout_s"]), stall_s=6.0)
         except StageFailure as exc:
             # the stand-off is a place to close in from, not a pose to hit: the guarded close-in covers the last
             # stretch under vision anyway. Stalling a few millimetres out is arriving (g5g stopped 0.4 cm and 2 deg
             # short of it and lost the call); stalling far out is not, and still returns the stage.
+            if not exc.local_retry:
+                raise
             off = float(np.linalg.norm(goal_now()[0] - self.tcp()[0]))
             if off > float(g["close_in_short_ok_m"]):
                 raise
             info = {"stalled_short_m": round(off, 4), "why": exc.why}
         self._evidence["standoff"] = {**info, "tracked_frames": state["hits"], "missed_frames": state["misses"],
                                       "image": self.save("standoff.jpg", upright(self.frame(after=self._clock() - 0.05).bgr, None))}
+        self.contact_permission("insertion")
         state["standoff"] = -float(g["pad_offset_m"])
         self.stage("approach", close_in=True)
-        try:
-            self.servo_twist(goal_now, "approach", tol_m=0.005, tol_rad=0.04, max_speed_m_s=float(g["close_in_speed_m_s"]),
-                             timeout_s=60.0, stall_s=6.0, guard=guard_pose)
-        except StageFailure as exc:
-            p1, _ = self.tcp()
-            short = float(np.linalg.norm(state["p_base"] - p1))
-            if short > float(g["close_in_short_ok_m"]) + float(g["pad_offset_m"]):
-                raise StageFailure("approach", f"the close-in stopped {short * 100:.1f} cm from the grasp: {exc.why}") from exc
+        info = self.servo(goal_now, "approach", tol_m=0.005, tol_rad=0.04,
+                          max_speed_m_s=float(g["close_in_speed_m_s"]),
+                          max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
+                          timeout_s=60.0, stall_s=6.0)
+        self._closure_goal = goal_now()
         p1, _ = self.tcp()
-        self._evidence["close_in"] = {"remaining_m": round(float(np.linalg.norm(state["p_base"] - p1)), 4),
+        self._evidence["close_in"] = {**info, "remaining_m": round(float(np.linalg.norm(state["p_base"] - p1)), 4),
                                       "tracked_frames": state["hits"], "missed_frames": state["misses"],
                                       "track": state.get("trace", [])}
         self._grasp_point = state["p_base"]
 
-    def take_standoff(self, cand: Candidate, state: dict, standoffs_m: list[float]) -> PartTracker | None:
+    def take_standoff(self, cand: Candidate, state: dict, standoffs_m: list[float], refresh_contact_frame) -> PartTracker | None:
         """Stand the tool in front of the chosen grasp, in the orientation the grasp needs, with the planner -- one
         reconfiguration, not a servo motion: the view is taken from wherever frames the part, the grasp comes from the
         side the part is free on, and between the two the wrist can turn half round. Turning it where the tool stands is
@@ -595,27 +609,48 @@ class PickRskill(EyeInHandSkill):
         and the part leaves the image (research repo F57). Standing at the stand-off instead puts the part back on the
         tool axis, where the camera sees it and the servo can close the last stretch.
 
-        Returns the part's tracker as seen from there, or None when the pose is not reachable or not clear, in which
-        case the caller servos from where it is."""
+        Both stand-off and contact must be reachable at the measured grasp direction.
+        Failure returns to the caller before motion; no tilted substitute approach."""
         p, R_now = self.tcp()
-        R_g = grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
-                             R_now, state["camera_side"], self._cam_tool)
-        rec = {"turn_deg": round(math.degrees(float(np.linalg.norm(mat_to_rotvec(R_g @ R_now.T)))), 1), "tried": []}
+        tool_points, tool_links = self.gripper_surface_points(with_links=True)
+        options = [(side, grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
+                                         R_now, side, self._cam_tool)) for side in state["camera_sides"]]
+        options.sort(key=lambda option: np.linalg.norm(mat_to_rotvec(option[1] @ R_now.T)))
+        rec = {"tried": [], "approach_direction": "measured contact normal; no pitch substitution"}
         self._evidence["take_standoff"] = rec
         q = blocked = None
         found = False
-        for turn in [float(v) for v in self.goal["approach_turns_deg"]]:
-            R_t = turned_about_jaws(R_g, turn)
+        for side, R_t in options:
+            p_contact = state["p_base"] + R_t[:, 2] * float(self.goal["pad_offset_m"])
             for standoff_m in standoffs_m:  # the stand-offs this skill offers, in order: a local retry on the same grasp
                 p_g = state["p_base"] - R_t[:, 2] * standoff_m
                 q = self.ik(p_g, R_t, list(self.arm_q()))
-                blocked = None if q is None else guard_or_empty(self, p_g, R_t, state)
-                rec["tried"].append({"turn_deg": turn, "stand_off_m": round(standoff_m, 3),
-                                     "goal": [round(float(v), 3) for v in p_g],
-                                     "reachable": q is not None, "blocked": blocked})
+                blocked = None if q is None else ("" if self.state_valid(np.asarray(q)) else
+                                                  str(self._evidence["last_state_validity"]))
+                q_contact = None
                 if q is not None and not blocked:
+                    self.contact_permission("endpoint_check")
+                    try:
+                        q_contact = self.ik(p_contact, R_t, q)
+                        if q_contact is not None and not self.state_valid(np.asarray(q_contact)):
+                            blocked = str(self._evidence["last_state_validity"])
+                            q_contact = None
+                    finally:
+                        self.contact_permission("revoke")
+                if q_contact is not None:
+                    coverage = self.contact_path_observed(tool_points, tool_links, p_g, p_contact, R_t)
+                    if not coverage["satisfied"]:
+                        blocked = f"observation_insufficient: {coverage}"
+                        q_contact = None
+                rec["tried"].append({"camera_side": side.tolist(), "stand_off_m": round(standoff_m, 3),
+                                     "goal": [round(float(v), 3) for v in p_g],
+                                     "reachable": q is not None, "contact_reachable": q_contact is not None,
+                                     "contact_goal": p_contact.tolist(), "blocked": blocked})
+                if q_contact is not None:
                     rec["stand_off_m"] = state["standoff_used"] = round(standoff_m, 3)
-                    rec["approach_turn_deg"] = state["turn_deg"] = turn
+                    rec["approach_turn_deg"] = 0.0
+                    refresh_contact_frame(camera_side=side)
+                    rec["turn_deg"] = round(math.degrees(float(np.linalg.norm(mat_to_rotvec(R_t @ R_now.T)))), 1)
                     R_g, found = R_t, True
                     break
             if found:
@@ -624,20 +659,24 @@ class PickRskill(EyeInHandSkill):
         if not found:
             q = None
         if q is None:
-            # No amount of servoing reaches a grasp the arm cannot stand in front of -- but another grasp on the same
-            # item may be one it can, and that is a retry on the same target, which is this skill's to make (plan v4
-            # §4). The attempt loop puts this candidate in `tried` and asks for the next one; when they run out the
-            # call returns with this stage, and the model decides whether the rover should stand somewhere else.
-            # Both kinds have been seen: a mark 99 cm away on the depot stand (g4q) and one 21 cm away on the ORU
-            # itself that no wrist orientation could reach (g4u).
-            raise StageFailure("approach", "the arm cannot stand in front of this grasp from where the rover is "
-                                           f"(the grasp is {float(np.linalg.norm(state['p_base'] - self.tcp()[0])) * 100:.0f} cm "
-                                           f"from the tool, at {[round(float(v), 2) for v in state['p_base']]} in the rover frame)")
+            # No blind servo can establish an unreachable stand-off. Return the
+            # failed contact and its evidence; the caller decides the next operation.
+            reasons = [trial["blocked"] for trial in rec["tried"] if trial["blocked"]]
+            cause = ("observation_insufficient" if any(str(r).startswith("observation_insufficient") for r in reasons)
+                     else "collision" if reasons else "ik_no_solution")
+            self._evidence["decision_required"] = {
+                "cause": cause, "contact_preserved": True,
+                "scene": self._evidence["contact_scene"], "reasons": reasons,
+                "physical_unreachable_proven": False,
+            }
+            raise StageFailure("approach", f"{cause}: no executable insertion established for the selected contact; "
+                               "see scene, collision and observation evidence", local_retry=False)
         if blocked:
             raise StageFailure("approach", f"the tool cannot stand in front of this grasp without touching {blocked}")
         self.plan_to(q, "approach")
         self.wait(0.6)
         nf = self.frame(after=self._clock() - 0.05)
+        refresh_contact_frame()
         state["seen"] = nf.stamp  # the stand-off is on `view_dir` by construction: standing there does not redefine it
         R_c = nf.T_base_cam[:3, :3]
         p_cam = R_c.T @ (state["p_base"] - nf.T_base_cam[:3, 3])
@@ -652,10 +691,69 @@ class PickRskill(EyeInHandSkill):
         cv2.drawMarker(mark, (int(u), int(v)), (0, 255, 255), cv2.MARKER_CROSS, 24, 2)
         rec.update(stood=True, part_px=[round(u), round(v)], part_depth_m=round(float(p_cam[2]), 3),
                    tool=[round(float(x), 3) for x in self.tcp()[0]], image=self.save("standoff_pose.jpg", mark))
-        return PartTracker(nf.bgr, nf.depth, nf.K, seen, R_base_cam=R_c)
+        R_odom_cam = self.T("odom", "chassis_base_link")[:3, :3] @ R_c
+        return PartTracker(nf.bgr, nf.depth, nf.K, seen, R_base_cam=R_odom_cam)
+
+    def contact_path_observed(self, tool_points, tool_links, start, end, rotation) -> dict:
+        """Require measured free rays along the gripper's insertion, not absence of mesh triangles.
+
+        Collision checks still test actual geometry. This separate evidence check
+        treats occlusion/invalid pixels as unknown and never deletes target cells.
+        Sampling resolves the smallest feature supported by the gripper perception.
+        """
+        count = int(math.ceil(np.linalg.norm(end - start) / self.geom.min_part_width_m)) + 1
+        local = tool_points @ rotation.T
+        missing = total = permitted = 0
+        region, dimensions = self._contact_region
+        T_ob = self.T("odom", "chassis_base_link")
+        contact_links = np.isin(tool_links, self.geom.contact_links)
+        for point in np.linspace(start, end, count):
+            points = local + point
+            in_odom = points @ T_ob[:3, :3].T + T_ob[:3, 3]
+            local_region = (in_odom - region[:3, 3]) @ region[:3, :3]
+            expected_contact = contact_links & np.all(abs(local_region) <= dimensions / 2, axis=1)
+            observed = expected_contact.copy()
+            permitted += int(np.count_nonzero(expected_contact))
+            for frame in self._contact_views:
+                pc = (points - frame.T_base_cam[:3, 3]) @ frame.T_base_cam[:3, :3]
+                front = pc[:, 2] > self._self_depth
+                indices = np.flatnonzero(front & ~observed)
+                uv = pc[indices, :2] / pc[indices, 2, None]
+                uv = np.rint(uv * [frame.K[0, 0], frame.K[1, 1]] + [frame.K[0, 2], frame.K[1, 2]]).astype(int)
+                h, w = frame.depth.shape
+                inside = (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+                indices, uv = indices[inside], uv[inside]
+                measured = frame.depth[uv[:, 1], uv[:, 0]]
+                free = np.isfinite(measured) & (measured >= pc[indices, 2])
+                semantics = frame.depth_semantics or {}
+                if semantics.get("depth_axis") == "image_plane" and semantics.get("positive_infinity") == "beyond_far_clip":
+                    free |= (np.isposinf(measured) & (pc[indices, 2] >= float(semantics["near_m"]))
+                             & (pc[indices, 2] < float(semantics["far_m"])))
+                observed[indices] |= free
+            total += len(points)
+            missing += int(np.count_nonzero(~observed))
+        result = {"satisfied": missing == 0, "unobserved_samples": missing, "samples": total,
+                  "views": len(self._contact_views), "step_m": self.geom.min_part_width_m,
+                  "expected_contact_samples": permitted,
+                  "depth_semantics": [frame.depth_semantics for frame in self._contact_views]}
+        self._evidence["contact_path_observation"] = result
+        return result
 
     # ---- grasp + hold -----------------------------------------------------------------------------------------------------
     def grasp(self) -> float:
+        # Recheck the actual pose immediately before closure. A stalled servo or
+        # a nonempty jaw is not evidence that the selected contact was reached.
+        p, R = self.tcp()
+        gp, gR = self._closure_goal
+        position_error = float(np.linalg.norm(gp - p))
+        rotation_error = float(np.linalg.norm(mat_to_rotvec(gR @ R.T)))
+        valid = self._evidence["target_lock"]["status"] == "committed"
+        self._evidence["closure_precondition"] = {
+            "position_error_m": position_error, "rotation_error_rad": rotation_error,
+            "target_valid": valid, "satisfied": valid and position_error < 0.005 and rotation_error < 0.04,
+        }
+        if not self._evidence["closure_precondition"]["satisfied"]:
+            raise StageFailure("grasp", "selected contact pose not reached; jaws remain open", local_retry=False)
         self.stage("grasp")
         jaw = self.set_jaw(False, "grasp")
         self._evidence["jaw_closed_rad"] = round(jaw, 4)
@@ -734,25 +832,29 @@ class PickRskill(EyeInHandSkill):
         self._evidence["bring_in"] = {"from": [round(float(v), 3) for v in p], "in_by_m": best[1] if best else 0.0}
         if best is None:
             return
+
+        target = p + np.array([best[1], 0.0, 0.0])
+
+        def carrying():
+            self.working_on(self.tcp()[0])
+            return target, R
+
         try:
-            self.plan_to(best[0], "bring_in")
+            # A joint-goal plan constrains only its endpoint: it can turn the
+            # held object along the route. Use the same orientation-preserving,
+            # per-step collision-checked carry servo as place.
+            info = self.servo(carrying, "bring_in", **self.goal["carry_servo"])
+            self._evidence["bring_in"]["servo"] = info
             self._evidence["bring_in"]["tcp"] = [round(float(v), 3) for v in self.tcp()[0]]
         except StageFailure as exc:
             self._evidence["bring_in"]["why"] = exc.why
-
-    def back_off(self) -> None:
-        """Local retry: open, a short straight retreat along the tool axis, then back to the side-view posture."""
-        self.stage("back_off")
-        self.set_jaw(True, "back_off")
-        p, R = self.tcp()
-        try:
-            self.servo_twist(lambda: (p - R[:, 2] * 0.05, R), "back_off", tol_m=0.01, tol_rad=0.08, timeout_s=20.0)
-            self.plan_to(self._view_q, "back_off")
-        except StageFailure as exc:
-            # Getting back to where the chosen view was taken is a convenience for the next attempt, not a
-            # requirement: the next `find` takes its own views and its own posture. Ending the call on the way back
-            # rather than on the grasp is what happened in g5g, where the retreat stalled 5.7 cm out.
-            self._evidence.setdefault("back_off", []).append({"returned_to_view": False, "why": exc.why})
+        finally:
+            self.hold_here()
+        jaw = self.jaw()
+        self._evidence["bring_in"]["jaw_rad"] = round(jaw, 4)
+        if jaw <= JAW_EMPTY_MAX_RAD:
+            raise StageFailure("bring_in", f"the item slipped out during carry retraction (jaw {jaw:.3f} rad)",
+                               local_retry=False)
 
 
 #: the tool's own body and the outsides of its fingers, in the tool frame (x jaw axis, y up in the grip orientation,
@@ -853,32 +955,6 @@ def surface_heights(views: list[Frame], self_depth_m: float, cell_m: float = 0.0
     return out
 
 
-def item_cells(heights: dict, p_base: np.ndarray, cell_m: float = 0.05, step_m: float = 0.06,
-               max_cells: int = 600) -> set:
-    """The ground cells the item being grasped stands on: a flood fill out from the grasp point across cells whose
-    measured surface is within `step_m` of the neighbour it came from.
-
-    What a skill is working on is not an obstacle (F59) -- and what it is working on is a great deal larger than the
-    gripper-sized sphere that declaration covers. A handle that holds by interlock stands in its own payload's free
-    height, so reaching it puts the tool body out over the payload, and a 2.5-D height map cannot tell that from
-    driving the tool into it: in g5f the body was refused 2.3 cm "below" the ORU's own lid, 18 cm behind the grasp
-    and therefore outside the fixed radius the guard excluded (F61 §5). The fill stops at a real step -- the edge of
-    the stand, the drop to the ground -- so a neighbouring structure is still an obstacle."""
-    start = (int(p_base[0] // cell_m), int(p_base[1] // cell_m))
-    if start not in heights:
-        return set()
-    out, frontier = {start}, [start]
-    while frontier and len(out) < max_cells:
-        cx, cy = frontier.pop()
-        h = heights[(cx, cy)]
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            n = (cx + dx, cy + dy)
-            if n not in out and n in heights and abs(heights[n] - h) <= step_m:
-                out.add(n)
-                frontier.append(n)
-    return out
-
-
 def lowest_clearance(heights: dict, pts: np.ndarray, cell_m: float = 0.05,
                      except_near: tuple[np.ndarray, float] | None = None, except_cells: set | None = None):
     """The point standing least clear of what the cameras measured under it: (clearance, point, surface height)."""
@@ -938,4 +1014,3 @@ def moved_with_gripper(before: Frame, after: Frame, tool_mask: np.ndarray, self_
     med = float(np.median(mag))
     return {"item_moved_with_gripper": bool(med < 0.35 * expected), "median_flow_px": round(float(med), 1),
             "expected_flow_px": round(float(expected), 1), "near_pixels": int(near.sum())}
-

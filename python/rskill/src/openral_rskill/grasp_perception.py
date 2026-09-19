@@ -18,18 +18,19 @@ import base64
 import json
 import math
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 import cv2
 import numpy as np
 
-__all__ = ["Candidate", "GripperGeometry", "find_candidates", "render_candidates", "select_candidate", "associate", "upright", "PartTracker", "Region", "find_regions", "render_regions", "locate_region"]
+__all__ = ["Candidate", "GripperGeometry", "find_candidates", "refine_contact", "render_candidates", "select_candidate", "associate", "upright", "PartTracker", "Region", "find_regions", "render_regions", "locate_region"]
 
 
 @dataclass(frozen=True)
 class GripperGeometry:
     """The gripper's own dimensions (EG2-4C2 on the RM-75: ~66 mm opening, research repo F44)."""
 
+    contact_links: tuple[str, ...] = ("eg2_link5", "eg2_link6")  # distal jaw bodies; not drive linkages
     open_width_m: float = 0.066
     clearance_m: float = 0.010  # per side, between a finger and the grasped part when the jaws are open
     finger_width_m: float = 0.016  # finger thickness along the closing axis
@@ -65,6 +66,59 @@ def _free(z: np.ndarray, front: float, step: float) -> np.ndarray:
     """Pixels behind which a finger can pass: invalid returns (sky, out of range) or deeper than the part by `step`. The
     gripper's own pixels (masked to 0) are not free."""
     return ~np.isfinite(z) | (z >= front + step)
+
+
+def refine_contact(depth: np.ndarray, K: np.ndarray, candidate: Candidate,
+                   geom: GripperGeometry) -> tuple[Candidate, dict]:
+    """Measure the selected contact's tangent frame from its visible depth surface.
+
+    The image-plane closing axis is only a proposal. At an oblique view, assigning
+    the same depth to both edges rotates the jaws into the surface. Fit the local
+    surface inside the jaw span, then intersect the part's image direction with it.
+    This refines the same selected contact before commitment, never selects another.
+    """
+    center = np.array([candidate.u, candidate.v])
+    edge = np.diff(np.asarray(candidate.ends_px), axis=0)[0]
+    span = np.linalg.norm(edge)
+    closing_px = np.asarray(candidate.axis_cam[:2])
+    closing_px = closing_px / np.linalg.norm(closing_px)
+    along_px = np.array([-closing_px[1], closing_px[0]])
+    radius = int(math.ceil(max(span, geom.pad_height_m * K[1, 1] / candidate.depth_m)))
+    h, w = depth.shape
+    x0, x1 = max(0, int(candidate.u) - radius), min(w, int(candidate.u) + radius + 1)
+    y0, y1 = max(0, int(candidate.v) - radius), min(h, int(candidate.v) + radius + 1)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    delta = np.stack([xx - center[0], yy - center[1]], axis=-1)
+    z = depth[y0:y1, x0:x1]
+    inside = (abs(delta @ closing_px) < span / 2 - 1) & (
+        abs(delta @ along_px) < geom.pad_height_m * K[1, 1] / candidate.depth_m / 2)
+    inside &= np.isfinite(z) & (z > 0) & (abs(z - candidate.depth_m) < geom.depth_step_m)
+    z = z[inside]
+    points = np.stack([(xx[inside] - K[0, 2]) * z / K[0, 0],
+                       (yy[inside] - K[1, 2]) * z / K[1, 1], z], axis=1)
+    if len(points) < 3:
+        raise ValueError("selected contact has insufficient depth for a surface direction")
+    mean = points.mean(axis=0)
+    _, _, vectors = np.linalg.svd(points - mean, full_matrices=False)
+    normal = vectors[-1]
+    normal *= np.sign(normal[2])
+    rays = np.array([[(p[0] - K[0, 2]) / K[0, 0],
+                      (p[1] - K[1, 2]) / K[1, 1], 1.0]
+                     for p in (center - along_px, center + along_px)])
+    surface_points = rays * (np.dot(normal, mean) / (rays @ normal))[:, None]
+    part = surface_points[1] - surface_points[0]
+    part /= np.linalg.norm(part)
+    if np.dot(part, candidate.part_axis_cam) < 0:
+        part = -part
+    closing = np.cross(part, normal)
+    closing /= np.linalg.norm(closing)
+    if np.dot(closing, candidate.axis_cam) < 0:
+        closing = -closing
+    evidence = {"points": len(points), "normal_cam": normal.tolist(),
+                "plane_rms_m": float(np.sqrt(np.mean(((points - mean) @ normal) ** 2))),
+                "closing_correction_deg": math.degrees(math.acos(float(np.clip(
+                    np.dot(closing, candidate.axis_cam) / np.linalg.norm(candidate.axis_cam), -1, 1))))}
+    return replace(candidate, axis_cam=closing.tolist(), part_axis_cam=part.tolist()), evidence
 
 
 def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = GripperGeometry(),
@@ -131,7 +185,11 @@ def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = Gr
                     if rj - rl > 4:
                         break
                     continue
-                if rj > rl and abs((cj0 + cj1) - (cl0 + cl1)) / 2 <= 3 and abs(fj - fl) < 0.015:
+                # Follow both boundaries, not only the centreline: a narrow part
+                # and its wider mounting block can have the same centre. Joining
+                # them corrupts the measured contact span and can hide the narrow
+                # part from the candidates. Keep the existing contour tolerance.
+                if rj > rl and max(abs(cj0 - cl0), abs(cj1 - cl1)) <= 3 and abs(fj - fl) < 0.015:
                     chain.append(j)
                     last = j
             for j in chain:
@@ -449,8 +507,8 @@ class PartTracker:
     """Follows the chosen grasp in the wrist image while the tool moves towards it.
 
     Template matching around where the camera's own motion says the part must now be, with the template rescaled by the
-    change in depth. A generic re-detection every frame snaps onto whatever else the narrowing view shows once the
-    fingers cover the part (research repo F57); a template of the part itself does not."""
+    change in depth. The reference template remains fixed. A match is visibility evidence;
+    its score alone does not establish a new spatial contact point."""
 
     def __init__(self, frame_bgr: np.ndarray, depth: np.ndarray, K: np.ndarray, cand: Candidate, half_px: int = 28,
                  R_base_cam: np.ndarray | None = None) -> None:
@@ -461,23 +519,25 @@ class PartTracker:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         self.template = gray[self.v0 - half_px:self.v0 + half_px + 1, self.u0 - half_px:self.u0 + half_px + 1]
         self.depth = float(cand.depth_m)
+        self.reference_depth = self.depth
         self.width_m, self.axis_cam = cand.width_m, np.array(cand.axis_cam, float)
         self.part_axis_cam = np.array(cand.part_axis_cam, float)
         self.score, self.roll_deg, self.reject, self.covered = 1.0, 0.0, "", False
         self.last_px, self.last_score = (float(self.u0), float(self.v0)), 1.0
 
     def measure(self, frame_bgr: np.ndarray, depth: np.ndarray, predicted_cam: np.ndarray, search_px: int = 60,
-                min_score: float = 0.6, max_depth_jump_m: float = 0.03, refresh_score: float = 0.8,
+                min_score: float = 0.6, max_depth_jump_m: float = 0.03,
                 R_base_cam: np.ndarray | None = None, self_depth_m: float = 0.0,
                 predict_depth_min_score: float = 0.9):
         """Where the part is in this frame: (pixel, depth, score) or None. `predicted_cam` is its 3-D point in this
-        camera as the arm's own motion predicts it, `R_base_cam` the camera's orientation now.
+        camera as the arm's own motion predicts it, `R_base_cam` its orientation in the same fixed
+        reference frame used at construction (odom for pick).
 
         The template is corrected for the camera's own motion since it was taken: bigger by the change in depth, and
         turned by however much the camera has rolled about its viewing direction -- a grasp is approached with the tool
         rolled to the side the part is free on, which can be half a turn from the view it was chosen in, and no image of
-        the part survives that untouched. A confident match (`refresh_score`) then replaces the template with what the
-        part looks like now, which carries the slower change of viewing direction.
+        the part survives that untouched. The committed template and its reference distance stay fixed:
+        repeated high-score matches on adjacent uniform surfaces must not replace the selected feature.
 
         When the depth where the part should be reads the gripper's own body instead (nearer than `self_depth_m`, the
         robot's own reach in front of this camera), the part is not lost but covered by the hand that is reaching for
@@ -488,12 +548,16 @@ class PartTracker:
             return None
         pu = self.K[0, 0] * predicted_cam[0] / predicted_cam[2] + self.K[0, 2]
         pv = self.K[1, 1] * predicted_cam[1] / predicted_cam[2] + self.K[1, 2]
+        # Association stays inside the selected contact's projected extent. A
+        # fixed pixel search window can include an adjacent mounting block as
+        # the camera approaches; a high correlation there is not this contact.
+        search_px = min(search_px, self.width_m * self.K[0, 0] / (2 * float(predicted_cam[2])))
         here = depth_at(depth, pu, pv)
         if self_depth_m and here is not None and here < min(self_depth_m, float(predicted_cam[2]) - max_depth_jump_m):
             self.covered, self.reject = True, f"the gripper is in front of the part ({here:.2f} m)"
             self.last_px = (float(pu), float(pv))
             return None
-        scale = self.depth / max(float(predicted_cam[2]), 1e-6)
+        scale = self.reference_depth / max(float(predicted_cam[2]), 1e-6)
         roll_deg = 0.0
         if R_base_cam is not None and self.R_ref is not None:
             M = np.asarray(R_base_cam, float).T @ np.asarray(self.R_ref, float)  # the template's camera seen from this one
@@ -560,13 +624,7 @@ class PartTracker:
         self.reject, self.score = "", score
         if d is not None:  # an unranged frame keeps the last distance for the record; it returns None to the caller
             self.depth = d
-        best = score
-        if best >= refresh_score:
-            ui, vi = int(round(u)), int(round(v))
-            fresh = gray[vi - self.half:vi + self.half + 1, ui - self.half:ui + self.half + 1]
-            if fresh.shape == (2 * self.half + 1, 2 * self.half + 1):
-                self.template, self.R_ref = fresh, R_base_cam if R_base_cam is not None else self.R_ref
-        return np.array([u, v]), d, float(best)
+        return np.array([u, v]), d, float(score)
 
     def point_cam(self, pixel: np.ndarray, d: float) -> np.ndarray:
         return np.array([(pixel[0] - self.K[0, 2]) / self.K[0, 0] * d, (pixel[1] - self.K[1, 2]) / self.K[1, 1] * d, d])

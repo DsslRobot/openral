@@ -15,8 +15,8 @@ Action-goal lifecycle (CLAUDE.md §6.4 + the F1 design):
 2. **execute_cb** — instantiate/reuse a ``openral_runner.DeployRunner`` with the
    ``openral_runner.ROSPublishingHAL`` sink and the shared
    ``openral_world_state.WorldStateAggregator``; run until completion or ``deadline_s``.
-3. **cancel_cb** — drain the in-flight chunk (≤100 ms), then idle-hold the last commanded
-   joint state. Runner stays ``active``, ready for the next goal.
+3. **cancel_cb** — request cancellation; before finalizing, apply the skill's holding
+   actions and join its worker. Command acknowledgement does not prove physical rest.
 4. **/openral/estop + /openral/safety_status subscriptions** — defense in depth alongside
    ``safety_node`` (CLAUDE.md §1.5); aborts with ``failure_reason="safety_estop"`` /
    ``failure_kind=FAILURE_SAFETY_ESTOP`` and transitions to ``inactive``. OR-ed into one seam,
@@ -76,9 +76,6 @@ def _cuda_allocated_mb() -> float | None:
 # pass `openral_rskill.rSkill.from_pretrained`-shaped callables;
 # integration tests pass a real local-only resolver.
 SkillResolver = Callable[..., "rSkillBase"]
-
-# 100 ms cancel drain (F1 design).
-_CANCEL_DRAIN_S = 0.1
 
 # Runaway guard for the MoveIt approach replay; real MoveGroup
 # trajectories are far smaller (hundreds of points).
@@ -944,6 +941,7 @@ if _ROS2_AVAILABLE:
                 # resolved success flag.
                 episode_task = req.prompt or rskill_id
                 self._publish_episode_start(task_string=episode_task)
+                transition = "abort"
                 try:
                     try:
                         exit_reason = self._run_until_done_or_deadline(
@@ -957,8 +955,7 @@ if _ROS2_AVAILABLE:
                         result.success = False
                         result.failure_reason = f"safety_estop:{exc!s}"
                         result.failure_kind = _failure_kind_for_exception(exc)
-                        self._finalize_goal(goal_handle, "abort")
-                        self._reset_active_goal()
+                        transition = "abort"
                         return result
                     except ROSSafetyViolation:
                         # Never convert a safety violation into a soft failure_reason
@@ -980,8 +977,7 @@ if _ROS2_AVAILABLE:
                         result.success = False
                         result.failure_reason = f"{_kind}: {exc!s}"
                         result.failure_kind = _failure_kind_for_exception(exc)
-                        self._finalize_goal(goal_handle, "abort")
-                        self._reset_active_goal()
+                        transition = "abort"
                         return result
                     except Exception as exc:  # reason: torch inference
                         # errors (CUDA OOM, dtype/quantization mismatch) are raw
@@ -999,18 +995,15 @@ if _ROS2_AVAILABLE:
                         result.success = False
                         result.failure_reason = _reason
                         result.failure_kind = _failure_kind
-                        self._finalize_goal(goal_handle, "abort")
-                        self._reset_active_goal()
+                        transition = "abort"
                         return result
 
                     # Honour cancel — drain then idle-hold (F1 design).
                     if self._cancel_requested or goal_handle.is_cancel_requested:
-                        self._drain_and_idle_hold(skill)
                         result.success = False
                         result.failure_reason = "cancelled"
                         result.failure_kind = ExecuteRskill.Result.FAILURE_CANCELLED
-                        self._finalize_goal(goal_handle, "canceled")
-                        self._reset_active_goal()
+                        transition = "canceled"
                         return result
 
                     # A lapsed budget is a FAILURE, not a quiet success. Every
@@ -1023,29 +1016,39 @@ if _ROS2_AVAILABLE:
                     if exit_reason == "deadline":
                         _over = self._last_deadline_elapsed_s
                         _elapsed_txt = f"{_over:.1f}" if _over is not None else "?"
-                        self._drain_and_idle_hold(skill)
                         result.success = False
                         result.failure_reason = (
                             f"deadline_exceeded: elapsed={_elapsed_txt}s budget={deadline_s:.1f}s"
                         )
                         result.failure_kind = ExecuteRskill.Result.FAILURE_DEADLINE_MISSED
-                        self._finalize_goal(goal_handle, "abort")
-                        self._reset_active_goal()
+                        transition = "abort"
                         return result
 
                     result.success = True
                     result.failure_reason = ""
                     result.failure_kind = ExecuteRskill.Result.FAILURE_NONE
-                    self._finalize_goal(goal_handle, "succeed")
-                    self._reset_active_goal()
+                    transition = "succeed"
                     return result
                 finally:
-                    # the record must survive even a value the encoder does not know (a numpy scalar from a skill's
-                    # measurement): an unreadable field is better than an empty result
-                    result.evidence_json = json.dumps(skill.evidence(), default=str)
-                    self._publish_episode_end(
-                        task_string=episode_task, success=bool(result.success)
-                    )
+                    try:
+                        self._drain_and_idle_hold(skill)
+                    except Exception as exc:  # stopping failures must never finalize a successful goal
+                        result.success = False
+                        result.failure_reason = f"stop_failed: {type(exc).__name__}: {exc!s}"
+                        result.failure_kind = _failure_kind_for_exception(exc)
+                        transition = "abort"
+                        span.record_exception(exc)
+                        self.get_logger().error(result.failure_reason)
+                        if isinstance(exc, ROSSafetyViolation):
+                            raise
+                    finally:
+                        self._finalize_goal(goal_handle, transition)
+                        self._reset_active_goal()
+                        # Preserve evidence and the episode boundary even when stopping raises.
+                        result.evidence_json = json.dumps(skill.evidence(), default=str)
+                        self._publish_episode_end(
+                            task_string=episode_task, success=bool(result.success)
+                        )
 
         # ── Internal helpers ─────────────────────────────────────────────────
 
@@ -1303,10 +1306,15 @@ if _ROS2_AVAILABLE:
                 chunk_index += 1
 
                 feedback = ExecuteRskill.Feedback()
-                feedback.progress = (
-                    min((self._now() - start) / deadline_s, 1.0) if deadline_s > 0.0 else 0.0
-                )
+                # Elapsed budget is not task progress. Staged skills report the
+                # physical phase; zero retains the legacy unknown sentinel.
+                feedback.progress = 0.0
                 feedback.state = "executing"
+                stages = skill.evidence().get("stages", [])
+                if stages:
+                    event = dict(stages[-1], seq=len(stages))
+                    feedback.state = event["stage"]
+                    feedback.evidence_json = json.dumps(event, default=str)
                 feedback.chunk_index = chunk_index
                 feedback.chunks_total = 0  # unknown — rskills are open-loop
                 try:
@@ -1704,18 +1712,24 @@ if _ROS2_AVAILABLE:
                 self.destroy_client(client)
 
         def _drain_and_idle_hold(self, skill: rSkillBase) -> None:
-            """Honour the F1 cancel semantics: ≤100 ms drain + idle-hold.
+            """Quiesce background work after applying explicit holding actions.
 
-            For Day-1 we wait the configured drain window with a short
-            sleep — the runner does not currently re-publish a hold
-            chunk because the HAL lifecycle node (commit 3 — added in
-            this PR's HAL consumer wiring) latches the last `safe_action`
-            and brakes on `/openral/estop` independently. When the C++
-            kernel lands and we route through it, this method republishes
-            a single ``ActionChunk`` with the last commanded row.
+            HAL acknowledgement proves command application, not physical rest;
+            the evidence keeps these claims separate.
             """
-            del skill
-            time.sleep(_CANCEL_DRAIN_S)
+            actions = []
+            try:
+                actions = skill.stop_actions(self._aggregator.snapshot())
+                if self._safety_abort_reason() is None:
+                    for action in actions:
+                        self._hal.send_action(action)
+                    if actions:
+                        skill.evidence()["stop"]["hold_command_applied"] = True
+            finally:
+                skill.finish_stop()
+            if actions:
+                state = self._aggregator.snapshot()
+                skill.evidence()["stop"]["joint_velocity_rad_s"] = list(state.joint_state.velocity)
 
         def _publish_episode_start(self, *, task_string: str) -> None:
             """Publish an Episode(PHASE_START) marker. No-op if unconfigured."""

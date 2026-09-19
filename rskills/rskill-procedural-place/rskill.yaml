@@ -17,6 +17,10 @@ actuators_required:
     control_mode_semantics:
       mode: "absolute"
       reference_frame: "chassis_base_link"
+  - kind: "joint_position"
+    control_mode_semantics:
+      mode: "absolute"
+      joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
   - kind: "gripper_binary"
     control_mode_semantics:
       mode: "absolute"
@@ -42,9 +46,11 @@ procedural:
   default_goal_json: |
     {
       "support": "",
+      "release_constraint": "unconstrained",
       "support_xyz_map": [0.0, 0.0, 0.0],
       "evidence_dir": "/tmp/openral_evidence",
       "carry_speed_m_s": 0.05,
+      "carry_servo": {"tol_m": 0.01, "tol_rad": 0.05, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0},
       "lower_speed_m_s": 0.02,
       "min_tool_above_support_m": 0.15,
       "contact_confirm_s": 0.6,
@@ -57,4 +63,8 @@ goal_params_schema:
   type: object
   properties:
     support: {type: string, description: "where to set the held item down"}
+    release_constraint:
+      type: string
+      enum: [unconstrained, below_overhang]
+      description: "For a side grasp below an overhang, withdraw parallel to the horizontal support before lifting."
   required: ["support"]

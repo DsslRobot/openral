@@ -15,6 +15,7 @@
   sensor bridge publishes) is a fixed link so a goal can constrain the TCP directly.
 -->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include filename="eg2_collision.xacro"/>
   <xacro:macro name="lunarbot_body">
     <link name="chassis_base_link">
       <!-- deck slab: the chassis collision box, x +-0.661, y +-0.336, z 0.485..0.612 -->
@@ -67,30 +68,12 @@
     <xacro:passive_joint name="front_right_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
     <xacro:passive_joint name="rear_left_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
     <xacro:passive_joint name="rear_right_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
-    <xacro:passive_joint name="eg2_joint1" parent="Link7" lower="-0.9" upper="0.9"/>
-    <xacro:passive_joint name="eg2_joint2" parent="Link7" lower="-0.9" upper="0.9"/>
-    <xacro:passive_joint name="eg2_joint3" parent="Link7" lower="-0.9" upper="0.9"/>
-    <xacro:passive_joint name="eg2_joint4" parent="Link7" lower="-0.9" upper="0.9"/>
-    <xacro:passive_joint name="eg2_joint5" parent="Link7" lower="-0.9" upper="0.9"/>
-    <xacro:passive_joint name="eg2_joint6" parent="Link7" lower="-0.9" upper="0.9"/>
+    <xacro:eg2_collision_model />
 
     <joint name="chassis_to_arm_mount" type="fixed">
       <parent link="chassis_base_link"/>
       <child link="base_link"/>
       <origin xyz="-0.4475 0 0.727" rpy="0 0 0"/>
-    </joint>
-
-    <!-- EG2-4C2 gripper: body + open jaws bound, in Link7's frame (jaws spread along tool x, 0.143 m long) -->
-    <link name="eg2_gripper">
-      <collision name="gripper">
-        <origin xyz="0 0 0.0715" rpy="0 0 0"/>
-        <geometry><box size="0.092 0.03 0.143"/></geometry>
-      </collision>
-    </link>
-    <joint name="link7_to_gripper" type="fixed">
-      <parent link="Link7"/>
-      <child link="eg2_gripper"/>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
     </joint>
 
     <!-- tool centre point: Link7 + _TCP_OFFSET (SRB lunarbot.py / sensor bridge `tcp_frame`) -->

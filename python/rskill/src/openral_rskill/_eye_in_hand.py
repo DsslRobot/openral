@@ -120,6 +120,7 @@ class Frame:
     T_base_cam: np.ndarray  # 4x4, camera optical frame in chassis_base_link at grab time
     frame_id: str = ""
     arm_links: np.ndarray | None = None  # where the arm's own links were when the frame was taken (self-filtering)
+    depth_semantics: dict | None = None  # sensor-sourced range/no-return meaning; absent means unknown
 
     @property
     def up_cam(self) -> np.ndarray:
@@ -138,6 +139,8 @@ class WristRGBD:
     (research repo F58)."""
 
     def __init__(self, node: Any, camera: str = "wrist") -> None:
+        import json
+        from std_msgs.msg import String
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import CameraInfo, Image
 
@@ -145,11 +148,14 @@ class WristRGBD:
         self._rgb: dict[float, Any] = {}
         self._depth: dict[float, Any] = {}
         self._info = None
+        self.depth_semantics = None
         stamp = lambda m: m.header.stamp.sec + m.header.stamp.nanosec * 1e-9  # noqa: E731
         self._subs = [
             node.create_subscription(Image, f"/openral/cameras/{camera}/image", lambda m: self._put(self._rgb, stamp(m), m), qos_profile_sensor_data),
             node.create_subscription(Image, f"/openral/cameras/{camera}_depth/image", lambda m: self._put(self._depth, stamp(m), m), qos_profile_sensor_data),
             node.create_subscription(CameraInfo, f"/openral/cameras/{camera}/camera_info", lambda m: setattr(self, "_info", m), qos_profile_sensor_data),
+            node.create_subscription(String, f"/openral/cameras/{camera}/depth_semantics",
+                                     lambda m: setattr(self, "depth_semantics", json.loads(m.data)), qos_profile_sensor_data),
         ]
 
     def _put(self, store: dict, t: float, m: Any) -> None:
@@ -197,10 +203,13 @@ class EyeInHandSkill(rSkillBase):
         self.goal: dict[str, Any] = {}
         self._evidence: dict[str, Any] = {}
         self._cmd_lock = threading.Lock()
+        self._stop_requested = threading.Event()
         self._final_sent = False
         self._twist: tuple | None = None
         self._joints: tuple[float, ...] | None = None
-        self._jaw_open = True
+        # A new arm operation must preserve a held object. Gripper commands begin
+        # only when the procedure explicitly calls set_jaw (e.g. place's release).
+        self._jaw_open: bool | None = None
         self._q: dict[str, float] = {}
         self._done: BaseException | None | bool = None
         self._worker: threading.Thread | None = None
@@ -217,8 +226,10 @@ class EyeInHandSkill(rSkillBase):
         self.goal = {**json.loads(self.manifest.procedural.default_goal_json), **json.loads(self._goal_params_json or "{}")}
 
     def _activate_impl(self) -> None:
+        self._stop_requested.clear()
         self._evidence = {"stages": []}
         self._done, self._final_sent, self._q, self._twist = None, False, {}, None
+        self._jaw_open = None
         # the wrist camera belongs to the robot, not to one call: one subscriber per node, kept for its life. Creating
         # it per skill and destroying it on shutdown raced the executor -- a subscription destroyed while the executor
         # held it in its wait set killed the runner with InvalidHandle, and with it every later skill (F57).
@@ -238,10 +249,37 @@ class EyeInHandSkill(rSkillBase):
         self._worker.start()
 
     def _deactivate_impl(self) -> None:
-        pass
+        self._stop_requested.set()
+        self.finish_stop()
 
     def _shutdown_impl(self) -> None:
-        pass  # the camera subscriptions live on the node and outlive every skill instance (see _activate_impl)
+        self._stop_requested.set()
+        self.finish_stop()
+
+    def stop_actions(self, world_state) -> list[Action]:
+        self._q = joint_positions_by_name(world_state)
+        with self._cmd_lock:
+            self._stop_requested.set()
+            self._joints, self._twist = tuple(self.arm_q()), None
+            actions = self._command_actions()
+        self._evidence["stop"] = {"requested": True, "worker_stopped": False,
+                                  "arm_hold_rad": list(self._joints),
+                                  "jaw_command_open": self._jaw_open,
+                                  "physical_stop_confirmed": False}
+        return actions
+
+    def finish_stop(self) -> None:
+        if self._worker is not None:
+            self._worker.join()
+        self._evidence.setdefault("stop", {})["worker_stopped"] = True
+
+    def _check_stop(self) -> None:
+        if self._stop_requested.is_set():
+            raise StageFailure("stopping", "operation stopped", local_retry=False)
+
+    def _sleep(self, seconds: float) -> None:
+        self._stop_requested.wait(seconds)
+        self._check_stop()
 
     def evidence(self) -> dict:
         return self._evidence
@@ -249,7 +287,7 @@ class EyeInHandSkill(rSkillBase):
     def _run(self) -> None:
         try:
             while not self._q:  # the first joint reading arrives with the first control tick
-                time.sleep(0.01)
+                self._sleep(0.01)
             self.hold_here()
             self.procedure()
             self._done = True
@@ -272,63 +310,97 @@ class EyeInHandSkill(rSkillBase):
             raise ROSRuntimeError(f"{self.name} failed at stage {self._evidence.get('failed_stage')}: {self._evidence.get('why')}")
         done = self._done is not None
         with self._cmd_lock:
-            joints, twist, jaw_open = self._joints, self._twist, self._jaw_open
-        out = [Action(control_mode=ControlMode.GRIPPER_BINARY, horizon=1, gripper=[1.0 if jaw_open else 0.0])]
+            out = self._command_actions()
+        self._final_sent = done
+        return out
+
+    def _command_actions(self) -> list[Action]:
+        joints, twist, jaw_open = self._joints, self._twist, self._jaw_open
+        out = []
+        if jaw_open is not None:
+            out.append(Action(control_mode=ControlMode.GRIPPER_BINARY, horizon=1, gripper=[1.0 if jaw_open else 0.0]))
         if joints is not None:  # planned paths and postures are commanded in joint space; the last target holds the arm
             out.insert(0, Action(control_mode=ControlMode.JOINT_POSITION, horizon=1, joint_names=list(ARM_JOINT_NAMES),
                                  joint_targets=[full_width_joint_row(self.description, dict(zip(ARM_JOINT_NAMES, joints)))]))
         elif twist is not None:  # short precise moves are commanded as a tool twist (the arm tracks it to millimetres)
             out.insert(0, Action(control_mode=ControlMode.CARTESIAN_TWIST, horizon=1, cartesian_twist=[twist], frame_id=BASE_FRAME_ID))
-        self._final_sent = done
         return out
 
     # ---- commands (worker side) -----------------------------------------------------------------------------------
     def set_twist(self, twist) -> None:
         with self._cmd_lock:
+            self._check_stop()
             self._twist, self._joints = tuple(float(v) for v in twist), None
 
     def hold_here(self) -> None:
         with self._cmd_lock:
             self._joints, self._twist = tuple(self.arm_q()), None
 
-    #: the space the tool itself takes up about its TCP, from the gripper's own points (`procedural_pick.BODY_POINTS`)
-    TOOL_RADIUS_M = 0.105
+    def contact_scene(self, prepare: bool) -> None:
+        """Acquire/release an applied shared scene for one stationary contact operation."""
+        import json
+        from std_srvs.srv import Trigger
+
+        name = "/space/prepare_contact_scene" if prepare else "/space/release_contact_scene"
+        client = self._node.create_client(Trigger, name)
+        try:
+            if not client.wait_for_service(timeout_sec=30.0):
+                raise StageFailure("contact_scene", f"scene service unavailable: {name}", local_retry=False)
+            future = client.call_async(Trigger.Request())
+            started = time.monotonic()
+            while not future.done():
+                if time.monotonic() - started > 30.0:
+                    raise StageFailure("contact_scene", "scene acknowledgement not received", local_retry=False)
+                time.sleep(0.01)  # also complete release when cancellation is already set
+            result = future.result()
+            if not result.success:
+                raise StageFailure("contact_scene", result.message, local_retry=False)
+            self._contact_scene_owned = prepare
+            self._evidence["contact_scene" if prepare else "contact_scene_release"] = (
+                json.loads(result.message) if prepare else result.message)
+        finally:
+            self._node.destroy_client(client)
+
+    def contact_permission(self, phase: str, region=None, dimensions=None, evidence_ref="") -> None:
+        """Apply a phase-scoped contact declaration and retain the consumer acknowledgement."""
+        import json
+        from openral_msgs.srv import ConfigureContact
+
+        client = self._node.create_client(ConfigureContact, "/space/configure_contact")
+        try:
+            if not client.wait_for_service(timeout_sec=30.0):
+                raise StageFailure("contact_scene", "contact permission service unavailable", local_retry=False)
+            request = ConfigureContact.Request(phase=phase, evidence_ref=evidence_ref)
+            if region is not None:
+                request.region.header.frame_id = "odom"
+                request.region.pose.position.x, request.region.pose.position.y, request.region.pose.position.z = map(float, region[:3, 3])
+                q = mat_to_quat(region[:3, :3])
+                orientation = request.region.pose.orientation
+                orientation.x, orientation.y, orientation.z, orientation.w = q
+                request.dimensions.x, request.dimensions.y, request.dimensions.z = map(float, dimensions)
+            future = client.call_async(request)
+            started = time.monotonic()
+            while not future.done():
+                if time.monotonic() - started > 30.0:
+                    raise StageFailure("contact_scene", "contact permission acknowledgement missing", local_retry=False)
+                time.sleep(0.01)  # revoke remains possible after cancellation
+            result = future.result()
+            self._evidence.setdefault("contact_permissions", []).append(json.loads(result.evidence_json))
+            if not result.success:
+                raise StageFailure("contact_scene", result.evidence_json, local_retry=False)
+        finally:
+            self._node.destroy_client(client)
 
     def working_on(self, p_base: np.ndarray | None) -> None:
-        """Say which piece of the world this skill is about to have its tool inside.
-
-        The world model puts what the cameras measure standing in the arm's work zone into the planner's scene, so the
-        arm goes round the things no map knows about (`openral_ext/planning_scene`). The thing being picked up is one
-        of those things -- and an obstacle the planner will not let the tool touch is an item the robot can never take
-        hold of: with the ORU in the measured scene, no arm configuration was allowed to put the tool at its handle,
-        while the same pose solved the moment the measurement was dropped (research repo F58).
-
-        So a skill that is working on something says where: a sphere the size of the tool itself, about the point the
-        tool is going to occupy. Inside it the measurement is not an obstacle -- it is the job. Outside it nothing
-        changes. `None` clears the declaration, and the world model drops one that stops being renewed."""
-        from geometry_msgs.msg import Pose
-        from moveit_msgs.msg import CollisionObject
-        from shape_msgs.msg import SolidPrimitive
-
-        pub = getattr(self._node, "_working_on_pub", None)
-        if pub is None:
-            pub = self._node.create_publisher(CollisionObject, "/space/manipulation_target", 1)
-            self._node._working_on_pub = pub
-        o = CollisionObject()
-        o.header.frame_id, o.id = BASE_FRAME_ID, "tool/working_on"
-        o.header.stamp = self._node.get_clock().now().to_msg()
+        """Record the operation target; never delete its geometry from collision checks."""
         if p_base is None:
-            o.operation = CollisionObject.REMOVE
+            if getattr(self, "_contact_scene_owned", False):
+                self.contact_scene(False)
         else:
-            o.operation = CollisionObject.ADD
-            o.primitives.append(SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[self.TOOL_RADIUS_M]))
-            pose = Pose()
-            pose.position.x, pose.position.y, pose.position.z = (float(v) for v in p_base)
-            pose.orientation.w = 1.0
-            o.primitive_poses.append(pose)
-        pub.publish(o)
+            self._evidence["operation_target_base_m"] = list(map(float, p_base))
 
     def stage(self, name: str, **info) -> dict:
+        self._check_stop()
         rec = {"stage": name, "t_sim": round(self._clock() - self.t0, 2), **info}
         self._evidence["stage"] = name
         self._evidence["stages"].append(rec)
@@ -337,7 +409,7 @@ class EyeInHandSkill(rSkillBase):
     def wait(self, sim_s: float) -> None:
         t = self._clock()
         while self._clock() - t < sim_s:
-            time.sleep(0.01)
+            self._sleep(0.01)
 
     def jaw(self) -> float:
         return float(self._q.get(GRIPPER_JOINT_NAME, float("nan")))
@@ -362,7 +434,7 @@ class EyeInHandSkill(rSkillBase):
                 break
             if self._clock() - t > timeout_s:
                 raise StageFailure(self._evidence.get("stage", "?"), "no wrist camera frames")
-            time.sleep(0.01)
+            self._sleep(0.01)
         stamp, rgb, dm = got
         info = self.camera._info
         depth = np.frombuffer(dm.data, np.float32).reshape(dm.height, dm.width).copy()
@@ -371,7 +443,8 @@ class EyeInHandSkill(rSkillBase):
         tool = (T_now[:3, :3] @ np.array([[0.0, 0.0, z] for z in (0.0, 0.05, 0.10)]).T).T + T_now[:3, 3]
         links = np.vstack([links, tool])
         return Frame(bgr=image_to_bgr(rgb), depth=depth, K=np.array(info.k, float).reshape(3, 3), stamp=stamp,
-                     T_base_cam=self.T(BASE_FRAME_ID, rgb.header.frame_id), frame_id=rgb.header.frame_id, arm_links=links)
+                     T_base_cam=self.T(BASE_FRAME_ID, rgb.header.frame_id), frame_id=rgb.header.frame_id, arm_links=links,
+                     depth_semantics=self.camera.depth_semantics)
 
     def save(self, name: str, img: np.ndarray) -> str:
         path = self.evidence_dir / name
@@ -381,6 +454,7 @@ class EyeInHandSkill(rSkillBase):
     def set_jaw(self, open_: bool, stage: str, timeout_s: float = 8.0) -> float:
         """Open or close the jaws and wait until they stop; returns the jaw angle."""
         with self._cmd_lock:
+            self._check_stop()
             self._jaw_open = open_
         t, hist = self._clock(), []
         while self._clock() - t < timeout_s:
@@ -404,6 +478,7 @@ class EyeInHandSkill(rSkillBase):
         while self._clock() - t0 < timeout_s:
             a = min(1.0, (self._clock() - t0) * rate_rad_s / max(span, 1e-6))
             with self._cmd_lock:
+                self._check_stop()
                 self._joints = tuple(float(v) for v in q0 + (q - q0) * a)
             self.wait(0.05)
             if a >= 1.0 and np.max(np.abs(np.array(self.arm_q()) - q)) < tol_rad:
@@ -427,8 +502,11 @@ class EyeInHandSkill(rSkillBase):
         req = GetPositionIK.Request()
         r = req.ik_request
         r.group_name, r.ik_link_name, r.avoid_collisions = "rm_group", TCP_FRAME_ID, True
-        r.robot_state.joint_state.name = list(ARM_JOINT_NAMES)
-        r.robot_state.joint_state.position = [float(v) for v in seed]
+        r.robot_state.joint_state.name = list(self._q)
+        r.robot_state.joint_state.position = [float(self._q[j]) for j in self._q]
+        for joint, value in zip(ARM_JOINT_NAMES, seed):
+            r.robot_state.joint_state.position[r.robot_state.joint_state.name.index(joint)] = float(value)
+        r.robot_state.is_diff = True
         r.pose_stamped.header.frame_id = BASE_FRAME_ID
         r.pose_stamped.pose.position.x, r.pose_stamped.pose.position.y, r.pose_stamped.pose.position.z = (float(v) for v in p)
         q = mat_to_quat(R)
@@ -445,8 +523,9 @@ class EyeInHandSkill(rSkillBase):
         while not fut.done():
             if time.monotonic() - t > 5.0:
                 raise StageFailure(self._evidence.get("stage", "?"), "the arm's inverse kinematics service did not answer")
-            time.sleep(0.005)
+            self._sleep(0.005)
         res = fut.result()
+        self._evidence["last_ik"] = {"error_code": int(res.error_code.val), "goal_m": list(map(float, p))}
         if res.error_code.val != 1:
             return None
         js = res.solution.joint_state
@@ -473,7 +552,7 @@ class EyeInHandSkill(rSkillBase):
         while not fut.done():
             if time.monotonic() - t > 5.0:  # every service call ends, or the stage does: a wedged planner is a failure
                 raise StageFailure(self._evidence.get("stage", "?"), "the arm's forward kinematics service did not answer")
-            time.sleep(0.005)
+            self._sleep(0.005)
         res = fut.result()
         by_name = dict(zip(res.fk_link_names, res.pose_stamped))
         ps = by_name[TCP_FRAME_ID].pose
@@ -530,17 +609,73 @@ class EyeInHandSkill(rSkillBase):
             if not self._valid_client.wait_for_service(timeout_sec=30.0):
                 raise StageFailure(self._evidence.get("stage", "?"), "the arm's state validity service is not available")
         req = GetStateValidity.Request()
-        req.group_name = "rm_group"
-        req.robot_state.joint_state.name = list(ARM_JOINT_NAMES)
-        req.robot_state.joint_state.position = [float(v) for v in q]
+        # Whole-robot validation includes the measured articulated gripper, not
+        # just the arm's planning group or an implicit zero-width jaw state.
+        req.robot_state.joint_state.name = list(self._q)
+        req.robot_state.joint_state.position = [float(self._q[j]) for j in self._q]
+        for joint, value in zip(ARM_JOINT_NAMES, q):
+            req.robot_state.joint_state.position[req.robot_state.joint_state.name.index(joint)] = float(value)
         req.robot_state.is_diff = True
         fut = self._valid_client.call_async(req)
         while not fut.done():
-            time.sleep(0.005)
-        return bool(fut.result().valid)
+            self._sleep(0.005)
+        result = fut.result()
+        self._evidence["last_state_validity"] = {
+            "valid": bool(result.valid),
+            "contacts": [{"body1": c.contact_body_1, "body2": c.contact_body_2,
+                          "depth_m": float(c.depth), "frame": c.header.frame_id,
+                          "position_m": [float(getattr(c.position, axis)) for axis in "xyz"],
+                          "normal": [float(getattr(c.normal, axis)) for axis in "xyz"]}
+                         for c in result.contacts],
+            "joint_positions": dict(zip(req.robot_state.joint_state.name,
+                                         req.robot_state.joint_state.position)),
+        }
+        return bool(result.valid)
 
     def arm_q(self) -> list[float]:
         return [float(self._q[j]) for j in ARM_JOINT_NAMES]
+
+    def gripper_surface_points(self, with_links: bool = False):
+        """Current articulated collision-mesh vertices in TCP coordinates, from the robot model."""
+        from ament_index_python.packages import get_package_share_directory
+        from moveit_msgs.srv import GetPositionFK
+
+        directory = Path(get_package_share_directory("rm_75_config")) / "meshes/eg2"
+        paths = sorted(directory.glob("*.stl"))
+        if not paths:
+            raise StageFailure("contact_geometry", "robot gripper collision meshes unavailable", local_retry=False)
+        request = GetPositionFK.Request()
+        request.header.frame_id = BASE_FRAME_ID
+        request.fk_link_names = [p.stem for p in paths] + [TCP_FRAME_ID]
+        request.robot_state.joint_state.name = list(self._q)
+        request.robot_state.joint_state.position = list(map(float, self._q.values()))
+        request.robot_state.is_diff = True
+        client = self._node.create_client(GetPositionFK, "/compute_fk")
+        try:
+            if not client.wait_for_service(timeout_sec=30.0):
+                raise StageFailure("contact_geometry", "robot FK service unavailable", local_retry=False)
+            future = client.call_async(request)
+            while not future.done():
+                self._sleep(0.005)
+            result = future.result()
+        finally:
+            self._node.destroy_client(client)
+        if result.error_code.val != 1:
+            raise StageFailure("contact_geometry", "gripper FK failed", local_retry=False)
+        points, point_links = [], []
+        tcp = result.pose_stamped[-1].pose
+        q = tcp.orientation
+        R_tcp = quat_to_mat(q.x, q.y, q.z, q.w)
+        p_tcp = np.array([tcp.position.x, tcp.position.y, tcp.position.z])
+        dtype = np.dtype([("normal", "<f4", (3,)), ("vertices", "<f4", (3, 3)), ("attribute", "<u2")])
+        for path, pose in zip(paths, result.pose_stamped[:-1]):
+            triangles = np.frombuffer(path.read_bytes(), dtype=dtype, offset=84)
+            vertices = np.unique(triangles["vertices"].reshape(-1, 3), axis=0)
+            o, p = pose.pose.orientation, pose.pose.position
+            in_base = vertices @ quat_to_mat(o.x, o.y, o.z, o.w).T + [p.x, p.y, p.z]
+            points.append((in_base - p_tcp) @ R_tcp)
+            point_links.extend([path.stem] * len(vertices))
+        return (np.vstack(points), np.asarray(point_links)) if with_links else np.vstack(points)
 
     def plan_to(self, q_goal, stage: str, tol_rad: float = 0.02, rate_rad_s: float = 0.5) -> dict:
         """Plan a collision-free path to a configuration with the robot's own planner (MoveIt, the same one the
@@ -572,7 +707,7 @@ class EyeInHandSkill(rSkillBase):
         while not fut.done():
             if time.monotonic() - t > 60.0:
                 raise StageFailure(stage, "the arm's motion planning service did not answer")
-            time.sleep(0.01)
+            self._sleep(0.01)
         res = fut.result().motion_plan_response
         if res.error_code.val != 1 or not res.trajectory.joint_trajectory.points:
             raise StageFailure(stage, f"no collision-free path to that arm posture (planner error {res.error_code.val})")
@@ -585,8 +720,9 @@ class EyeInHandSkill(rSkillBase):
         for pt in pts:
             due = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
             while self._clock() - t0 < due:
-                time.sleep(0.01)
+                self._sleep(0.01)
             with self._cmd_lock:
+                self._check_stop()
                 self._joints = tuple(float(pt.positions[i]) for i in order)
         # the planned path ends where it ends: a few degrees of tracking error are not a failure (the visual servo and the
         # measured tool pose take it from here)
@@ -660,7 +796,8 @@ class EyeInHandSkill(rSkillBase):
     def servo(self, goal: Callable[[], tuple[np.ndarray, np.ndarray] | None], stage: str, *, tol_m: float, tol_rad: float,
               max_joint_rate_rad_s: float = 0.3, timeout_s: float = 40.0, stall_s: float = 4.0, settle_cycles: int = 3,
               step_m: float = 0.04, step_rad: float = 0.2, guard: Callable[[np.ndarray], str] | None = None,
-              null_objective: Callable[[np.ndarray], np.ndarray] | None = None) -> dict:
+              null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
+              max_speed_m_s: float | None = None) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
         servoing); `goal()` returning None keeps the last goal. Each cycle the goal, corrected by the integral of the
         remaining position error (arm sag under a load), goes through the arm's inverse kinematics on its working branch
@@ -713,6 +850,8 @@ class EyeInHandSkill(rSkillBase):
             # move the tool a short way along the straight line to the goal, through the Jacobian: a step, not a new
             # arm configuration
             dx = (e + integ) * min(1.0, step_m / max(en, 1e-6))
+            if max_speed_m_s is not None:
+                dx *= min(1.0, max_speed_m_s * dt / max(float(np.linalg.norm(dx)), 1e-9))
             dw = r * min(1.0, step_rad / max(rn, 1e-6))
             q_meas = np.array(self.arm_q())
             q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt,
@@ -728,6 +867,7 @@ class EyeInHandSkill(rSkillBase):
             else:
                 blocked, q_cmd = 0, q_next
                 with self._cmd_lock:
+                    self._check_stop()
                     self._joints = tuple(float(v) for v in q_cmd)
             if len(trace) < 60 and now - (trace[-1]["t"] if trace else -1) > 0.5:
                 trace.append({"t": round(now - t0, 1), "tcp": [round(float(v), 3) for v in p], "goal": [round(float(v), 3) for v in gp],
@@ -743,5 +883,6 @@ class EyeInHandSkill(rSkillBase):
             return None
         q_cmd = q_cmd + np.clip(np.array(q_goal) - q_cmd, -max_dq, max_dq)
         with self._cmd_lock:
+            self._check_stop()
             self._joints = tuple(float(v) for v in q_cmd)
         return q_cmd

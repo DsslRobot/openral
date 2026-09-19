@@ -58,8 +58,12 @@
     <disable_collisions link1="chassis_base_link" link2="Link1" reason="Never"/>
     <disable_collisions link1="chassis_base_link" link2="Link2" reason="Never"/>
     <disable_collisions link1="chassis_base_link" link2="Link3" reason="Never"/>
-    <disable_collisions link1="eg2_gripper" link2="Link7" reason="Adjacent"/>
-    <disable_collisions link1="eg2_gripper" link2="Link6" reason="Never"/>
-    <disable_collisions link1="eg2_gripper" link2="Link5" reason="Never"/>
-    <disable_collisions link1="eg2_gripper" link2="Link4" reason="Never"/>
+    <!-- Authored USD joint pairs have physics:collisionEnabled=false. No target exemptions. -->
+    <disable_collisions link1="eg2_base" link2="Link7" reason="Adjacent"/>
+    <disable_collisions link1="eg2_base" link2="eg2_link1" reason="Adjacent"/>
+    <disable_collisions link1="eg2_base" link2="eg2_link2" reason="Adjacent"/>
+    <disable_collisions link1="eg2_base" link2="eg2_link3" reason="Adjacent"/>
+    <disable_collisions link1="eg2_base" link2="eg2_link4" reason="Adjacent"/>
+    <disable_collisions link1="eg2_link1" link2="eg2_link5" reason="Adjacent"/>
+    <disable_collisions link1="eg2_link4" link2="eg2_link6" reason="Adjacent"/>
 </robot>

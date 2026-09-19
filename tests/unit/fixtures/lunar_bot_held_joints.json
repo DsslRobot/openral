@@ -1,0 +1,16 @@
+{
+  "source": "Space_Robot_Harness artifacts/runs/g5m/capability_server.log: successful pick",
+  "arm": {
+    "posture": "other",
+    "joints_rad": [
+      0.626,
+      0.392,
+      -0.579,
+      -2.318,
+      0.104,
+      0.258,
+      1.276
+    ],
+    "jaw_rad": 0.169
+  }
+}
