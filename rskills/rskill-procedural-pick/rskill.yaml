@@ -84,4 +84,5 @@ goal_params_schema:
   properties:
     target: {type: string, description: "the item to pick, described in words"}
     part: {type: string, description: "the part to hold it by, described in words"}
+    held_item: {type: object, description: "catalogue envelope of the carried item (size_m, handle_above_base_m, neck_height_m), from the boundary"}
   required: ["target", "part"]

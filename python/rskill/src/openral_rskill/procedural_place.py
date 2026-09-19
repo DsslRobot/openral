@@ -49,15 +49,24 @@ class PlaceRskill(EyeInHandSkill):
         s_map = np.array(g["support_xyz_map"], float)
         s = T_bm[:3, :3] @ s_map + T_bm[:3, 3]
         p0, R0 = self.tcp()
-        over = np.array([s[0], s[1], p0[2]])
+        height = p0[2]
+        if g.get("held_item"):
+            # Travel over the support with the hanging item's envelope above it: moving across at the carry height
+            # swept the item into the shelf edge (g8s stall, g8t drop; F78). The rover's own body is checked too.
+            self.carry_item(g["held_item"])
+            height = max(height, s[2] + self.held_bottom_below_tcp())
+        over = np.array([s[0], s[1], height])
+        self._evidence["over_plan"] = {"carry_height_m": round(float(p0[2]), 3), "over_height_m": round(float(height), 3)}
 
-        def carrying():
-            # the item in the jaws, and the surface it is going onto, are what this skill is working on -- the planner
-            # must not treat either as an obstacle to the tool that is holding one and reaching for the other (F58)
-            self.working_on(self.tcp()[0])
-            return over, R0
+        for target in ([np.array([p0[0], p0[1], height])] if height > p0[2] else []) + [over]:
+            def carrying(target=target):
+                # the item in the jaws, and the surface it is going onto, are what this skill is working on -- the
+                # planner must not treat either as an obstacle to the tool that is holding one and reaching for the
+                # other (F58)
+                self.working_on(self.tcp()[0])
+                return target, R0
 
-        self.servo(carrying, "over", **g["carry_servo"])
+            self.servo(carrying, "over", **g["carry_servo"])
         self._evidence["over"] = {"support_rover": [round(float(v), 3) for v in s], "tcp": [round(float(v), 3) for v in self.tcp()[0]]}
 
         self.stage("lower")
@@ -99,6 +108,7 @@ class PlaceRskill(EyeInHandSkill):
         self.stage("release")
         jaw = self.set_jaw(True, "release")
         self._evidence["jaw_open_rad"] = round(jaw, 4)
+        self.carry_item(None)  # the support has the item now
 
         self.stage("retreat")
         p, R = self.tcp()

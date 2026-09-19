@@ -147,6 +147,8 @@ class PickRskill(EyeInHandSkill):
             jaw = self.grasp()
             self.contact_permission("revoke")
             self.hold(jaw)
+            if self.goal.get("held_item"):
+                self.carry_item(self.goal["held_item"])
             self.bring_in()
             rec["outcome"] = "held"
             self._evidence["outcome"] = "held"
@@ -822,27 +824,39 @@ class PickRskill(EyeInHandSkill):
         self.stage("bring_in")
         p, R = self.tcp()
         self.working_on(p)  # what is in the jaws travels with them; it is the job, not an obstacle to it (F59)
-        best, seed = None, list(self.arm_q())
-        for dx in [round(0.05 * k, 2) for k in range(1, 13)]:
-            q = self.ik(p + np.array([dx, 0.0, 0.0]), R, seed)
+        # With the carried item in the collision checks, walking in at the grasp height can put the item into the
+        # rover's own deck (g8s/g8t, F78): the same search may first raise the tool, on the same step grid.
+        best = None
+        for dz in [round(0.05 * k, 2) for k in range(0, 5 if self._held else 1)]:
+            seed = list(self.arm_q())
+            q = self.ik(p + np.array([0.0, 0.0, dz]), R, seed)
             if q is None or not self.state_valid(np.array(q)):
                 break
-            best, seed = (q, dx), list(q)
-        self._evidence["bring_in"] = {"from": [round(float(v), 3) for v in p], "in_by_m": best[1] if best else 0.0}
+            found, seed = None, list(q)
+            for dx in [round(0.05 * k, 2) for k in range(1, 13)]:
+                q = self.ik(p + np.array([dx, 0.0, dz]), R, seed)
+                if q is None or not self.state_valid(np.array(q)):
+                    break
+                found, seed = dx, list(q)
+            if found is not None and (best is None or found > best[0]):
+                best = (found, dz)
+        self._evidence["bring_in"] = {"from": [round(float(v), 3) for v in p], "in_by_m": best[0] if best else 0.0,
+                                      "raised_by_m": best[1] if best else 0.0}
         if best is None:
             return
 
-        target = p + np.array([best[1], 0.0, 0.0])
-
-        def carrying():
-            self.working_on(self.tcp()[0])
-            return target, R
+        waypoints = ([p + np.array([0.0, 0.0, best[1]])] if best[1] else []) + [p + np.array([best[0], 0.0, best[1]])]
 
         try:
             # A joint-goal plan constrains only its endpoint: it can turn the
             # held object along the route. Use the same orientation-preserving,
             # per-step collision-checked carry servo as place.
-            info = self.servo(carrying, "bring_in", **self.goal["carry_servo"])
+            for target in waypoints:
+                def carrying(target=target):
+                    self.working_on(self.tcp()[0])
+                    return target, R
+
+                info = self.servo(carrying, "bring_in", **self.goal["carry_servo"])
             self._evidence["bring_in"]["servo"] = info
             self._evidence["bring_in"]["tcp"] = [round(float(v), 3) for v in self.tcp()[0]]
         except StageFailure as exc:

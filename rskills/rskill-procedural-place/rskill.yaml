@@ -1,6 +1,7 @@
 # rSkill manifest -- set the held item down on a named support (kind: procedural).
 # One physical operation for the reasoner; over / lower / release / retreat / settle are its internal stages
 # (openral_rskill.procedural_place). Research repo plan v4.
+# Over tolerance 3 cm / 0.08 rad: a third of the ~10 cm clearance a catalogued module has on the PDU shelf (research F78).
 
 schema_version: "0.1"
 name: "OpenRAL/rskill-procedural-lunar_bot-place"
@@ -50,7 +51,7 @@ procedural:
       "support_xyz_map": [0.0, 0.0, 0.0],
       "evidence_dir": "/tmp/openral_evidence",
       "carry_speed_m_s": 0.05,
-      "carry_servo": {"tol_m": 0.01, "tol_rad": 0.05, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0},
+      "carry_servo": {"tol_m": 0.03, "tol_rad": 0.08, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0},
       "lower_speed_m_s": 0.02,
       "min_tool_above_support_m": 0.15,
       "contact_confirm_s": 0.6,
@@ -63,6 +64,7 @@ goal_params_schema:
   type: object
   properties:
     support: {type: string, description: "where to set the held item down"}
+    held_item: {type: object, description: "catalogue envelope of the carried item (size_m, handle_above_base_m, neck_height_m), from the boundary"}
     release_constraint:
       type: string
       enum: [unconstrained, below_overhang]

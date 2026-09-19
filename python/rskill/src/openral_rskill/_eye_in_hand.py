@@ -217,6 +217,7 @@ class EyeInHandSkill(rSkillBase):
         self._ik_client = None
         self._fk_client = None
         self._valid_client = None
+        self._held = None  # the carried item's catalogue envelope, checked with the robot while it hangs from the jaws
         self._plan_client = None
 
     # ---- lifecycle ------------------------------------------------------------------------------------------------
@@ -599,6 +600,77 @@ class EyeInHandSkill(rSkillBase):
         q_next = q_cmd + dq * scale
         return np.clip(q_next, [-(l - 0.05) for l in JOINT_LIMITS_RAD], [l - 0.05 for l in JOINT_LIMITS_RAD])
 
+    def carry_item(self, held: dict | None) -> None:
+        """Account for the item hanging from the jaws in every collision check, or stop doing so.
+
+        `held` is the equipment catalogue's envelope (size_m, handle_above_base_m, neck_height_m). The item hangs
+        gravity-vertical below the grasp, turning freely about the vertical, so it is checked as an upright square
+        prism around its possible yaws, extended downwards by the neck's length it can slide in the jaws. It is
+        checked against the robot's own body; the measured world (which may contain the item itself, or where it
+        stood) is exempt, and a surveyed support is handled by the operation that approaches it (g8s/g8t, F78)."""
+        self._held = held
+        if held is None:
+            return
+        from moveit_msgs.msg import AllowedCollisionEntry, PlanningScene, PlanningSceneComponents
+        from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
+
+        get = self._node.create_client(GetPlanningScene, "/get_planning_scene")
+        apply = self._node.create_client(ApplyPlanningScene, "/apply_planning_scene")
+        try:
+            for client in (get, apply):
+                if not client.wait_for_service(timeout_sec=30.0):
+                    raise StageFailure(self._evidence.get("stage", "?"), "planning scene service unavailable", local_retry=False)
+            req = GetPlanningScene.Request()
+            req.components.components = (PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+                                         | PlanningSceneComponents.WORLD_OBJECT_NAMES)
+            fut = get.call_async(req)
+            while not fut.done():
+                self._sleep(0.005)
+            scene = fut.result().scene
+            acm, world = scene.allowed_collision_matrix, [o.id for o in scene.world.collision_objects]
+            for name in ["held_item", *world]:
+                if name not in acm.entry_names:
+                    acm.entry_names.append(name)
+                    for entry in acm.entry_values:
+                        entry.enabled.append(False)
+                    acm.entry_values.append(AllowedCollisionEntry(enabled=[False] * len(acm.entry_names)))
+            i = acm.entry_names.index("held_item")
+            for name in world:
+                j = acm.entry_names.index(name)
+                acm.entry_values[i].enabled[j] = acm.entry_values[j].enabled[i] = True
+            fut = apply.call_async(ApplyPlanningScene.Request(scene=PlanningScene(is_diff=True, allowed_collision_matrix=acm)))
+            while not fut.done():
+                self._sleep(0.005)
+            self._evidence["held_envelope"] = {**held, "exempt_world": world, "applied": bool(fut.result().success)}
+        finally:
+            self._node.destroy_client(get)
+            self._node.destroy_client(apply)
+
+    def held_bottom_below_tcp(self) -> float:
+        """How far below the tool the carried item's envelope reaches."""
+        return float(self._held["handle_above_base_m"]) + float(self._held["neck_height_m"])
+
+    def _held_body(self):
+        from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
+        from geometry_msgs.msg import Pose
+        from shape_msgs.msg import SolidPrimitive
+
+        size = np.array(self._held["size_m"], float)
+        side = float(np.hypot(size[0], size[1]))
+        height = float(size[2]) + float(self._held["neck_height_m"])
+        _, R = self.tcp()  # the servo keeps the tool's orientation; the offset is vertical in the rover frame
+        centre = R.T @ np.array([0.0, 0.0, -self.held_bottom_below_tcp() + height / 2])
+        body = AttachedCollisionObject(link_name=TCP_FRAME_ID, touch_links=[f"eg2_link{i}" for i in range(1, 7)] + ["eg2_base"])
+        body.object = CollisionObject(id="held_item", operation=CollisionObject.ADD)
+        body.object.header.frame_id = TCP_FRAME_ID
+        body.object.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[side, side, height])]
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = map(float, centre)
+        qx, qy, qz, qw = mat_to_quat(R.T)
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = qx, qy, qz, qw
+        body.object.primitive_poses = [pose]
+        return body
+
     def state_valid(self, q: np.ndarray) -> bool:
         """Is this arm configuration collision-free in the robot's own planning scene (its own links, the rover, the
         surveyed site structures)? The servo steps the joints directly, so it checks what the planners check."""
@@ -616,6 +688,8 @@ class EyeInHandSkill(rSkillBase):
         for joint, value in zip(ARM_JOINT_NAMES, q):
             req.robot_state.joint_state.position[req.robot_state.joint_state.name.index(joint)] = float(value)
         req.robot_state.is_diff = True
+        if self._held is not None:
+            req.robot_state.attached_collision_objects = [self._held_body()]
         fut = self._valid_client.call_async(req)
         while not fut.done():
             self._sleep(0.005)
