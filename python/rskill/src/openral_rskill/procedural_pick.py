@@ -825,17 +825,20 @@ class PickRskill(EyeInHandSkill):
         p, R = self.tcp()
         self.working_on(p)  # what is in the jaws travels with them; it is the job, not an obstacle to it (F59)
         # With the carried item in the collision checks, walking in at the grasp height can put the item into the
-        # rover's own deck (g8s/g8t, F78): the same search may first raise the tool, on the same step grid.
+        # rover's own deck (g8s/g8t, F78): the same search may first raise the tool, on the same step grid. It stops
+        # where the item would still clear the rover after sagging one grid step: stopping where it just clears left
+        # it 2 mm over the deck edge, the wrist dipped as the servo let go, and the item wedged there (g9a, F78).
+        step = 0.05
         best = None
-        for dz in [round(0.05 * k, 2) for k in range(0, 5 if self._held else 1)]:
+        for dz in [round(step * k, 2) for k in range(0, 5 if self._held else 1)]:
             seed = list(self.arm_q())
             q = self.ik(p + np.array([0.0, 0.0, dz]), R, seed)
             if q is None or not self.state_valid(np.array(q)):
                 break
             found, seed = None, list(q)
-            for dx in [round(0.05 * k, 2) for k in range(1, 13)]:
+            for dx in [round(step * k, 2) for k in range(1, 13)]:
                 q = self.ik(p + np.array([dx, 0.0, dz]), R, seed)
-                if q is None or not self.state_valid(np.array(q)):
+                if q is None or not self.state_valid(np.array(q), held_drop_m=step if self._held else 0.0):
                     break
                 found, seed = dx, list(q)
             if found is not None and (best is None or found > best[0]):

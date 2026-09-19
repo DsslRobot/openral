@@ -650,7 +650,7 @@ class EyeInHandSkill(rSkillBase):
         """How far below the tool the carried item's envelope reaches."""
         return float(self._held["handle_above_base_m"]) + float(self._held["neck_height_m"])
 
-    def _held_body(self):
+    def _held_body(self, drop_m: float = 0.0):
         from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
         from geometry_msgs.msg import Pose
         from shape_msgs.msg import SolidPrimitive
@@ -659,7 +659,7 @@ class EyeInHandSkill(rSkillBase):
         side = float(np.hypot(size[0], size[1]))
         height = float(size[2]) + float(self._held["neck_height_m"])
         _, R = self.tcp()  # the servo keeps the tool's orientation; the offset is vertical in the rover frame
-        centre = R.T @ np.array([0.0, 0.0, -self.held_bottom_below_tcp() + height / 2])
+        centre = R.T @ np.array([0.0, 0.0, -self.held_bottom_below_tcp() + height / 2 - drop_m])
         body = AttachedCollisionObject(link_name=TCP_FRAME_ID, touch_links=[f"eg2_link{i}" for i in range(1, 7)] + ["eg2_base"])
         body.object = CollisionObject(id="held_item", operation=CollisionObject.ADD)
         body.object.header.frame_id = TCP_FRAME_ID
@@ -671,7 +671,7 @@ class EyeInHandSkill(rSkillBase):
         body.object.primitive_poses = [pose]
         return body
 
-    def state_valid(self, q: np.ndarray) -> bool:
+    def state_valid(self, q: np.ndarray, held_drop_m: float = 0.0) -> bool:
         """Is this arm configuration collision-free in the robot's own planning scene (its own links, the rover, the
         surveyed site structures)? The servo steps the joints directly, so it checks what the planners check."""
         from moveit_msgs.srv import GetStateValidity
@@ -689,7 +689,7 @@ class EyeInHandSkill(rSkillBase):
             req.robot_state.joint_state.position[req.robot_state.joint_state.name.index(joint)] = float(value)
         req.robot_state.is_diff = True
         if self._held is not None:
-            req.robot_state.attached_collision_objects = [self._held_body()]
+            req.robot_state.attached_collision_objects = [self._held_body(held_drop_m)]
         fut = self._valid_client.call_async(req)
         while not fut.done():
             self._sleep(0.005)
