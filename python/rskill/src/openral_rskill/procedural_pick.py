@@ -537,14 +537,16 @@ class PickRskill(EyeInHandSkill):
                 cv2.circle(mark, (int(tracker.last_px[0]), int(tracker.last_px[1])), 7,
                            (0, 255, 0) if m is not None else (0, 0, 255), 2)  # where the template matched best
                 cv2.putText(mark, f"{'hit' if m is not None else 'MISS'} score {tracker.last_score:.2f} "
-                                  f"d {tracker.depth:.3f} roll {tracker.roll_deg:+.0f} left {left * 100:.1f}cm",
+                                  f"d {'~' if tracker.depth_predicted else ''}{tracker.depth:.3f} "
+                                  f"roll {tracker.roll_deg:+.0f} left {left * 100:.1f}cm",
                             (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 if tracker.reject:
                     cv2.putText(mark, tracker.reject, (6, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                 path = self.save(f"servo_{len(state['frames']):02d}.jpg", mark)
                 state["frames"].append((nf.stamp, path))
                 state["trace"].append({"image": path, "hit": m is not None, "score": round(tracker.last_score, 3),
-                                       "depth_m": round(tracker.depth, 4), "roll_deg": round(tracker.roll_deg, 1),
+                                       "depth_m": round(tracker.depth, 4), "depth_predicted": tracker.depth_predicted,
+                                       "roll_deg": round(tracker.roll_deg, 1),
                                        "left_m": round(left, 4), "why": tracker.reject})
             R = turned_about_jaws(grasp_rotation(state["axis_base"], state["part_base"], state["view_dir"],
                                                  self.tcp()[1], state["camera_side"], self._cam_tool),

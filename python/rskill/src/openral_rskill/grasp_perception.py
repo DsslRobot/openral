@@ -468,7 +468,8 @@ class PartTracker:
 
     def measure(self, frame_bgr: np.ndarray, depth: np.ndarray, predicted_cam: np.ndarray, search_px: int = 60,
                 min_score: float = 0.6, max_depth_jump_m: float = 0.03, refresh_score: float = 0.8,
-                R_base_cam: np.ndarray | None = None, self_depth_m: float = 0.0):
+                R_base_cam: np.ndarray | None = None, self_depth_m: float = 0.0,
+                predict_depth_min_score: float = 0.9):
         """Where the part is in this frame: (pixel, depth, score) or None. `predicted_cam` is its 3-D point in this
         camera as the arm's own motion predicts it, `R_base_cam` the camera's orientation now.
 
@@ -482,7 +483,7 @@ class PartTracker:
         robot's own reach in front of this camera), the part is not lost but covered by the hand that is reaching for
         it: `covered` says so, and the caller closes the last stretch on its last measurement. A blocker further away
         than the tool is something else, and counts as losing sight of the part."""
-        self.covered = False
+        self.covered = self.depth_predicted = False
         if predicted_cam[2] <= 0.05:
             return None
         pu = self.K[0, 0] * predicted_cam[0] / predicted_cam[2] + self.K[0, 2]
@@ -529,13 +530,23 @@ class PartTracker:
             self.last_px, self.last_score = (u, v), score
             d = depth_at(depth, u, v)
             if d is None:
-                self.reject = "no depth where it matches"
-                continue
+                # A grasp that holds is a thin one: the bail's neck is 12 mm across, some 20 px at the distance the
+                # close-in starts, and what stands behind it is sky, which returns no range at all. So the depth
+                # image has no value at a pixel the template is certain of -- g6b matched at 1.00 and was thrown
+                # away eight frames running for want of a number. The pixel is the strong measurement here; the
+                # range is the weak one, and the arm's own motion already implies it (`predicted_cam`). Taking it
+                # does not feed the loop: that prediction is the tracked point carried through the camera's
+                # measured motion, so the distance still comes from the arm, never from the match (F64 §5).
+                if score < predict_depth_min_score:
+                    self.reject = "no depth where it matches"
+                    continue
+                self.depth_predicted, hit = True, (u, v, float(predicted_cam[2]), score)
+                break
             off = d - float(predicted_cam[2])
             if abs(off) > max_depth_jump_m:
                 self.reject = f"every match is off the part's distance (best {off * 100:+.0f} cm)"
                 continue
-            hit = (u, v, d, score)
+            self.depth_predicted, hit = False, (u, v, d, score)
             break
         if hit is None:
             return None
