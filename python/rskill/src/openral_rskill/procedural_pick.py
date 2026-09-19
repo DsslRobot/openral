@@ -38,8 +38,8 @@ import numpy as np
 
 from openral_rskill._eye_in_hand import (READY, JAW_EMPTY_MAX_RAD, EyeInHandSkill, Frame, StageFailure, mat_to_rotvec,
                                           rotvec_to_mat)
-from openral_rskill.grasp_perception import (Candidate, GripperGeometry, PartTracker, find_candidates, render_candidates,
-                                             select_candidate, upright)
+from openral_rskill.grasp_perception import (Candidate, GripperGeometry, PartTracker, find_candidates, find_regions,
+                                             locate_region, render_candidates, render_regions, select_candidate, upright)
 
 __all__ = ["PickRskill", "tool_rotation"]
 
@@ -98,7 +98,8 @@ def guard_or_empty(skill, p: np.ndarray, R: np.ndarray, state: dict) -> str:
     """Why the tool's own body cannot be at this pose (a surface it would touch), or "" when it can. The part being
     grasped is excluded: that is what the fingers are closing on."""
     pts = (R @ BODY_POINTS.T).T + p
-    worst = lowest_clearance(skill._heights, pts, except_near=(state["p_base"], float(skill.goal["grasp_clear_radius_m"])))
+    worst = lowest_clearance(skill._heights, pts, except_near=(state["p_base"], float(skill.goal["grasp_clear_radius_m"])),
+                             except_cells=state.get("item_cells"))
     return "" if worst[0] >= float(skill.goal["clearance_m"]) else f"a surface at {worst[2]} m under {worst[1]}"
 
 
@@ -158,6 +159,7 @@ class PickRskill(EyeInHandSkill):
                 self.hold(jaw)
                 rec["outcome"] = "held"
                 self._evidence["outcome"] = "held"
+                self.bring_in()
                 return
             except StageFailure as exc:
                 rec["outcome"] = f"failed at {exc.stage}: {exc.why}"
@@ -190,22 +192,37 @@ class PickRskill(EyeInHandSkill):
     # ---- find + select --------------------------------------------------------------------------------------------------
     def find_and_select(self, tried: list[np.ndarray]) -> tuple[Candidate, dict]:
         """Side views of the arm's reach zone from the top of the grasp band downwards. Each view pose, and the joint path
-        to it, must lie in space the views already taken saw through (the first is above the band). In each view the
-        grasp candidates go to the vision-language model; the first view in which it chooses a grasp on the described
-        part ends the search."""
+        to it, must lie in space the views already taken saw through (the first is above the band). Every view is taken
+        before anything is chosen, and the vision-language model then judges the marks of all of them in one question:
+        a view from above cannot see the sides of a part, so which view shows the part best is part of the choice."""
         g = self.goal
         self.stage("find")
         # an overview from above the work area: the item's identity for the vision model (the side views show mostly
         # the part), and the first free-space evidence for the side-view paths
         x, y, z, pitch, yaw = g["overview_pose"]
-        q_over = self.ik(np.array([x, y, z]), tool_rotation(pitch, yaw, 180.0), READY)  # camera above the tool axis
-        if q_over is None:
-            raise StageFailure("find", "the overview posture is not reachable")
-        self.plan_to(q_over, "find")
+        # The overview is a place to look from, not a fixed posture. One written-down pose is a pose that does not
+        # know what is standing under it: the arm reaches it on an empty stand and stops short against the item on a
+        # full one (g5b stopped 0.13 m low, "blocked by contact"). Lower and shallower are offered in turn; taking
+        # the overview from a little lower costs some of the work zone, taking none of it costs the call.
+        taken = []
+        for dz, dpitch in ((0.0, 0.0), (-0.08, -10.0), (-0.16, -20.0), (0.0, -20.0)):
+            q_over = self.ik(np.array([x, y, z + dz]), tool_rotation(pitch + dpitch, yaw, 180.0), READY)
+            if q_over is None:
+                taken.append({"dz": dz, "dpitch": dpitch, "reachable": False})
+                continue
+            try:
+                self.plan_to(q_over, "find")
+                taken.append({"dz": dz, "dpitch": dpitch, "reachable": True})
+                break
+            except StageFailure as exc:
+                taken.append({"dz": dz, "dpitch": dpitch, "reachable": False, "blocked": exc.why})
+        else:
+            raise StageFailure("find", "the arm cannot take an overview of the work zone from where the rover stands "
+                                       f"({len(taken)} postures tried)")
         self.wait(0.8)
         over = self.frame(after=self._clock() - 0.05)
         overview = upright(over.bgr, over.up_cam)
-        record = {"views": [], "overview": self.save("overview.jpg", overview)}
+        record = {"views": [], "overview": self.save("overview.jpg", overview), "overview_postures": taken}
         self._evidence["find"] = record
         self._heights: dict = {}
         seen: list[Frame] = [over]
@@ -222,21 +239,55 @@ class PickRskill(EyeInHandSkill):
         # where to look: what the overview measured standing above its surroundings inside the arm's work zone, tallest
         # first. Not a fixed zone point -- an item that stands somewhere else takes its own place in this list, which is
         # what "the item's placement is unknown" means (research repo F57).
-        aims = aim_points(surface_heights(seen, self._self_depth), float(g["reach_zone_x_m"]))
-        record["aims"] = [[round(float(v), 3) for v in P] for P in aims]
-        if not aims:
+        regions = find_regions(over.depth, over.K, self.geom)
+        record["regions"] = [r.as_dict() for r in regions]
+        if not regions:
             raise StageFailure("find", "the overview measured nothing standing in the arm's work zone behind the rover")
+        # Which of the things standing here is the item, settled once on the overview before any working view is taken.
+        # Without it the sweep goes to whatever stands out -- `aim_points` said as much itself, "nothing here knows
+        # where it was put" -- and in g4w four views out of five went to other structures, while the one that did find
+        # the handle saw it from above, where the head hides the neck. Where to look is part of the work, not a
+        # constant: the item is found first, and every working view is then a view of it.
+        marked_over = render_regions(over.bgr, regions, over.up_cam)
+        record["overview_marked"] = self.save("overview_marked.jpg", marked_over)
+        loc = self.vlm_call("locate", lambda: locate_region(self.vlm, g["vlm_model"], marked_over, g["target"],
+                                                            g["part"], regions))
+        record["locate"] = {k: loc[k] for k in ("item_visible", "what_is_visible", "choice", "reason")}
+        if loc["choice"] is None:
+            raise StageFailure("find", "none of the structures in view from here is the described item "
+                                       f"(the vision model saw: {loc['what_is_visible']})", local_retry=False)
+        P = over.to_base(np.array(next(r for r in regions if r.id == loc["choice"]).p_cam))
+        # the item's top, not wherever the dot happened to fall on it: a lifting handle stands on top of its payload,
+        # and a view aimed at the middle of the body pushes the handle to the edge of the frame. The overview's own
+        # height map says how high this item stands where it stands; no model of the item is used.
+        cell, heights = 0.05, surface_heights(seen, self._self_depth)
+        over_item = [h for (cx, cy), h in heights.items()
+                     if abs((cx + 0.5) * cell - P[0]) < 0.2 and abs((cy + 0.5) * cell - P[1]) < 0.2]
+        if over_item:
+            P[2] = max(max(over_item), float(P[2]))
+        record["aim"] = [round(float(v), 3) for v in P]
         next_id = 1
-        for P in aims:
-            view = {"aim": [round(float(v), 3) for v in P], "height_m": round(float(P[2]), 3)}
+        gathered: list[tuple] = []  # (frame, its candidates, its marked image, the arm posture it was taken from)
+        # one working view per viewing direction, all of them of the item: a part that holds by interlock is only
+        # measurable from the side, and which direction shows it is not known before looking (F60 §5)
+        for pitch in [float(p) for p in g["side_view_pitch_deg"]]:
+            view = {"aim": record["aim"], "pitch_deg": pitch}
             record["views"].append(view)
-            pose = self.side_view_pose(P, T_tc, over.K, seen)
+            pose = self.side_view_pose(P, T_tc, over.K, seen, pitches=[pitch])
             if pose is None:
                 view["reachable"] = False
                 continue
             q, info = pose
             view.update(info)
-            self.plan_to(q, "find")
+            try:
+                self.plan_to(q, "find")
+            except StageFailure as exc:
+                # A viewpoint the arm turns out not to reach is one view fewer, not a failed pick. Taking every view
+                # before choosing means more of them, and the lowest of them stand close in to the structure being
+                # looked at, so some are found to be blocked only on the way (g4v stopped 0.12 rad short against
+                # contact). The sweep goes on; if none can be taken, `gathered` is empty and the stage says that.
+                view["reachable"], view["blocked"] = False, exc.why
+                continue
             self.wait(0.8)
             f = self.frame(after=self._clock() - 0.05)
             f, framing = self.frame_part(f, q, info)  # what is in the view decides the framing, not the model of the camera
@@ -248,14 +299,14 @@ class PickRskill(EyeInHandSkill):
                 shots.append(rolled)
                 seen.append(rolled[1])
             self._heights = surface_heights(seen, self._self_depth)
-            np.save(self.evidence_dir / f"view_h{P[2]:.2f}_depth.npy", f.depth)
+            np.save(self.evidence_dir / f"view_p{int(pitch):02d}_depth.npy", f.depth)
             shot_cands, marked_images = [], []
             for shot_info, shot, shot_q in shots:
                 cands = [c for c in find_candidates(shot.depth, shot.K, self.geom, max_candidates=int(g["candidates_per_view"]))
                          if all(np.linalg.norm(shot.to_base(c.p_cam) - t) > 0.02 for t in tried)]
                 for c in cands:
                     c.id, next_id = next_id, next_id + 1
-                tag = f"h{P[2]:.2f}" + ("_rolled" if shot_info.get("roll") else "")
+                tag = f"p{int(pitch):02d}" + ("_rolled" if shot_info.get("roll") else "")
                 self.save(f"view_{tag}.jpg", upright(shot.bgr, shot.up_cam))
                 if cands:
                     marked = render_candidates(shot.bgr, cands, shot.up_cam)
@@ -263,42 +314,33 @@ class PickRskill(EyeInHandSkill):
                     shot_cands.append((shot, cands, marked, shot_q))
             view["candidates"] = sum(len(c) for _, c, _, _ in shot_cands)
             view["marked"] = marked_images
-            if not shot_cands:
-                continue
-            all_cands = [c for _, cs, _, _ in shot_cands for c in cs]
-            self.stage("select", aim=[round(float(v), 2) for v in P], candidates=len(all_cands))
-            # one question per marked view, one image in each. Measured against this gateway on these very frames:
-            # a request carrying the overview and both marked views (265 KB) timed out as often as it answered,
-            # while one marked view (54 KB) answered in 7 and 15 s and chose the same correct mark (research repo F57).
-            answers, picked = [], None
-            for shot, cands, marked, shot_q in shot_cands:
-                a = self.vlm_call("select", lambda m=marked, cs=cands: select_candidate(
-                    self.vlm, g["vlm_model"], m, g["target"], g["part"], {c.id for c in cs}, g["handle_convention"]))
-                answers.append(a)
-                if a["choice"] is not None:
-                    picked = (shot, cands, shot_q, a)
-                    break
-            a = picked[3] if picked else answers[-1]
-            view["vlm"] = {k: a[k] for k in ("item_visible", "what_is_visible", "choice", "reason")} | {
-                "answers": [{k: x[k] for k in ("item_visible", "choice", "reason")} for x in answers]}
-            if picked is not None:
-                f, cands, shot_q = picked[:3]
-                # stand where that image was taken: the tracker follows the part from the same side of the tool
-                if float(np.max(np.abs(np.array(self.arm_q()) - np.array(shot_q)))) > 0.03:
-                    self.plan_to(shot_q, "select")
-                    self.wait(0.5)
-                self._locked_frame, self._view_q = f, shot_q
-                # keep the camera on the side of the tool it looked from: the tracker's template is that view's image,
-                # and a roll of the tool turns that template upside down in the following frames
-                self._view_R = self.fk(np.array(shot_q))[:3, :3]
-                return next(c for c in cands if c.id == a["choice"]), view["vlm"]
-            # no agreed grasp in this view: it may be the wrong structure (the marks in it are not on the part at
-            # all), so the sweep goes on to the next thing that stands out, and only the last one ends the stage
-        saw = [v["vlm"]["what_is_visible"] for v in record["views"] if v.get("vlm")]
-        raise StageFailure("select" if saw else "find",
-                           f"none of the {len(aims)} structures the views measured in the arm's work zone carries a "
-                           "grasp on the described part of the described item"
-                           + (f" (the vision model saw: {saw[0]})" if saw else ""))
+            gathered += shot_cands
+        # every view is taken before any of them is judged: the choice is between the views as much as within one, and
+        # the lower views are the ones that see the sides of a part (research repo F60)
+        if not gathered:
+            raise StageFailure("find", f"none of the {len(record['views'])} views of the item measured anything the "
+                                       "jaws could close on")
+        all_cands = [c for _, cs, _, _ in gathered for c in cs]
+        self.stage("select", views=len(gathered), candidates=len(all_cands))
+        a = self.vlm_call("select", lambda: select_candidate(
+            self.vlm, g["vlm_model"], [m for _, _, m, _ in gathered], g["target"], g["part"],
+            {c.id for c in all_cands}, g["handle_convention"]))
+        record["select"] = {k: a[k] for k in ("item_visible", "what_is_visible", "choice", "reason")}
+        if a["choice"] is None:
+            raise StageFailure("select", f"none of the {len(all_cands)} marks in the {len(gathered)} views is on the "
+                                         "described part of the described item")
+        f, cands, _, shot_q = next(t for t in gathered if any(c.id == a["choice"] for c in t[1]))
+        # The arm does not travel back to where the chosen view was taken. `approach` works from the frame itself --
+        # the grasp point, the part's axes and the tracker's template all carry that frame's own TF -- and the planner
+        # takes the tool to the stand-off from wherever it stands. Going back was a no-op while the chosen view was
+        # the one the arm was already standing in; once every view is taken before the choice it became a move right
+        # across the work zone, and in g4r it stalled against the depot stand and failed the whole call. `_view_q` is
+        # kept for back_off, which runs from the grasp itself and retreats along a path just travelled.
+        self._locked_frame, self._view_q = f, shot_q
+        # keep the camera on the side of the tool it looked from: the tracker's template is that view's image,
+        # and a roll of the tool turns that template upside down in the following frames
+        self._view_R = self.fk(np.array(shot_q))[:3, :3]
+        return next(c for c in cands if c.id == a["choice"]), record["select"]
 
     def rolled_view(self, info: dict, P: np.ndarray, T_tc: np.ndarray, K: np.ndarray, seen: list[Frame]):
         """The same place seen from the other side of the tool: the fingers hide the opposite half of the image there, so
@@ -311,7 +353,10 @@ class PickRskill(EyeInHandSkill):
         q = self.ik(T[:3, 3], R, READY)
         if q is None:
             return None
-        self.plan_to(q, "find")
+        try:
+            self.plan_to(q, "find")
+        except StageFailure:
+            return None  # the far side of the tool is one shot fewer, not a failed find (same rule as the views)
         self.wait(0.8)
         other = dict(info, roll=0.0 if info.get("roll") else 180.0)
         f, framing = self.frame_part(self.frame(after=self._clock() - 0.05), q, other)
@@ -340,19 +385,30 @@ class PickRskill(EyeInHandSkill):
         q2 = self.ik(p + np.array([0.0, 0.0, float(np.clip(shift, -0.2, 0.2))]), R, list(q))
         if q2 is None:
             return f, {**out, "moved": False}
-        self.plan_to(q2, "find")
+        try:
+            self.plan_to(q2, "find")
+        except StageFailure as exc:
+            # framing is an improvement on the view, not a requirement for it: the shot already taken still shows the
+            # part, only nearer the edge of the band the fingers leave free
+            return f, {**out, "moved": False, "blocked": exc.why}
         self.wait(0.8)
         return self.frame(after=self._clock() - 0.05), {**out, "moved": True}
 
-    def side_view_pose(self, P: np.ndarray, T_tc: np.ndarray, K: np.ndarray, seen: list[Frame]):
+    def side_view_pose(self, P: np.ndarray, T_tc: np.ndarray, K: np.ndarray, seen: list[Frame],
+                       pitches: list[float] | None = None):
         """The arm pose on its working branch whose wrist camera looks at P from the rover's side, P nearest the image
-        centre, with the tool -- there and along the joint path to it -- in space the earlier views saw through."""
+        centre, with the tool -- there and along the joint path to it -- in space the earlier views saw through.
+
+        `pitches` restricts how steeply the camera may look down. One view per pitch is how the same part gets seen
+        from more than one direction, and a part that holds by interlock needs that: seen from above, a T-handle's
+        head hides its neck and the neck's 55 mm of free height reads as 8 mm of graspable length, which is below the
+        pads' own height and is dropped -- the grasp that holds is then not among the candidates at all (F60)."""
         g = self.goal
         options = []
         rows = int(self.goal.get("image_rows_px", 480))
         for back in g["side_view_back_m"]:
             for rise in g["side_view_rise_m"]:
-                for pitch in g["side_view_pitch_deg"]:
+                for pitch in (pitches if pitches is not None else g["side_view_pitch_deg"]):
                     # the camera above the tool axis: payloads stand on their supports and are taken from above, so
                     # this is the side the fingers will come from and the side the grasp will be seen from. The
                     # opposite side is the second shot (`rolled_view`), for a part under an overhang.
@@ -396,6 +452,9 @@ class PickRskill(EyeInHandSkill):
                  "part_base": f.T_base_cam[:3, :3] @ np.array(cand.part_axis_cam), "view_base": f.T_base_cam[:3, 3],
                  "seen": f.stamp, "hits": 0, "misses": 0, "frames": [], "trace": []}
         self._evidence["approach_track"] = state["trace"]  # the same list: a failed approach still returns its pictures
+        # the item this grasp is on is not an obstacle to reaching it: its own measured surface comes out of the guard
+        state["item_cells"] = item_cells(self._heights, state["p_base"])
+        self._evidence["item_cells"] = len(state["item_cells"])
         # the camera looks from the side the part is free on, so the fingers close from the side with less material
         # (a handle on a box: from above, not through the box). The tracker carries the roll this costs, frame by frame.
         self.working_on(state["p_base"])
@@ -481,8 +540,17 @@ class PickRskill(EyeInHandSkill):
 
         # close in under vision: the stand-off first, then the grasp point itself
         state["standoff"] = float(state.get("standoff_used", approach_from[0]))
-        info = self.servo_twist(goal_now, "approach", tol_m=0.006, tol_rad=0.04, max_speed_m_s=float(g["approach_speed_m_s"]),
-                                timeout_s=float(g["approach_timeout_s"]), stall_s=6.0, guard=guard_pose)
+        try:
+            info = self.servo_twist(goal_now, "approach", tol_m=0.006, tol_rad=0.04, max_speed_m_s=float(g["approach_speed_m_s"]),
+                                    timeout_s=float(g["approach_timeout_s"]), stall_s=6.0, guard=guard_pose)
+        except StageFailure as exc:
+            # the stand-off is a place to close in from, not a pose to hit: the guarded close-in covers the last
+            # stretch under vision anyway. Stalling a few millimetres out is arriving (g5g stopped 0.4 cm and 2 deg
+            # short of it and lost the call); stalling far out is not, and still returns the stage.
+            off = float(np.linalg.norm(goal_now()[0] - self.tcp()[0]))
+            if off > float(g["close_in_short_ok_m"]):
+                raise
+            info = {"stalled_short_m": round(off, 4), "why": exc.why}
         self._evidence["standoff"] = {**info, "tracked_frames": state["hits"], "missed_frames": state["misses"],
                                       "image": self.save("standoff.jpg", upright(self.frame(after=self._clock() - 0.05).bgr, None))}
         state["standoff"] = -float(g["pad_offset_m"])
@@ -539,15 +607,17 @@ class PickRskill(EyeInHandSkill):
         if not found:
             q = None
         if q is None:
-            # standing in front of the grasp is the whole premise of the approach: if the arm cannot, no amount of
-            # servoing will, and what the goal needs is the rover somewhere else -- which is the caller's to decide
+            # No amount of servoing reaches a grasp the arm cannot stand in front of -- but another grasp on the same
+            # item may be one it can, and that is a retry on the same target, which is this skill's to make (plan v4
+            # §4). The attempt loop puts this candidate in `tried` and asks for the next one; when they run out the
+            # call returns with this stage, and the model decides whether the rover should stand somewhere else.
+            # Both kinds have been seen: a mark 99 cm away on the depot stand (g4q) and one 21 cm away on the ORU
+            # itself that no wrist orientation could reach (g4u).
             raise StageFailure("approach", "the arm cannot stand in front of this grasp from where the rover is "
                                            f"(the grasp is {float(np.linalg.norm(state['p_base'] - self.tcp()[0])) * 100:.0f} cm "
-                                           f"from the tool, at {[round(float(v), 2) for v in state['p_base']]} in the rover frame)",
-                               local_retry=False)
+                                           f"from the tool, at {[round(float(v), 2) for v in state['p_base']]} in the rover frame)")
         if blocked:
-            raise StageFailure("approach", f"the tool cannot stand in front of this grasp without touching {blocked}",
-                               local_retry=False)
+            raise StageFailure("approach", f"the tool cannot stand in front of this grasp without touching {blocked}")
         self.plan_to(q, "approach")
         self.wait(0.6)
         nf = self.frame(after=self._clock() - 0.05)
@@ -623,13 +693,49 @@ class PickRskill(EyeInHandSkill):
             self.wait(0.3)
         raise StageFailure(self._evidence.get("stage", "?"), "the wrist camera returned only empty frames")
 
+    def bring_in(self) -> None:
+        """Carry what is now in the jaws in towards the rover before the call returns.
+
+        A payload left where it was grasped hangs at the far end of the arm's reach: in g5k it rode 1.08 m behind the
+        chassis origin for the whole carry, which is the longest lever the arm owns -- a turn at the base puts more
+        acceleration on the load through that lever than driving forwards does, and a bump swings it furthest. The
+        item came out of the jaws on the first metre every time (F61 §6).
+
+        Where to stop is not written down. The tool walks in along the rover's own x axis keeping the grasp's
+        orientation, so the load hangs the way it was taken, and stops at the last pose the arm reaches and its own
+        planning scene allows. Failing to move at all is not a failed pick: the grasp is already made and verified,
+        and the caller can still drive -- just with the lever it had before."""
+        self.stage("bring_in")
+        p, R = self.tcp()
+        self.working_on(p)  # what is in the jaws travels with them; it is the job, not an obstacle to it (F59)
+        best, seed = None, list(self.arm_q())
+        for dx in [round(0.05 * k, 2) for k in range(1, 13)]:
+            q = self.ik(p + np.array([dx, 0.0, 0.0]), R, seed)
+            if q is None or not self.state_valid(np.array(q)):
+                break
+            best, seed = (q, dx), list(q)
+        self._evidence["bring_in"] = {"from": [round(float(v), 3) for v in p], "in_by_m": best[1] if best else 0.0}
+        if best is None:
+            return
+        try:
+            self.plan_to(best[0], "bring_in")
+            self._evidence["bring_in"]["tcp"] = [round(float(v), 3) for v in self.tcp()[0]]
+        except StageFailure as exc:
+            self._evidence["bring_in"]["why"] = exc.why
+
     def back_off(self) -> None:
         """Local retry: open, a short straight retreat along the tool axis, then back to the side-view posture."""
         self.stage("back_off")
         self.set_jaw(True, "back_off")
         p, R = self.tcp()
-        self.servo_twist(lambda: (p - R[:, 2] * 0.05, R), "back_off", tol_m=0.01, tol_rad=0.08, timeout_s=20.0)
-        self.plan_to(self._view_q, "back_off")
+        try:
+            self.servo_twist(lambda: (p - R[:, 2] * 0.05, R), "back_off", tol_m=0.01, tol_rad=0.08, timeout_s=20.0)
+            self.plan_to(self._view_q, "back_off")
+        except StageFailure as exc:
+            # Getting back to where the chosen view was taken is a convenience for the next attempt, not a
+            # requirement: the next `find` takes its own views and its own posture. Ending the call on the way back
+            # rather than on the grasp is what happened in g5g, where the retreat stalled 5.7 cm out.
+            self._evidence.setdefault("back_off", []).append({"returned_to_view": False, "why": exc.why})
 
 
 #: the tool's own body and the outsides of its fingers, in the tool frame (x jaw axis, y up in the grip orientation,
@@ -730,14 +836,43 @@ def surface_heights(views: list[Frame], self_depth_m: float, cell_m: float = 0.0
     return out
 
 
+def item_cells(heights: dict, p_base: np.ndarray, cell_m: float = 0.05, step_m: float = 0.06,
+               max_cells: int = 600) -> set:
+    """The ground cells the item being grasped stands on: a flood fill out from the grasp point across cells whose
+    measured surface is within `step_m` of the neighbour it came from.
+
+    What a skill is working on is not an obstacle (F59) -- and what it is working on is a great deal larger than the
+    gripper-sized sphere that declaration covers. A handle that holds by interlock stands in its own payload's free
+    height, so reaching it puts the tool body out over the payload, and a 2.5-D height map cannot tell that from
+    driving the tool into it: in g5f the body was refused 2.3 cm "below" the ORU's own lid, 18 cm behind the grasp
+    and therefore outside the fixed radius the guard excluded (F61 §5). The fill stops at a real step -- the edge of
+    the stand, the drop to the ground -- so a neighbouring structure is still an obstacle."""
+    start = (int(p_base[0] // cell_m), int(p_base[1] // cell_m))
+    if start not in heights:
+        return set()
+    out, frontier = {start}, [start]
+    while frontier and len(out) < max_cells:
+        cx, cy = frontier.pop()
+        h = heights[(cx, cy)]
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n = (cx + dx, cy + dy)
+            if n not in out and n in heights and abs(heights[n] - h) <= step_m:
+                out.add(n)
+                frontier.append(n)
+    return out
+
+
 def lowest_clearance(heights: dict, pts: np.ndarray, cell_m: float = 0.05,
-                     except_near: tuple[np.ndarray, float] | None = None):
+                     except_near: tuple[np.ndarray, float] | None = None, except_cells: set | None = None):
     """The point standing least clear of what the cameras measured under it: (clearance, point, surface height)."""
     worst = (9.9, None, None)
     for x, y, z in pts:
         if except_near is not None and math.hypot(x - except_near[0][0], y - except_near[0][1]) < except_near[1]:
             continue
-        h = heights.get((int(x // cell_m), int(y // cell_m)))
+        cell = (int(x // cell_m), int(y // cell_m))
+        if except_cells and cell in except_cells:  # the item being picked up is not an obstacle to picking it up
+            continue
+        h = heights.get(cell)
         if h is not None and z - h < worst[0]:
             worst = (z - h, [round(float(v), 3) for v in (x, y, z)], round(h, 3))
     return worst

@@ -51,7 +51,13 @@ JOINT_LIMITS_RAD = (3.107, 2.269, 3.107, 2.356, 3.107, 2.234, 6.283)
 #: wrist it had just turned (research repo F57).
 POSTURE = {"joint1": (0.0, 1.5), "joint2": (-0.4, 0.9), "joint3": (0.0, 1.2), "joint4": (-1.5, 0.85),
            "joint5": (0.0, 1.6)}
-JAW_OPEN_MIN_RAD = 0.78
+#: The jaw bands, in the angle the EG2's own encoder reports: 0.10 closed on nothing, ~0.17 on a 12 mm neck, 0.33 on
+#: the ORU's bail, 0.82 commanded open. "Open" is not that commanded value: the jaws come to rest a few hundredths
+#: below it (0.776 after a snapshot restore, run g4p), so a threshold set just under the nominal reads an open jaw as
+#: a held item -- which refused `arm_ready` in g4p and would have failed `place` at its own settle check. The edge of
+#: the holding band belongs midway between the widest item this gripper can take and where the jaws come to rest open,
+#: not at the nominal figure; this is the one definition of it (the boundary reads it from here).
+JAW_OPEN_MIN_RAD = 0.6
 JAW_EMPTY_MAX_RAD = 0.13
 
 

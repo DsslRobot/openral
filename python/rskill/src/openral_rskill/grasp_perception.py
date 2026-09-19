@@ -223,6 +223,12 @@ def _turn_point(u, v, w, h, turn):
             cv2.ROTATE_90_CLOCKWISE: (h - 1 - v, u)}[turn]
 
 
+def _unturn_point(u, v, w, h, turn):
+    """Where a pixel read off the gravity-up view falls in the camera's own image (`w`, `h` are the camera's)."""
+    return {None: (u, v), cv2.ROTATE_90_COUNTERCLOCKWISE: (w - 1 - v, u), cv2.ROTATE_180: (w - 1 - u, h - 1 - v),
+            cv2.ROTATE_90_CLOCKWISE: (v, h - 1 - u)}[turn]
+
+
 def render_candidates(bgr: np.ndarray, cands: list[Candidate], up_cam: np.ndarray | None = None, zoom_px: int = 640) -> np.ndarray:
     """Numbered marks for set-of-mark selection on a magnified crop around the candidates, turned gravity-up: each
     candidate is drawn as the jaw span across the part (a bar with two finger ticks) and its number. Marks are drawn
@@ -330,7 +336,7 @@ LOCATE_PROMPT = """This image is from the camera on a robot's gripper, looking o
 
 Task: pick up {target}, holding it by {part}.
 
-Is the described item in view? If so, which numbered dot lies on {part} of that item (or, if no dot is exactly on it, the dot on the item nearest to that part)? Only choose a dot on the described item.
+Is the described item in view? If so, which numbered dot lies on the body of that item? This view is from above and is used only to find where the item stands -- the part to grasp is looked for later, from the side, so choose a dot on the item itself rather than one you think is on {part}.
 
 Reply with JSON only: {{"item_visible": true or false, "what_is_visible": "<short description of the items you see>", "choice": <dot number or null>, "reason": "<one sentence>"}}"""
 
@@ -362,6 +368,38 @@ def ask_json(client, model: str, prompt: str, images: list[np.ndarray]) -> tuple
         return {}, reply
 
 
+POINT_PROMPT = """This image is from the camera on a robot's gripper, looking out over its work area. It is shown the way up a person would see it.
+
+Find {target} in this {w}x{h} image.
+
+Reply with JSON only: {{"found": true or false, "point": [x, y], "reason": "<one short sentence>"}} -- pixel coordinates, origin at the top-left, the point on the thing itself. found=false if it is not clearly visible."""
+
+
+def locate_point(client, model: str, bgr: np.ndarray, target: str, up_cam: np.ndarray | None = None):
+    """Where a described thing is in this camera image: its pixel, or None with why not.
+
+    For a target that is a patch on a larger surface -- a button on a panel -- rather than a structure standing clear
+    of its surroundings. `find_regions` splits the view at depth discontinuities, so a button shares its region with
+    the panel it is on and set-of-mark selection has no mark to offer; this asks for the pixel itself. The model is
+    shown the gravity-up view, as everywhere else (research repo F57), and the answer is mapped back to the camera's
+    own pixels here, so callers work in the frame their depth is in."""
+    h, w = bgr.shape[:2]
+    turn = upright_turn(up_cam) if up_cam is not None else None
+    shown = bgr if turn is None else cv2.rotate(bgr, turn)
+    sh, sw = shown.shape[:2]
+    answer, reply = ask_json(client, model, POINT_PROMPT.format(target=target, w=sw, h=sh), [shown])
+    rec = {"target": target, "reason": answer.get("reason", ""), "raw": reply, "model": model}
+    pt = answer.get("point") or []
+    if not answer.get("found") or len(pt) != 2:
+        return None, {**rec, "found": False}
+    us, vs = float(pt[0]), float(pt[1])
+    if not (0 <= us < sw and 0 <= vs < sh):
+        return None, {**rec, "found": False, "reason": f"the pixel {pt} is outside the {sw}x{sh} image"}
+    u, v = _unturn_point(us, vs, w, h, turn)
+    return (float(u), float(v)), {**rec, "found": True, "shown_px": [round(us, 1), round(vs, 1)],
+                                  "point_px": [round(float(u), 1), round(float(v), 1)]}
+
+
 def locate_region(client, model: str, marked_bgr: np.ndarray, target: str, part: str, regions: list[Region]) -> dict:
     answer, reply = ask_json(client, model, LOCATE_PROMPT.format(target=target, part=part), [marked_bgr])
     ids = {r.id for r in regions}
@@ -370,25 +408,27 @@ def locate_region(client, model: str, marked_bgr: np.ndarray, target: str, part:
                 choice=choice if choice in ids else None, reason=answer.get("reason", ""), raw=reply, model=model)
 
 
-SELECT_PROMPT = """One view from the camera on a robot's gripper. The numbered yellow bars span parts the two fingers could close on.
+SELECT_PROMPT = """{n} views from the camera on a robot's gripper, of the same work area from different heights and sides. The numbered yellow bars span parts the two fingers could close on; the numbering runs across all the views, so each number appears in exactly one of them.
 
 Task: pick up {target}, holding it by {part}.
 {convention}
-Choose the numbered mark where closing the jaws would hold that item by that part so it can be lifted without slipping. Only a mark on the described item counts; if none is, the choice is null.
+Choose the numbered mark where closing the jaws would hold that item by that part so it can be lifted without slipping. A view from lower down sees the sides of a part that a view from above cannot, so judge the marks across all the views and take the one that sits on the described part itself. Only a mark on the described item counts; if none is, the choice is null.
 
 Reply with JSON only: {{"choice": <mark number or null>, "reason": "<one short sentence>"}}"""
-# One view per question, and only what the answer needs. Measured against this gateway with the same frames: three
-# images (an overview and both marked views, 265 KB) answered in 16 s once and timed out once; one marked view (54 KB)
-# answered in 7 and 15 s, both correct. Asking for a description of everything in view and a runner-up as well pushed
-# every request past 90 s. Three concurrent asks were dropped to one: on the G0 dataset a single answer and the
-# majority of three both scored 20/28 (research repo F57).
+# Every view in one question. The single-view question this replaced was a concession to a gateway that timed out on
+# anything larger (F58): with the model on DeepSeek's own endpoint a marked view is read in 1-6 s, so the views can be
+# judged against each other instead of one at a time. Asking one at a time and stopping at the first view that answers
+# made the first view decide the grasp -- and this model essentially always answers, so the lower views that actually
+# see the part were never looked at (run g4q chose a mark on the depot stand 42 cm behind the ORU's handle, from the
+# one view taken from above, and reported it as "the narrow neck under the T-shaped head").
 
 
-def select_candidate(client, model: str, marked_bgr: np.ndarray, target: str, part: str,
+def select_candidate(client, model: str, marked_views: list[np.ndarray], target: str, part: str,
                      ids: set[int], convention: str = "") -> dict:
-    """VLM set-of-mark choice on one magnified marked view. Returns the parsed answer plus the raw reply."""
-    prompt = SELECT_PROMPT.format(target=target, part=part, convention=f"\n{convention}\n" if convention else "")
-    answer, reply = ask_json(client, model, prompt, [marked_bgr])
+    """VLM set-of-mark choice over every marked view at once. Returns the parsed answer plus the raw reply."""
+    prompt = SELECT_PROMPT.format(n=len(marked_views), target=target, part=part,
+                                  convention=f"\n{convention}\n" if convention else "")
+    answer, reply = ask_json(client, model, prompt, marked_views)
     choice = answer.get("choice")
     choice = choice if choice in ids else None
     # a choice is the answer to "is the item there": the model is not asked for a separate flag it would have to

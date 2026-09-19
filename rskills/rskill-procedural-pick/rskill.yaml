@@ -60,7 +60,7 @@ procedural:
       "framing_tolerance_m": 0.03,
       "side_view_back_m": [0.15, 0.22, 0.28, 0.34],
       "side_view_rise_m": [0.0, 0.05, 0.10, 0.15],
-      "side_view_pitch_deg": [10, 20, 30, 40],
+      "side_view_pitch_deg": [0, 5, 10, 20, 30, 40],
       "candidates_per_view": 6,
       "standoff_m": [0.10, 0.14, 0.07],
       "approach_turns_deg": [0, -15, 15, -30, 30, -45, 45],
