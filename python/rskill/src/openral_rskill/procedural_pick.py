@@ -638,10 +638,9 @@ class PickRskill(EyeInHandSkill):
                     finally:
                         self.contact_permission("revoke")
                 if q_contact is not None:
-                    coverage = self.contact_path_observed(tool_points, tool_links, p_g, p_contact, R_t)
-                    if not coverage["satisfied"]:
-                        blocked = f"observation_insufficient: {coverage}"
-                        q_contact = None
+                    # Evidence, not a veto: unobserved space along the insertion is recorded for the caller, while the
+                    # measured-scene collision checks on every servo step still stop real contact (g8j, F78).
+                    self.contact_path_observed(tool_points, tool_links, p_g, p_contact, R_t)
                 rec["tried"].append({"camera_side": side.tolist(), "stand_off_m": round(standoff_m, 3),
                                      "goal": [round(float(v), 3) for v in p_g],
                                      "reachable": q is not None, "contact_reachable": q_contact is not None,
@@ -662,15 +661,15 @@ class PickRskill(EyeInHandSkill):
             # No blind servo can establish an unreachable stand-off. Return the
             # failed contact and its evidence; the caller decides the next operation.
             reasons = [trial["blocked"] for trial in rec["tried"] if trial["blocked"]]
-            cause = ("observation_insufficient" if any(str(r).startswith("observation_insufficient") for r in reasons)
-                     else "collision" if reasons else "ik_no_solution")
+            cause = "collision" if reasons else "ik_no_solution"
             self._evidence["decision_required"] = {
                 "cause": cause, "contact_preserved": True,
                 "scene": self._evidence["contact_scene"], "reasons": reasons,
                 "physical_unreachable_proven": False,
             }
-            raise StageFailure("approach", f"{cause}: no executable insertion established for the selected contact; "
-                               "see scene, collision and observation evidence", local_retry=False)
+            raise StageFailure("approach", f"{cause}: no reachable insertion for the selected mark {cand.id} "
+                               f"({cand.width_m * 1000:.1f} mm across, {cand.depth_m:.2f} m from the camera) in "
+                               f"{len(rec['tried'])} stand-off/side options", local_retry=False)
         if blocked:
             raise StageFailure("approach", f"the tool cannot stand in front of this grasp without touching {blocked}")
         self.plan_to(q, "approach")
@@ -695,7 +694,7 @@ class PickRskill(EyeInHandSkill):
         return PartTracker(nf.bgr, nf.depth, nf.K, seen, R_base_cam=R_odom_cam)
 
     def contact_path_observed(self, tool_points, tool_links, start, end, rotation) -> dict:
-        """Require measured free rays along the gripper's insertion, not absence of mesh triangles.
+        """Record measured free rays along the gripper's insertion (evidence for the caller, not a veto).
 
         Collision checks still test actual geometry. This separate evidence check
         treats occlusion/invalid pixels as unknown and never deletes target cells.
