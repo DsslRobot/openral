@@ -125,7 +125,9 @@ class PlaceRskill(EyeInHandSkill):
         back = p + withdraw * float(g["retreat_m"])
         self._evidence["retreat"] = {"release_constraint": g["release_constraint"], "from": p.tolist(),
                                     "withdraw_to": back.tolist()}
-        self.servo(lambda: (back, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0)
+        # The open jaws start around the part they just released, which the live scene measures: the withdrawal stroke
+        # out of it is not tested against that measurement (the lift out of a grasp is not either); the stroke up is.
+        self.servo(lambda: (back, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=False)
         up = back + np.array([0.0, 0.0, float(g["retreat_up_m"])])
         self.servo(lambda: (up, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0)
 
