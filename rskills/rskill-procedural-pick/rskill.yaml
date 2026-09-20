@@ -44,6 +44,9 @@ scenes:
 # `view_part_depth_m`: depths at which this wrist camera measures a part well -- past the gripper in its own
 # view, and near enough that the declared contact still spans pixels to measure. A property of the camera and
 # the gripper, not of any item: the tool stand-off is derived from it and from the camera mount read off TF.
+# `max_views`: how many frames the search for the part may take before the operation answers. Not a belief about
+# how many are needed -- the first reachable level look usually measures it -- but a deadline, like the servo
+# timeouts: a robot that is still looking after half a minute has something to report.
 procedural:
   entrypoint: "openral_rskill.procedural_pick:PickRskill"
   default_goal_json: |
@@ -53,13 +56,8 @@ procedural:
       "evidence_dir": "/tmp/openral_evidence",
       "vlm_model": "deepseek-flash",
       "vlm_endpoint": "https://api.deepseek.com",
-      "reach_zone_x_m": -1.07,
       "view_part_depth_m": [0.42, 0.34, 0.52],
-      "clearance_m": 0.015,
-      "image_rows_px": 480,
-      "grasp_clear_radius_m": 0.10,
-      "lift_when_below_m": 0.10,
-      "framing_tolerance_m": 0.03,
+      "max_views": 6,
       "candidates_per_view": 6,
       "standoff_m": [0.10, 0.14, 0.07],
       "approach_speed_m_s": 0.05,
@@ -68,9 +66,7 @@ procedural:
       "close_in_short_ok_m": 0.02,
       "blind_ok_m": 0.06,
       "max_track_misses": 6,
-      "max_corrections": 2,
       "track_gate_m": 0.02,
-      "correction_done_m": 0.006,
       "lift_m": 0.15,
       "lift_speed_m_s": 0.04,
       "carry_servo": {"tol_m": 0.01, "tol_rad": 0.05, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0},
