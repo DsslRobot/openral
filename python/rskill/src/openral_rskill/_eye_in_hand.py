@@ -42,6 +42,8 @@ from openral_rskill.base import rSkillBase
 READY = (0.0, -1.0, 0.0, -1.4, 0.0, 1.2, math.pi)
 #: RM-75 joint limits, joint1..joint7 (docs/lunar_bot_rm75_spec.md in the research repo)
 JOINT_LIMITS_RAD = (3.107, 2.269, 3.107, 2.356, 3.107, 2.234, 6.283)
+#: how far a seeded IK solution may sit from the seed before it is another arm configuration rather than a nearby one
+BRANCH_JUMP_RAD = 1.2
 #: The RM-75's working branch (joint: centre, half-range, rad): shoulder and forearm roll near zero, wrist roll unflipped.
 #: Unconstrained IK on this 7-DoF arm lands on arbitrary null-space branches (shoulder turned 90 deg, wrist rolled to its
 #: stop) from which the next small motion is impossible (research repo F57); the boundary's MoveIt posture preference is
@@ -514,16 +516,6 @@ class EyeInHandSkill(rSkillBase):
         o = r.pose_stamped.pose.orientation
         o.x, o.y, o.z, o.w = q
         r.timeout.nanosec = 100_000_000
-        from moveit_msgs.msg import JointConstraint
-
-        for joint, (centre, half) in POSTURE.items():
-            # The window keeps the redundancy on the working branch; it must still contain where the arm already is,
-            # or the solver answers "unreachable" for the very pose the tool is at. A lift that ended 0.04 rad outside
-            # it made every bring_in height unreachable and left the payload over the stand (g9l, research F78).
-            reach = abs(float(seed[ARM_JOINT_NAMES.index(joint)]) - centre) + 1e-3
-            r.constraints.joint_constraints.append(JointConstraint(joint_name=joint, position=centre,
-                                                                   tolerance_above=max(half, reach),
-                                                                   tolerance_below=max(half, reach), weight=1.0))
         fut = self._ik_client.call_async(req)
         t = time.monotonic()
         while not fut.done():
@@ -535,7 +527,15 @@ class EyeInHandSkill(rSkillBase):
         if res.error_code.val != 1:
             return None
         js = res.solution.joint_state
-        return [float(js.position[list(js.name).index(j)]) for j in ARM_JOINT_NAMES]
+        q = [float(js.position[list(js.name).index(j)]) for j in ARM_JOINT_NAMES]
+        # What the redundancy must not do is jump to the mirrored arm configuration mid-operation (research F57); a
+        # window on the joints said that badly -- it also refused poses the arm was already in, and every bring_in
+        # height came back unreachable (g9l, F78). The solution is seeded at the current joints: reject it when it
+        # lands somewhere else entirely, and let reach, collision and the servo decide the rest.
+        if max(abs(a - b) for a, b in zip(q, seed)) > BRANCH_JUMP_RAD:
+            self._evidence["last_ik"]["branch_jump_rad"] = round(max(abs(a - b) for a, b in zip(q, seed)), 3)
+            return None
+        return q
 
     #: arm links whose position is checked against what the cameras measured (the elbow and forearm sweep too)
     ARM_LINKS = ("Link4", "Link5", "Link6", "Link7")
