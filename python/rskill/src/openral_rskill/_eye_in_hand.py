@@ -517,8 +517,13 @@ class EyeInHandSkill(rSkillBase):
         from moveit_msgs.msg import JointConstraint
 
         for joint, (centre, half) in POSTURE.items():
-            r.constraints.joint_constraints.append(JointConstraint(joint_name=joint, position=centre, tolerance_above=half,
-                                                                   tolerance_below=half, weight=1.0))
+            # The window keeps the redundancy on the working branch; it must still contain where the arm already is,
+            # or the solver answers "unreachable" for the very pose the tool is at. A lift that ended 0.04 rad outside
+            # it made every bring_in height unreachable and left the payload over the stand (g9l, research F78).
+            reach = abs(float(seed[ARM_JOINT_NAMES.index(joint)]) - centre) + 1e-3
+            r.constraints.joint_constraints.append(JointConstraint(joint_name=joint, position=centre,
+                                                                   tolerance_above=max(half, reach),
+                                                                   tolerance_below=max(half, reach), weight=1.0))
         fut = self._ik_client.call_async(req)
         t = time.monotonic()
         while not fut.done():
