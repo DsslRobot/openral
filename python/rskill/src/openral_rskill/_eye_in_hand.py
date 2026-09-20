@@ -606,8 +606,10 @@ class EyeInHandSkill(rSkillBase):
         `held` is the equipment catalogue's envelope (size_m, handle_above_base_m, neck_height_m). The item hangs
         gravity-vertical below the grasp, turning freely about the vertical, so it is checked as an upright square
         prism around its possible yaws, extended downwards by the neck's length it can slide in the jaws. It is
-        checked against the robot's own body; the measured world (which may contain the item itself, or where it
-        stood) is exempt, and a surveyed support is handled by the operation that approaches it (g8s/g8t, F78)."""
+        checked against the robot's own body and against the surveyed site structures; only the live measurement is
+        exempt, because it contains the item itself and the place it stood. Exempting the surveyed structures too let
+        bring_in drag the hanging item into the stand it came from until the servo stalled, and the first metre of the
+        drive tore it out of the jaws (g9i, research F78)."""
         self._held = held
         if held is None:
             return
@@ -627,7 +629,8 @@ class EyeInHandSkill(rSkillBase):
             while not fut.done():
                 self._sleep(0.005)
             scene = fut.result().scene
-            acm, world = scene.allowed_collision_matrix, [o.id for o in scene.world.collision_objects]
+            acm = scene.allowed_collision_matrix
+            world = [o.id for o in scene.world.collision_objects if o.id.startswith("measured")]
             for name in ["held_item", *world]:
                 if name not in acm.entry_names:
                     acm.entry_names.append(name)
