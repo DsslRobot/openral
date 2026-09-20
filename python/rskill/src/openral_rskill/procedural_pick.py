@@ -758,13 +758,26 @@ class PickRskill(EyeInHandSkill):
 
     # ---- grasp + hold -----------------------------------------------------------------------------------------------------
     def on_contact(self, gp: np.ndarray, gR: np.ndarray) -> dict:
-        """Is the tool on the committed contact region? The error across the part and the tool's orientation must be
-        within their budgets; along the part's own long axis the pads may sit anywhere the measured contact is long
-        enough to take them, because that is the same contact region (contract C2)."""
+        """Is the tool on the committed contact region (contract C2)? The three directions are not one number:
+
+        * along the part's long axis (tool y) the pads may sit anywhere the contact is long enough to take them;
+        * along the closing axis (tool x) the part only has to lie between the open pads -- closing centres it, so
+          the budget is the free space each side of the contact when the jaws are open;
+        * along the approach (tool z) the pads must be level with the contact, or they close on what is above or
+          below it, so that budget is the insertion the approach itself offers.
+
+        The orientation budget comes from the same geometry: at the measured contact a tenth of a radian moves the
+        pad's edge less than a millimetre across the part's face, far inside it. g9k stopped 6 mm along the closing
+        axis -- with the part between the pads -- and one number rejected it."""
         p, R = self.tcp()
         e = gp - p
         along = float(abs(np.dot(e, gR[:, 1])))  # the part's long axis: tool y, by construction of grasp_rotation
+        sideways = float(abs(np.dot(e, gR[:, 0])))  # the closing axis: the pads centre what lies between them
+        depth = float(abs(np.dot(e, gR[:, 2])))  # the approach: how level the pads are with the contact
         across = float(np.linalg.norm(e - gR[:, 1] * np.dot(e, gR[:, 1])))
+        width = float(self._contact_width or self.geom.min_part_width_m)
+        side_budget = max(0.0, (self.geom.open_width_m - width) / 2 - self.geom.clearance_m)
+        depth_budget = float(self.goal["pad_offset_m"])
         rotation_error = float(np.linalg.norm(mat_to_rotvec(gR @ R.T)))
         # how long the contact region is along its own axis: the equipment catalogue where it says so (a lifting eye's
         # neck is as long as the catalogue's neck height), else what this view measured of it. The candidate itself is
@@ -773,9 +786,13 @@ class PickRskill(EyeInHandSkill):
         slack = max(0.0, (length - self.geom.pad_height_m) / 2)
         valid = self._evidence["target_lock"]["status"] == "committed"
         self._evidence["closure_precondition"] = {
-            "position_error_m": float(np.linalg.norm(e)), "across_part_m": across, "along_part_m": along,
-            "along_part_budget_m": round(slack, 4), "rotation_error_rad": rotation_error, "target_valid": valid,
-            "on_contact": valid and across < 0.005 and along <= slack and rotation_error < 0.04,
+            "position_error_m": float(np.linalg.norm(e)), "across_part_m": across,
+            "along_part_m": along, "along_part_budget_m": round(slack, 4),
+            "sideways_m": sideways, "sideways_budget_m": round(side_budget, 4),
+            "approach_m": depth, "approach_budget_m": depth_budget,
+            "rotation_error_rad": rotation_error, "target_valid": valid,
+            "on_contact": (valid and along <= slack and sideways <= side_budget and depth <= depth_budget
+                           and rotation_error < 0.10),
         }
         return self._evidence["closure_precondition"]
 
