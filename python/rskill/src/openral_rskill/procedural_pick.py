@@ -766,7 +766,11 @@ class PickRskill(EyeInHandSkill):
         along = float(abs(np.dot(e, gR[:, 1])))  # the part's long axis: tool y, by construction of grasp_rotation
         across = float(np.linalg.norm(e - gR[:, 1] * np.dot(e, gR[:, 1])))
         rotation_error = float(np.linalg.norm(mat_to_rotvec(gR @ R.T)))
-        slack = max(0.0, (getattr(self, "_contact_length", 0.0) - self.geom.pad_height_m) / 2)
+        # how long the contact region is along its own axis: the equipment catalogue where it says so (a lifting eye's
+        # neck is as long as the catalogue's neck height), else what this view measured of it. The candidate itself is
+        # one pad-height segment of a longer part, so its own extent is not that length (g9h left 0.9 mm of budget).
+        length = float((self.goal.get("held_item") or {}).get("neck_height_m") or getattr(self, "_contact_length", 0.0))
+        slack = max(0.0, (length - self.geom.pad_height_m) / 2)
         valid = self._evidence["target_lock"]["status"] == "committed"
         self._evidence["closure_precondition"] = {
             "position_error_m": float(np.linalg.norm(e)), "across_part_m": across, "along_part_m": along,
