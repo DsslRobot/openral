@@ -37,10 +37,10 @@ import time
 import cv2
 import numpy as np
 
-from openral_rskill._eye_in_hand import (READY, JAW_EMPTY_MAX_RAD, EyeInHandSkill, Frame, StageFailure, mat_to_rotvec,
-                                          rotvec_to_mat)
-from openral_rskill.grasp_perception import (Candidate, GripperGeometry, PartTracker, find_candidates, find_regions,
-                                             locate_region, render_candidates, render_regions, select_candidate, upright)
+from openral_rskill._eye_in_hand import (BASE_FRAME_ID, READY, JAW_EMPTY_MAX_RAD, EyeInHandSkill, Frame, StageFailure,
+                                          TCP_FRAME_ID, mat_to_rotvec, rotvec_to_mat)
+from openral_rskill.grasp_perception import (Candidate, GripperGeometry, PartTracker, find_candidates,
+                                             render_candidates, select_candidate, upright)
 
 __all__ = ["PickRskill", "tool_rotation"]
 
@@ -187,162 +187,100 @@ class PickRskill(EyeInHandSkill):
         """The width the jaws close across at the item's declared contact interface (equipment catalogue), if given."""
         return (self.goal.get("held_item") or {}).get("closing_width_m")
 
+    def work_point(self) -> np.ndarray:
+        """Where the work is, in the rover's own frame: the surveyed place the caller named, at the height work
+        happens there. Both come from the boundary, which computed that height to decide where the rover parks --
+        so the camera and the parking place are answering the same question instead of two written-down ones."""
+        g = self.goal
+        if "support_xyz_map" not in g:
+            raise StageFailure("find", "this pick did not say what the item stands on, so there is nothing to look "
+                                       "at: name the place frame (`support`) the item is on.", local_retry=False)
+        T_bm = self.T(BASE_FRAME_ID, "map")
+        s = T_bm[:3, :3] @ np.array(g["support_xyz_map"], float) + T_bm[:3, 3]
+        return np.array([s[0], s[1], float(g["work_z_m"]) if "work_z_m" in g else s[2]])
+
     def find_and_select(self) -> tuple[Candidate, dict]:
-        """Side views of the arm's reach zone from the top of the grasp band downwards. Each view pose, and the joint path
-        to it, must lie in space the views already taken saw through (the first is above the band). Every view is taken
-        before anything is chosen, and the vision-language model then judges the marks of all of them in one question:
-        a view from above cannot see the sides of a part, so which view shows the part best is part of the choice."""
+        """One view of the work, taken from straight behind the rover at the height of the part being grasped.
+
+        A lifting handle's neck is an upright post: a level view measures the width the jaws close on, and a view
+        from above cannot -- the head hides the neck (F60). So the camera goes where that measurement is made and
+        takes one frame there.
+
+        What this replaces was machinery for guessing where to point it: an overview from a pose fixed in the
+        chassis frame, a 5 cm height map, the tallest cell within 0.2 m of a located blob taken for "the item's
+        top", and a grid of 24 viewpoints aimed at that guess. None of it measured anything the grasp needed, and
+        all of it assumed the rover parks where that fixed pose expects. It does not -- the boundary chooses the
+        stand -- and when it parked 14 cm nearer, the guess landed on the ORU's body, every view framed the box,
+        and no 12 mm contact was ever measured (g9p, g9q, g9r, research F79). The declared contact is what can be
+        measured, so it is what is looked for, in the one view that can see it.
+        """
         g = self.goal
         self.stage("find")
-        # an overview from above the work area: the item's identity for the vision model (the side views show mostly
-        # the part), and the first free-space evidence for the side-view paths
-        x, y, z, pitch, yaw = g["overview_pose"]
-        # The overview is a place to look from, not a fixed posture. One written-down pose is a pose that does not
-        # know what is standing under it: the arm reaches it on an empty stand and stops short against the item on a
-        # full one (g5b stopped 0.13 m low, "blocked by contact"). Lower and shallower are offered in turn; taking
-        # the overview from a little lower costs some of the work zone, taking none of it costs the call.
-        taken = []
-        for dz, dpitch in ((0.0, 0.0), (-0.08, -10.0), (-0.16, -20.0), (0.0, -20.0)):
-            q_over = self.ik(np.array([x, y, z + dz]), tool_rotation(pitch + dpitch, yaw, 180.0), READY)
-            if q_over is None:
-                taken.append({"dz": dz, "dpitch": dpitch, "reachable": False})
-                continue
-            try:
-                self.plan_to(q_over, "find")
-                taken.append({"dz": dz, "dpitch": dpitch, "reachable": True})
+        # Where to look is derived, never written down. The caller names the place the item stands on; the boundary
+        # sends its surveyed point and the height work happens there -- the same height it stood the rover for. The
+        # camera goes level with that, far enough back that the part clears the gripper in its own view: the wrist
+        # camera sits behind the tool, so the tool stands off by that much less. Nothing here is particular to this
+        # item or this support, and both move with them.
+        at = self.work_point()
+        # how far the camera sits behind the tool, from the mount itself: one frame from wherever the arm is names
+        # its own optical frame, and TF gives the rest. The part depth asked for is a property of this camera and
+        # this gripper, so the tool's stand-off follows from it and nothing about the item enters here.
+        behind = float(np.linalg.norm(self.T(TCP_FRAME_ID, self.frame().frame_id)[:3, 3]))
+        stand_off = [float(d) - behind for d in g["view_part_depth_m"]]
+        tried, q, R, tool = [], None, None, None
+        for back in stand_off:
+            for pitch in (0.0, 10.0, 20.0):  # level first; a little down when the arm cannot fold that flat
+                R = tool_rotation(pitch, 0.0, 180.0)
+                tool = at - R[:, 2] * back
+                q = self.ik(tool, R, READY)
+                tried.append({"back_m": back, "pitch_deg": pitch, "reachable": q is not None})
+                if q is not None:
+                    break
+            if q is not None:
                 break
-            except StageFailure as exc:
-                taken.append({"dz": dz, "dpitch": dpitch, "reachable": False, "blocked": exc.why})
-        else:
-            raise StageFailure("find", "the arm cannot take an overview of the work zone from where the rover stands "
-                                       f"({len(taken)} postures tried). Trying again from here cannot help; the rover "
-                                       "has to stand somewhere else.", local_retry=False)
+        self._evidence["view_tried"] = tried
+        if q is None:
+            raise StageFailure("find", f"the arm cannot put its camera on {g.get('support') or 'this work'} at the "
+                                       f"height it is worked at ({at[2]:.2f} m) from where the rover stands: none of "
+                                       f"the {len(tried)} viewing poses is in reach. Trying again from here cannot "
+                                       "help; the rover has to stand somewhere else.", local_retry=False)
+        x, y, z = (float(v) for v in tool)
+        pitch = float(tried[-1]["pitch_deg"])
+        self.plan_to(q, "find")
         self.wait(0.8)
-        over = self.frame(after=self._clock() - 0.05)
-        overview = upright(over.bgr, over.up_cam)
-        # the overview's depth as well as its picture: the height map that decides where to aim is built from it, and
-        # without it a run that aimed at the wrong part of the item cannot be replayed off the bag (g9q, research F79)
-        np.save(self.evidence_dir / "overview_depth.npy", over.depth)
-        record = {"views": [], "overview": self.save("overview.jpg", overview), "overview_postures": taken}
-        self._evidence["find"] = record
-        self._heights: dict = {}
-        seen: list[Frame] = [over]
-        T_tc = self.T("tcp_frame", over.frame_id)  # the camera in the tool frame (robot geometry)
-        self._cam_tool = T_tc[:3, 3].copy()  # which side of the tool axis the camera sits on, from the mount itself
-        # the gripper's own place in its camera, from that mount: its depth and the image band it leaves free
-        self._tool_view = tool_in_view(over.K, np.linalg.inv(T_tc), *over.depth.shape)
+        f = self.frame(after=self._clock() - 0.05)
+        T_tc = self.T(TCP_FRAME_ID, f.frame_id)  # the camera in the tool frame (robot geometry)
+        self._cam_tool = T_tc[:3, 3].copy()
+        self._tool_view = tool_in_view(f.K, np.linalg.inv(T_tc), *f.depth.shape)
         self._gripper_mask_path = str(self.evidence_dir / "gripper_mask.npy")
         np.save(self._gripper_mask_path, self._tool_view["mask"])
         self._self_depth = float(self._tool_view["self_depth_m"])
         self.geom = dataclasses.replace(self.geom, self_depth_m=self._self_depth,
                                         min_part_depth_m=self._self_depth + 0.03)
-        record["tool_in_view"] = {k: v for k, v in self._tool_view.items() if k != "mask"} | {"mask": self._gripper_mask_path}
-        # where to look: what the overview measured standing above its surroundings inside the arm's work zone, tallest
-        # first. Not a fixed zone point -- an item that stands somewhere else takes its own place in this list, which is
-        # what "the item's placement is unknown" means (research repo F57).
-        regions = find_regions(over.depth, over.K, self.geom)
-        record["regions"] = [r.as_dict() for r in regions]
-        if not regions:
-            raise StageFailure("find", "the overview measured nothing standing in the arm's work zone behind the rover")
-        # Which of the things standing here is the item, settled once on the overview before any working view is taken.
-        # Without it the sweep goes to whatever stands out -- `aim_points` said as much itself, "nothing here knows
-        # where it was put" -- and in g4w four views out of five went to other structures, while the one that did find
-        # the handle saw it from above, where the head hides the neck. Where to look is part of the work, not a
-        # constant: the item is found first, and every working view is then a view of it.
-        marked_over = render_regions(over.bgr, regions, over.up_cam)
-        record["overview_marked"] = self.save("overview_marked.jpg", marked_over)
-        loc = self.vlm_call("locate", lambda: locate_region(self.vlm, g["vlm_model"], marked_over, g["target"],
-                                                            g["part"], regions))
-        record["locate"] = {k: loc[k] for k in ("item_visible", "what_is_visible", "choice", "reason")}
-        if loc["choice"] is None:
-            raise StageFailure("find", "none of the structures in view from here is the described item "
-                                       f"(the vision model saw: {loc['what_is_visible']})", local_retry=False)
-        P = over.to_base(np.array(next(r for r in regions if r.id == loc["choice"]).p_cam))
-        # the item's top, not wherever the dot happened to fall on it: a lifting handle stands on top of its payload,
-        # and a view aimed at the middle of the body pushes the handle to the edge of the frame. The overview's own
-        # height map says how high this item stands where it stands; no model of the item is used.
-        cell, heights = 0.05, surface_heights(seen, self._self_depth)
-        over_item = [h for (cx, cy), h in heights.items()
-                     if abs((cx + 0.5) * cell - P[0]) < 0.2 and abs((cy + 0.5) * cell - P[1]) < 0.2]
-        if over_item:
-            P[2] = max(max(over_item), float(P[2]))
-        record["aim"] = [round(float(v), 3) for v in P]
-        next_id = 1
-        gathered: list[tuple] = []  # (frame, its candidates, its marked image, the arm posture it was taken from)
-        # one working view per viewing direction, all of them of the item: a part that holds by interlock is only
-        # measurable from the side, and which direction shows it is not known before looking (F60 §5)
-        for pitch in [float(p) for p in g["side_view_pitch_deg"]]:
-            view = {"aim": record["aim"], "pitch_deg": pitch}
-            record["views"].append(view)
-            pose = self.side_view_pose(P, T_tc, over.K, seen, pitches=[pitch])
-            if pose is None:
-                view["reachable"] = False
-                continue
-            q, info = pose
-            view.update(info)
-            try:
-                self.plan_to(q, "find")
-            except StageFailure as exc:
-                # A viewpoint the arm turns out not to reach is one view fewer, not a failed pick. Taking every view
-                # before choosing means more of them, and the lowest of them stand close in to the structure being
-                # looked at, so some are found to be blocked only on the way (g4v stopped 0.12 rad short against
-                # contact). The sweep goes on; if none can be taken, `gathered` is empty and the stage says that.
-                view["reachable"], view["blocked"] = False, exc.why
-                continue
-            self.wait(0.8)
-            f = self.frame(after=self._clock() - 0.05)
-            f, framing = self.frame_part(f, q, info)  # what is in the view decides the framing, not the model of the camera
-            view["framing"] = framing
-            seen.append(f)
-            shots = [(info, f, q)]
-            rolled = self.rolled_view(info, P, T_tc, over.K, seen)  # the same place seen from the other side of the tool
-            if rolled is not None:
-                shots.append(rolled)
-                seen.append(rolled[1])
-            self._heights = surface_heights(seen, self._self_depth)
-            np.save(self.evidence_dir / f"view_p{int(pitch):02d}_depth.npy", f.depth)
-            shot_cands, marked_images = [], []
-            for shot_info, shot, shot_q in shots:
-                cands = find_candidates(shot.depth, shot.K, self.geom, max_candidates=int(g["candidates_per_view"]),
-                                        contact_width_m=self._contact_width)
-                for c in cands:
-                    c.id, next_id = next_id, next_id + 1
-                tag = f"p{int(pitch):02d}" + ("_rolled" if shot_info.get("roll") else "")
-                self.save(f"view_{tag}.jpg", upright(shot.bgr, shot.up_cam))
-                if cands:
-                    marked = render_candidates(shot.bgr, cands, shot.up_cam)
-                    marked_images.append(self.save(f"candidates_{tag}.jpg", marked))
-                    shot_cands.append((shot, cands, marked, shot_q))
-            view["candidates"] = sum(len(c) for _, c, _, _ in shot_cands)
-            view["marked"] = marked_images
-            gathered += shot_cands
-        # every view is taken before any of them is judged: the choice is between the views as much as within one, and
-        # the lower views are the ones that see the sides of a part (research repo F60)
-        if not gathered:
-            # Two different facts have been reported as one. A view the arm could not take says nothing about the
-            # item: it says the rover is parked where this work cannot be seen, and the caller is the only one who
-            # can change that (g9p took none of its six). A view that was taken and measured nothing is about the
-            # part, and is worth another look from here (g9q took three and found the neck on a retry).
-            taken = [v for v in record["views"] if v.get("reachable") is not False]
-            if not taken:
-                raise StageFailure("find", f"the arm cannot take any of the {len(record['views'])} working views of "
-                                           "this item from where the rover stands: every viewing posture is out of "
-                                           "its reach. Trying again from here cannot help; the rover has to stand "
-                                           "somewhere else to see this item.", local_retry=False)
-            raise StageFailure("find", f"none of the {len(taken)} views the arm could take measured anything the "
-                                       "jaws could close on"
+        self._heights = surface_heights([f], self._self_depth)
+        np.save(self.evidence_dir / "view_depth.npy", f.depth)
+        record = {"view": {"tool": [round(v, 3) for v in (x, y, z)], "pitch_deg": pitch},
+                  "tool_in_view": {k: v for k, v in self._tool_view.items() if k != "mask"}
+                                  | {"mask": self._gripper_mask_path}}
+        self._evidence["find"] = record
+        cands = find_candidates(f.depth, f.K, self.geom, max_candidates=int(g["candidates_per_view"]),
+                                contact_width_m=self._contact_width)
+        for i, c in enumerate(cands, 1):
+            c.id = i
+        record["view"]["image"] = self.save("view.jpg", upright(f.bgr, f.up_cam))
+        record["candidates"] = len(cands)
+        if not cands:
+            raise StageFailure("find", "the view of the work measured nothing the jaws could close on"
                                + (f" across the declared {self._contact_width * 1000:.0f} mm contact"
                                   if self._contact_width else ""))
-        all_cands = [c for _, cs, _, _ in gathered for c in cs]
-        self.stage("select", views=len(gathered), candidates=len(all_cands))
+        record["marked"] = self.save("candidates.jpg", render_candidates(f.bgr, cands, f.up_cam))
+        self.stage("select", views=1, candidates=len(cands))
         a = self.vlm_call("select", lambda: select_candidate(
-            self.vlm, g["vlm_model"], [m for _, _, m, _ in gathered], g["target"], g["part"], {c.id for c in all_cands}))
+            self.vlm, g["vlm_model"], [record["marked"]], g["target"], g["part"], {c.id for c in cands}))
         record["select"] = {k: a[k] for k in ("item_visible", "what_is_visible", "choice", "reason")}
         if a["choice"] is None:
-            raise StageFailure("select", f"none of the {len(all_cands)} marks in the {len(gathered)} views is on the "
-                                         "described part of the described item")
-        f, cands, _, _ = next(t for t in gathered if any(c.id == a["choice"] for c in t[1]))
-        # Approach uses this observation's own geometry; no return to its viewing posture.
+            raise StageFailure("select", f"none of the {len(cands)} marks in the view is on the described part of "
+                                         "the described item")
         from openral_rskill.grasp_perception import refine_contact
 
         selected = next(c for c in cands if c.id == a["choice"])
@@ -354,108 +292,9 @@ class PickRskill(EyeInHandSkill):
         np.save(self.evidence_dir / "selected_depth.npy", f.depth)
         self.save("selected_rgb.png", f.bgr)
         self._locked_frame = f
-        self._contact_views = seen
+        self._contact_views = [f]
         return selected, record["select"]
 
-    def rolled_view(self, info: dict, P: np.ndarray, T_tc: np.ndarray, K: np.ndarray, seen: list[Frame]):
-        """The same place seen from the other side of the tool: the fingers hide the opposite half of the image there, so
-        what one view hides (an overhanging head) the other shows."""
-        R = tool_rotation(info["pitch"], 0.0, 180.0 if not info.get("roll") else 0.0)
-        T = np.eye(4)
-        T[:3, :3], T[:3, 3] = R, P + np.array([info["back"], 0.0, info["rise"]])
-        if not pose_free(seen, self._heights, T, T_tc, float(self.goal["clearance_m"]), self._self_depth):
-            return None
-        q = self.ik(T[:3, 3], R, READY)
-        if q is None:
-            return None
-        try:
-            self.plan_to(q, "find")
-        except StageFailure:
-            return None  # the far side of the tool is one shot fewer, not a failed find (same rule as the views)
-        self.wait(0.8)
-        other = dict(info, roll=0.0 if info.get("roll") else 180.0)
-        f, framing = self.frame_part(self.frame(after=self._clock() - 0.05), q, other)
-        return dict(other, framing=framing), f, q
-
-    def frame_part(self, f: Frame, q: np.ndarray, info: dict) -> tuple[Frame, dict]:
-        """Keep what the view shows clear of the fingers: the graspable parts must sit in the image band the fingers do
-        not cover, with room above them for whatever overhangs them. When they sit too near that edge, the tool moves up
-        or down by the measured offset and the view is taken again."""
-        g = self.goal
-        cands = find_candidates(f.depth, f.K, self.geom, max_candidates=int(g["candidates_per_view"]),
-                                contact_width_m=self._contact_width)
-        if not cands:
-            return f, {"candidates": 0}
-        v = float(np.median([c.v for c in cands]))
-        depth = float(np.median([c.depth_m for c in cands]))
-        rows = int(g.get("image_rows_px", 480))
-        rolled = bool(info.get("roll"))
-        # the gripper always sits in the same place in its own camera (it is bolted to it), so the row the part should
-        # sit in does not depend on the tool's roll. The roll does flip which way the image moves when the tool moves.
-        target = float(self._tool_view["part_row"])
-        shift = (v - target) * depth / f.K[1, 1] * (-1.0 if rolled else 1.0)
-        out = {"part_row_px": round(v), "shift_m": round(shift, 3)}
-        if abs(shift) < float(g["framing_tolerance_m"]):
-            return f, out
-        p, R = self.tcp()
-        q2 = self.ik(p + np.array([0.0, 0.0, float(np.clip(shift, -0.2, 0.2))]), R, list(q))
-        if q2 is None:
-            return f, {**out, "moved": False}
-        try:
-            self.plan_to(q2, "find")
-        except StageFailure as exc:
-            # framing is an improvement on the view, not a requirement for it: the shot already taken still shows the
-            # part, only nearer the edge of the band the fingers leave free
-            return f, {**out, "moved": False, "blocked": exc.why}
-        self.wait(0.8)
-        return self.frame(after=self._clock() - 0.05), {**out, "moved": True}
-
-    def side_view_pose(self, P: np.ndarray, T_tc: np.ndarray, K: np.ndarray, seen: list[Frame],
-                       pitches: list[float] | None = None):
-        """The arm pose on its working branch whose wrist camera looks at P from the rover's side, P nearest the image
-        centre, with the tool -- there and along the joint path to it -- in space the earlier views saw through.
-
-        `pitches` restricts how steeply the camera may look down. One view per pitch is how the same part gets seen
-        from more than one direction, and a part that holds by interlock needs that: seen from above, a T-handle's
-        head hides its neck and the neck's 55 mm of free height reads as 8 mm of graspable length, which is below the
-        pads' own height and is dropped -- the grasp that holds is then not among the candidates at all (F60)."""
-        g = self.goal
-        options = []
-        rows = int(self.goal.get("image_rows_px", 480))
-        for back in g["side_view_back_m"]:
-            for rise in g["side_view_rise_m"]:
-                for pitch in (pitches if pitches is not None else g["side_view_pitch_deg"]):
-                    # the camera above the tool axis: payloads stand on their supports and are taken from above, so
-                    # this is the side the fingers will come from and the side the grasp will be seen from. The
-                    # opposite side is the second shot (`rolled_view`), for a part under an overhang.
-                    R = tool_rotation(pitch, 0.0, 180.0)
-                    T = np.eye(4)
-                    T[:3, :3], T[:3, 3] = R, P + np.array([back, 0.0, rise])
-                    pc = np.linalg.inv(T @ T_tc) @ np.append(P, 1.0)
-                    if pc[2] < 0.25:
-                        continue
-                    u, v = K[0, 0] * pc[0] / pc[2] + K[0, 2], K[1, 1] * pc[1] / pc[2] + K[1, 2]
-                    # the part in the middle of the image band the gripper does not hide -- the same band in every
-                    # frame, whatever the tool's roll, because the camera is bolted to the gripper
-                    want = float(self._tool_view["centre_row"])
-                    options.append((math.hypot(u - K[0, 2], v - want), T, dict(back=back, rise=rise, pitch=pitch, roll=180.0)))
-        q_from = np.array(self.arm_q())
-        heights = surface_heights(seen, self._self_depth)
-        clear = float(g["clearance_m"])
-        for off, T, info in sorted(options, key=lambda o: o[0]):
-            q = self.ik(T[:3, 3], T[:3, :3], READY)
-            if q is None:
-                continue
-            # the pose and the joint path to it, tool and arm links, clear of every surface the views measured
-            path = [(T, self.fk(q, self.ARM_LINKS)[1])]
-            for k in range(1, 6):
-                Tk, links = self.fk(q_from + (np.array(q) - q_from) * k / 6, self.ARM_LINKS)
-                path.append((Tk, links))
-            if all(pose_free(seen, heights, Tk, T_tc, clear, self._self_depth, links) for Tk, links in path):
-                return q, info
-        return None
-
-    # ---- approach -----------------------------------------------------------------------------------------------------
     def approach(self, cand: Candidate) -> None:
         """Approach a stationary, visually selected contact using measured robot pose feedback.
 
