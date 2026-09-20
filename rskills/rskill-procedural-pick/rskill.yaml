@@ -41,6 +41,9 @@ objects: []
 scenes:
   - "any"
 
+# `view_part_depth_m`: depths at which this wrist camera measures a part well -- past the gripper in its own
+# view, and near enough that the declared contact still spans pixels to measure. A property of the camera and
+# the gripper, not of any item: the tool stand-off is derived from it and from the camera mount read off TF.
 procedural:
   entrypoint: "openral_rskill.procedural_pick:PickRskill"
   default_goal_json: |
@@ -51,9 +54,6 @@ procedural:
       "vlm_model": "deepseek-flash",
       "vlm_endpoint": "https://api.deepseek.com",
       "reach_zone_x_m": -1.07,
-      # Depths at which this wrist camera measures a part well: past the gripper in its own view, and near
-      # enough that the declared contact still spans enough pixels to be measured. A property of the camera
-      # and the gripper, not of any item -- the tool stand-off is derived from it and the camera mount.
       "view_part_depth_m": [0.42, 0.34, 0.52],
       "clearance_m": 0.015,
       "image_rows_px": 480,
