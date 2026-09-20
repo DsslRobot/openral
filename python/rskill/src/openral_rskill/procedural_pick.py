@@ -459,7 +459,7 @@ class PickRskill(EyeInHandSkill):
         self._evidence["standoff"] = {**info, "tracked_frames": state["hits"], "missed_frames": state["misses"],
                                       "image": self.save("standoff.jpg", upright(self.frame(after=self._clock() - 0.05).bgr, None))}
         self.contact_permission("insertion")
-        state["standoff"] = -float(g["pad_offset_m"])
+        state["standoff"] = -self.geom.seat_depth_m  # drive the contact to the middle of the pads, not to the fingertips
         self.stage("approach", close_in=True)
         self._contact_length = float(cand.length_m)
         try:
@@ -500,7 +500,7 @@ class PickRskill(EyeInHandSkill):
         q = blocked = None
         found = False
         for side, R_t in options:
-            p_contact = state["p_base"] + R_t[:, 2] * float(self.goal["pad_offset_m"])
+            p_contact = state["p_base"] + R_t[:, 2] * self.geom.seat_depth_m
             for standoff_m in standoffs_m:  # the stand-offs this skill offers, in order: a local retry on the same grasp
                 p_g = state["p_base"] - R_t[:, 2] * standoff_m
                 q = self.ik(p_g, R_t, list(self.arm_q()))
@@ -644,7 +644,7 @@ class PickRskill(EyeInHandSkill):
         across = float(np.linalg.norm(e - gR[:, 1] * np.dot(e, gR[:, 1])))
         width = float(self._contact_width or self.geom.min_part_width_m)
         side_budget = max(0.0, (self.geom.open_width_m - width) / 2 - self.geom.clearance_m)
-        depth_budget = float(self.goal["pad_offset_m"])
+        depth_budget = self.geom.seat_tolerance_m
         rotation_error = float(np.linalg.norm(mat_to_rotvec(gR @ R.T)))
         # how long the contact region is along its own axis: the equipment catalogue where it says so (a lifting eye's
         # neck is as long as the catalogue's neck height), else what this view measured of it. The candidate itself is

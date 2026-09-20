@@ -36,10 +36,29 @@ class GripperGeometry:
     finger_width_m: float = 0.016  # finger thickness along the closing axis
     pad_height_m: float = 0.014  # minimum extent of the part along the pads (perpendicular to closing and approach)
     min_part_width_m: float = 0.005
+    #: where along the approach a part is actually clamped, past the tool origin -- from the gripper's own collision
+    #: meshes at a closed jaw: the fingertips reach 6 mm, the pads' clamping ridges run back to 30 mm, and the jaw
+    #: body closes the pocket at 43 mm. A part short of the near edge is pinched by the fingertip alone: ga1 closed
+    #: with the ORU's neck 3.2 mm in, held it, and lost it out of the front of the jaws during the drive (F81).
+    pad_band_m: tuple[float, float] = (0.006, 0.030)
     depth_step_m: float = 0.030  # how far both sides must fall away behind the part's front for the fingers to pass
     self_depth_m: float = 0.25  # nearer than this along the optical axis is the gripper itself in the wrist view
     min_part_depth_m: float = 0.28  # a part nearer than this is already at the fingers (the TCP is 0.22 m ahead of the camera)
     max_range_m: float = 1.2
+
+    @property
+    def seat_depth_m(self) -> float:
+        """How far past the tool origin to drive the contact before closing: the middle of the pads."""
+        return (self.pad_band_m[0] + self.pad_band_m[1]) / 2
+
+    @property
+    def seat_tolerance_m(self) -> float:
+        """How far off that seat the contact may still be and remain on the pads: half their length.
+
+        Aiming at the middle of the pads and accepting half their length are two different quantities from one
+        measurement. Using a single number for both (the old 12 mm `pad_offset_m`) accepted a contact that had not
+        entered the jaws at all."""
+        return (self.pad_band_m[1] - self.pad_band_m[0]) / 2
 
 
 @dataclass
