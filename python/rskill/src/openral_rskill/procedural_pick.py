@@ -273,10 +273,11 @@ class PickRskill(EyeInHandSkill):
             raise StageFailure("find", "the view of the work measured nothing the jaws could close on"
                                + (f" across the declared {self._contact_width * 1000:.0f} mm contact"
                                   if self._contact_width else ""))
-        record["marked"] = self.save("candidates.jpg", render_candidates(f.bgr, cands, f.up_cam))
+        marked = render_candidates(f.bgr, cands, f.up_cam)  # the vision model is shown the image, not its path
+        record["marked"] = self.save("candidates.jpg", marked)
         self.stage("select", views=1, candidates=len(cands))
         a = self.vlm_call("select", lambda: select_candidate(
-            self.vlm, g["vlm_model"], [record["marked"]], g["target"], g["part"], {c.id for c in cands}))
+            self.vlm, g["vlm_model"], [marked], g["target"], g["part"], {c.id for c in cands}))
         record["select"] = {k: a[k] for k in ("item_visible", "what_is_visible", "choice", "reason")}
         if a["choice"] is None:
             raise StageFailure("select", f"none of the {len(cands)} marks in the view is on the described part of "
