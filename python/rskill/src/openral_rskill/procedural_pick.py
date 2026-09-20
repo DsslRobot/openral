@@ -215,10 +215,14 @@ class PickRskill(EyeInHandSkill):
                 taken.append({"dz": dz, "dpitch": dpitch, "reachable": False, "blocked": exc.why})
         else:
             raise StageFailure("find", "the arm cannot take an overview of the work zone from where the rover stands "
-                                       f"({len(taken)} postures tried)")
+                                       f"({len(taken)} postures tried). Trying again from here cannot help; the rover "
+                                       "has to stand somewhere else.", local_retry=False)
         self.wait(0.8)
         over = self.frame(after=self._clock() - 0.05)
         overview = upright(over.bgr, over.up_cam)
+        # the overview's depth as well as its picture: the height map that decides where to aim is built from it, and
+        # without it a run that aimed at the wrong part of the item cannot be replayed off the bag (g9q, research F79)
+        np.save(self.evidence_dir / "overview_depth.npy", over.depth)
         record = {"views": [], "overview": self.save("overview.jpg", overview), "overview_postures": taken}
         self._evidence["find"] = record
         self._heights: dict = {}
@@ -315,7 +319,17 @@ class PickRskill(EyeInHandSkill):
         # every view is taken before any of them is judged: the choice is between the views as much as within one, and
         # the lower views are the ones that see the sides of a part (research repo F60)
         if not gathered:
-            raise StageFailure("find", f"none of the {len(record['views'])} views of the item measured anything the "
+            # Two different facts have been reported as one. A view the arm could not take says nothing about the
+            # item: it says the rover is parked where this work cannot be seen, and the caller is the only one who
+            # can change that (g9p took none of its six). A view that was taken and measured nothing is about the
+            # part, and is worth another look from here (g9q took three and found the neck on a retry).
+            taken = [v for v in record["views"] if v.get("reachable") is not False]
+            if not taken:
+                raise StageFailure("find", f"the arm cannot take any of the {len(record['views'])} working views of "
+                                           "this item from where the rover stands: every viewing posture is out of "
+                                           "its reach. Trying again from here cannot help; the rover has to stand "
+                                           "somewhere else to see this item.", local_retry=False)
+            raise StageFailure("find", f"none of the {len(taken)} views the arm could take measured anything the "
                                        "jaws could close on"
                                + (f" across the declared {self._contact_width * 1000:.0f} mm contact"
                                   if self._contact_width else ""))
@@ -685,9 +699,15 @@ class PickRskill(EyeInHandSkill):
                 "scene": self._evidence["contact_scene"], "reasons": reasons,
                 "physical_unreachable_proven": False,
             }
+            # Nothing blocked the tool: the arm simply has no configuration for this grasp from this base pose. That
+            # is a fact about where the rover is parked, not about the grasp, and only the caller can act on it --
+            # the boundary's own stand-off test passes distances the skills then cannot work from (g9q, research F79).
             raise StageFailure("approach", f"{cause}: no reachable insertion for the selected mark {cand.id} "
                                f"({cand.width_m * 1000:.1f} mm across, {cand.depth_m:.2f} m from the camera) in "
-                               f"{len(rec['tried'])} stand-off/side options", local_retry=False)
+                               f"{len(rec['tried'])} stand-off/side options"
+                               + ("" if reasons else ". The arm has no configuration that reaches this grasp from "
+                                  "where the rover stands, so trying again from here cannot help; the rover has to "
+                                  "stand somewhere else."), local_retry=False)
         if blocked:
             raise StageFailure("approach", f"the tool cannot stand in front of this grasp without touching {blocked}")
         self.plan_to(q, "approach")
