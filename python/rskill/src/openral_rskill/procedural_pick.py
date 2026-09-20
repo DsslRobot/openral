@@ -600,10 +600,18 @@ class PickRskill(EyeInHandSkill):
         self.contact_permission("insertion")
         state["standoff"] = -float(g["pad_offset_m"])
         self.stage("approach", close_in=True)
-        info = self.servo(goal_now, "approach", tol_m=0.005, tol_rad=0.04,
-                          max_speed_m_s=float(g["close_in_speed_m_s"]),
-                          max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
-                          timeout_s=60.0, stall_s=6.0, sag_integral=False, posture_gain=0.0)
+        self._contact_length = float(cand.length_m)
+        try:
+            info = self.servo(goal_now, "approach", tol_m=0.005, tol_rad=0.04,
+                              max_speed_m_s=float(g["close_in_speed_m_s"]),
+                              max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
+                              timeout_s=60.0, stall_s=6.0, sag_integral=False, posture_gain=0.0)
+        except StageFailure as exc:
+            # Stopping short along the part's own long axis is still on the committed contact region: the pads sit a
+            # little higher on the same neck. Across it, or in orientation, it is not (g9g stopped 6 mm up the neck).
+            if not exc.local_retry or not self.on_contact(*goal_now())["on_contact"]:
+                raise
+            info = {"stalled_on_contact": self._evidence["closure_precondition"], "why": exc.why}
         self._closure_goal = goal_now()
         p1, _ = self.tcp()
         self._evidence["close_in"] = {**info, "remaining_m": round(float(np.linalg.norm(state["p_base"] - p1)), 4),
@@ -749,19 +757,28 @@ class PickRskill(EyeInHandSkill):
         return result
 
     # ---- grasp + hold -----------------------------------------------------------------------------------------------------
+    def on_contact(self, gp: np.ndarray, gR: np.ndarray) -> dict:
+        """Is the tool on the committed contact region? The error across the part and the tool's orientation must be
+        within their budgets; along the part's own long axis the pads may sit anywhere the measured contact is long
+        enough to take them, because that is the same contact region (contract C2)."""
+        p, R = self.tcp()
+        e = gp - p
+        along = float(abs(np.dot(e, gR[:, 1])))  # the part's long axis: tool y, by construction of grasp_rotation
+        across = float(np.linalg.norm(e - gR[:, 1] * np.dot(e, gR[:, 1])))
+        rotation_error = float(np.linalg.norm(mat_to_rotvec(gR @ R.T)))
+        slack = max(0.0, (getattr(self, "_contact_length", 0.0) - self.geom.pad_height_m) / 2)
+        valid = self._evidence["target_lock"]["status"] == "committed"
+        self._evidence["closure_precondition"] = {
+            "position_error_m": float(np.linalg.norm(e)), "across_part_m": across, "along_part_m": along,
+            "along_part_budget_m": round(slack, 4), "rotation_error_rad": rotation_error, "target_valid": valid,
+            "on_contact": valid and across < 0.005 and along <= slack and rotation_error < 0.04,
+        }
+        return self._evidence["closure_precondition"]
+
     def grasp(self) -> float:
         # Recheck the actual pose immediately before closure. A stalled servo or
         # a nonempty jaw is not evidence that the selected contact was reached.
-        p, R = self.tcp()
-        gp, gR = self._closure_goal
-        position_error = float(np.linalg.norm(gp - p))
-        rotation_error = float(np.linalg.norm(mat_to_rotvec(gR @ R.T)))
-        valid = self._evidence["target_lock"]["status"] == "committed"
-        self._evidence["closure_precondition"] = {
-            "position_error_m": position_error, "rotation_error_rad": rotation_error,
-            "target_valid": valid, "satisfied": valid and position_error < 0.005 and rotation_error < 0.04,
-        }
-        if not self._evidence["closure_precondition"]["satisfied"]:
+        if not self.on_contact(*self._closure_goal)["on_contact"]:
             raise StageFailure("grasp", "selected contact pose not reached; jaws remain open", local_retry=False)
         self.stage("grasp")
         jaw = self.set_jaw(False, "grasp")
