@@ -263,11 +263,11 @@ class PickRskill(EyeInHandSkill):
                   "tool_in_view": {k: v for k, v in self._tool_view.items() if k != "mask"}
                                   | {"mask": self._gripper_mask_path}}
         self._evidence["find"] = record
-        cands = find_candidates(f.depth, f.K, self.geom, max_candidates=int(g["candidates_per_view"]),
-                                contact_width_m=self._contact_width)
+        record["view"]["image"] = self.save("view.jpg", upright(f.bgr, f.up_cam))  # before the detector, so a
+        cands = find_candidates(f.depth, f.K, self.geom,                            # failure still leaves the view
+                                max_candidates=int(g["candidates_per_view"]), contact_width_m=self._contact_width)
         for i, c in enumerate(cands, 1):
             c.id = i
-        record["view"]["image"] = self.save("view.jpg", upright(f.bgr, f.up_cam))
         record["candidates"] = len(cands)
         if not cands:
             raise StageFailure("find", "the view of the work measured nothing the jaws could close on"
