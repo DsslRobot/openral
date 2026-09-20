@@ -863,12 +863,17 @@ class PickRskill(EyeInHandSkill):
         # where the item would still clear the rover after sagging one grid step: stopping where it just clears left
         # it 2 mm over the deck edge, the wrist dipped as the servo let go, and the item wedged there (g9a, F78).
         step = 0.05
-        best = None
-        for dz in [round(step * k, 2) for k in range(0, 5 if self._held else 1)]:
+        best, raise_only, tried = None, None, []
+        for dz in [round(0.02 * k, 2) for k in range(0, 11 if self._held else 1)]:
             seed = list(self.arm_q())
             q = self.ik(p + np.array([0.0, 0.0, dz]), R, seed)
-            if q is None or not self.state_valid(np.array(q)):
-                break
+            # A height the arm cannot reach, or one where the item would still be over what it stood on, is one option
+            # fewer -- not the end of the search: g9j stopped at the first and left the payload over the depot stand.
+            if q is None or not self.state_valid(np.array(q), held_drop_m=step if self._held else 0.0):
+                tried.append({"raise_m": dz, "reachable": q is not None, "clear": False})
+                continue
+            tried.append({"raise_m": dz, "reachable": True, "clear": True})
+            raise_only = dz if raise_only is None else raise_only
             found, seed = None, list(q)
             for dx in [round(step * k, 2) for k in range(1, 13)]:
                 q = self.ik(p + np.array([dx, 0.0, dz]), R, seed)
@@ -877,12 +882,15 @@ class PickRskill(EyeInHandSkill):
                 found, seed = dx, list(q)
             if found is not None and (best is None or found > best[0]):
                 best = (found, dz)
+        if best is None and raise_only is not None:
+            best = (0.0, raise_only)  # out of the way of what it stood on, even when nothing can be pulled in
         self._evidence["bring_in"] = {"from": [round(float(v), 3) for v in p], "in_by_m": best[0] if best else 0.0,
-                                      "raised_by_m": best[1] if best else 0.0}
+                                      "raised_by_m": best[1] if best else 0.0, "tried": tried[:12]}
         if best is None:
             return
 
-        waypoints = ([p + np.array([0.0, 0.0, best[1]])] if best[1] else []) + [p + np.array([best[0], 0.0, best[1]])]
+        waypoints = ([p + np.array([0.0, 0.0, best[1]])] if best[1] else []) + (
+            [p + np.array([best[0], 0.0, best[1]])] if best[0] else [])
 
         try:
             # A joint-goal plan constrains only its endpoint: it can turn the
