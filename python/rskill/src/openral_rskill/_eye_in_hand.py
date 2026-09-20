@@ -528,12 +528,19 @@ class EyeInHandSkill(rSkillBase):
             return None
         js = res.solution.joint_state
         q = [float(js.position[list(js.name).index(j)]) for j in ARM_JOINT_NAMES]
-        # What the redundancy must not do is jump to the mirrored arm configuration mid-operation (research F57); a
-        # window on the joints said that badly -- it also refused poses the arm was already in, and every bring_in
-        # height came back unreachable (g9l, F78). The solution is seeded at the current joints: reject it when it
-        # lands somewhere else entirely, and let reach, collision and the servo decide the rest.
-        if max(abs(a - b) for a, b in zip(q, seed)) > BRANCH_JUMP_RAD:
-            self._evidence["last_ik"]["branch_jump_rad"] = round(max(abs(a - b) for a, b in zip(q, seed)), 3)
+        # What the redundancy must not do is jump to the mirrored arm configuration mid-operation (research F57).
+        # Neither half of that says it alone. The joint window by itself refused poses the arm was already in and
+        # made every bring_in height unreachable (g9l, F78); the distance from the seed by itself refused every
+        # deliberate reconfiguration, because the postures seeded at READY turn the wrist to look down -- all four
+        # `find` overviews solve on the working branch and still sit 1.6-2.6 rad from READY, in joint6/joint7, which
+        # are not in POSTURE (g9n). A solution is this arm's own configuration when it is on the working branch, or
+        # when it is next to the one the arm is in; a mirrored branch is neither, and reach, collision and the servo
+        # decide the rest.
+        jump = max(abs(a - b) for a, b in zip(q, seed))
+        off_branch = [j for j, (centre, half) in POSTURE.items()
+                      if abs(q[ARM_JOINT_NAMES.index(j)] - centre) > half]
+        if off_branch and jump > BRANCH_JUMP_RAD:
+            self._evidence["last_ik"].update(branch_jump_rad=round(jump, 3), off_branch=off_branch)
             return None
         return q
 
@@ -812,11 +819,15 @@ class EyeInHandSkill(rSkillBase):
         return {"waypoints": len(pts), "sim_s": round(self._clock() - t0, 1)}
 
     def move_to(self, p: np.ndarray, R: np.ndarray, stage: str, seed=None, rate_rad_s: float = 0.4) -> None:
-        """A larger reconfiguration: one IK solution for the pose (working branch, seeded at `seed` or the measured
-        joints), then a rate-limited joint-space move."""
+        """A larger reconfiguration: one IK solution for the pose (this arm's own configuration, seeded at `seed` or
+        the measured joints), then a rate-limited joint-space move."""
         q = self.ik(p, R, list(seed) if seed is not None else self.arm_q())
         if q is None:
-            raise StageFailure(stage, "no arm configuration on the working branch reaches that pose")
+            # Which of the two it was decides what the caller can do about it, so say it rather than "unreachable".
+            why = self._evidence.get("last_ik", {})
+            raise StageFailure(stage, f"the only configuration for that pose is a different one, {why['branch_jump_rad']} "
+                                      f"rad away at {'/'.join(why['off_branch'])}" if why.get("off_branch") else
+                                      "the arm has no configuration that reaches that pose")
         self.move_joints(q, stage, rate_rad_s=rate_rad_s)
 
     def servo_twist(self, goal: Callable[[], tuple[np.ndarray, np.ndarray] | None], stage: str, *, tol_m: float, tol_rad: float,
