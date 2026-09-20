@@ -56,8 +56,7 @@ class GripperGeometry:
         """How far off that seat the contact may still be and remain on the pads: half their length.
 
         Aiming at the middle of the pads and accepting half their length are two different quantities from one
-        measurement. Using a single number for both (the old 12 mm `pad_offset_m`) accepted a contact that had not
-        entered the jaws at all."""
+        measurement. One number serving as both accepted a contact that had not entered the jaws at all."""
         return (self.pad_band_m[1] - self.pad_band_m[0]) / 2
 
 
