@@ -44,6 +44,11 @@ READY = (0.0, -1.0, 0.0, -1.4, 0.0, 1.2, math.pi)
 JOINT_LIMITS_RAD = (3.107, 2.269, 3.107, 2.356, 3.107, 2.234, 6.283)
 #: how far a seeded IK solution may sit from the seed before it is another arm configuration rather than a nearby one
 BRANCH_JUMP_RAD = 1.2
+#: How far the carried item pivots about the jaw closing axis while it hangs from its handle: the largest tilt from
+#: vertical measured over every carry bag (g8s 14.1, g8t 4.7, g9m 12.5, g9o 15.4 deg), rounded up. The same bags say
+#: its yaw does not change -- modulo the box's own symmetry it stays within 14 deg of where it started -- so a
+#: carried item is not checked as a body that turns freely about the vertical (research F79).
+HELD_PIVOT_RAD = math.radians(16.0)
 #: The RM-75's working branch (joint: centre, half-range, rad): shoulder and forearm roll near zero, wrist roll unflipped.
 #: Unconstrained IK on this 7-DoF arm lands on arbitrary null-space branches (shoulder turned 90 deg, wrist rolled to its
 #: stop) from which the next small motion is impossible (research repo F57); the boundary's MoveIt posture preference is
@@ -671,17 +676,27 @@ class EyeInHandSkill(rSkillBase):
         from shape_msgs.msg import SolidPrimitive
 
         size = np.array(self._held["size_m"], float)
-        side = float(np.hypot(size[0], size[1]))
         height = float(size[2]) + float(self._held["neck_height_m"])
+        # The item hangs from its handle and turns with the jaws, not about the vertical: checking it as a prism
+        # swept over every yaw claimed 0.10 m per side of material that is not there, and that phantom cost bring_in
+        # exactly the travel it needed to carry the ORU past the stand it came from (0.228 m when nothing was checked,
+        # 0.105 m with the sweep; it needs its own half depth). What the bags do show is a pivot about the jaw closing
+        # axis, which swings the item across that axis (research F79).
+        along = float(size[0])  # the item's own x, the axis the jaws close along
+        across = float(size[1]) * math.cos(HELD_PIVOT_RAD) + height * math.sin(HELD_PIVOT_RAD)
         _, R = self.tcp()  # the servo keeps the tool's orientation; the offset is vertical in the rover frame
         centre = R.T @ np.array([0.0, 0.0, -self.held_bottom_below_tcp() + height / 2 - drop_m])
+        # upright in the rover frame, turned with the jaws: the item hangs gravity-vertical whatever the tool's pitch
+        jaw_axis = R[:, 0] * np.array([1.0, 1.0, 0.0])
+        jaw_axis = jaw_axis / np.linalg.norm(jaw_axis)
+        upright = np.column_stack([jaw_axis, [-jaw_axis[1], jaw_axis[0], 0.0], [0.0, 0.0, 1.0]])
         body = AttachedCollisionObject(link_name=TCP_FRAME_ID, touch_links=[f"eg2_link{i}" for i in range(1, 7)] + ["eg2_base"])
         body.object = CollisionObject(id="held_item", operation=CollisionObject.ADD)
         body.object.header.frame_id = TCP_FRAME_ID
-        body.object.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[side, side, height])]
+        body.object.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[along, across, height])]
         pose = Pose()
         pose.position.x, pose.position.y, pose.position.z = map(float, centre)
-        qx, qy, qz, qw = mat_to_quat(R.T)
+        qx, qy, qz, qw = mat_to_quat(R.T @ upright)
         pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = qx, qy, qz, qw
         body.object.primitive_poses = [pose]
         return body
