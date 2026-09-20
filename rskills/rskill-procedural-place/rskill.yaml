@@ -49,6 +49,7 @@ procedural:
       "support": "",
       "release_constraint": "unconstrained",
       "support_xyz_map": [0.0, 0.0, 0.0],
+      "support_normal_map": [1.0, 0.0, 0.0],
       "evidence_dir": "/tmp/openral_evidence",
       "carry_speed_m_s": 0.05,
       "carry_servo": {"tol_m": 0.03, "tol_rad": 0.08, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0},

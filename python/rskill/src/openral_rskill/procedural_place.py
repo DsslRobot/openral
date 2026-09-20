@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 
 from openral_rskill._eye_in_hand import JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure, mat_to_rotvec
+from openral_rskill.grasp_perception import GripperGeometry
 from openral_rskill.procedural_pick import tool_in_view
 
 __all__ = ["PlaceRskill"]
@@ -56,7 +57,34 @@ class PlaceRskill(EyeInHandSkill):
             self.carry_item(g["held_item"])
             height = max(height, s[2] + self.held_bottom_below_tcp())
         over = np.array([s[0], s[1], height])
-        self._evidence["over_plan"] = {"carry_height_m": round(float(p0[2]), 3), "over_height_m": round(float(height), 3)}
+        # The surveyed point is the middle of the surface, and an item whose envelope is nearly as deep as the
+        # surface cannot sit there: a shelf cantilevered off a wall has the wall right behind it, and in ga5 the
+        # ORU's envelope (0.485 m across a 0.6 m shelf) met `site/pdu_1` 1.5 mm inside its front face and the
+        # approach stalled 5.5 cm out with no reason a caller could act on. Which way is *off* the surface is the
+        # support's own outward normal, surveyed with it. Step along it until the robot's own collision check
+        # passes, no further than half the item's depth -- past that the item is more off the surface than on it.
+        off_by = 0.0
+        if g.get("held_item"):
+            n = T_bm[:3, :3] @ np.array(g.get("support_normal_map") or [0.0, 0.0, 0.0], float)
+            n[2] = 0.0
+            if np.linalg.norm(n) > 1e-6:
+                n /= np.linalg.norm(n)
+                step = float(GripperGeometry().min_part_width_m)  # the smallest feature this perception resolves
+                limit = float(np.max(g["held_item"]["size_m"][:2])) / 2
+                tried = []
+                for k in range(int(limit / step) + 1):
+                    cand = over + n * (k * step)
+                    q = self.ik(cand, R0, list(self.arm_q()))
+                    ok = q is not None and self.state_valid(np.asarray(q))
+                    tried.append({"off_support_m": round(k * step, 4), "reachable": q is not None, "clear": bool(ok)})
+                    if ok:
+                        over, off_by = cand, k * step
+                        break
+                self._evidence["over_offset"] = {"outward_normal_rover": [round(float(v), 3) for v in n],
+                                                 "limit_m": round(limit, 3), "chosen_m": round(off_by, 4),
+                                                 "tried": tried[:8]}
+        self._evidence["over_plan"] = {"carry_height_m": round(float(p0[2]), 3), "over_height_m": round(float(height), 3),
+                                       "off_support_m": round(off_by, 4)}
 
         for target in ([np.array([p0[0], p0[1], height])] if height > p0[2] else []) + [over]:
             def carrying(target=target):
