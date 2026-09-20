@@ -270,9 +270,16 @@ class PickRskill(EyeInHandSkill):
             c.id = i
         record["candidates"] = len(cands)
         if not cands:
+            # Say what the look was, not only that it found nothing: a part whose head overhangs the neck reads as
+            # its own width only from a level view, and this one is as level as the arm could manage from where the
+            # rover stands (g9t looked from 20 deg above and measured the 26 mm pedestal instead of the 12 mm neck).
+            level = [t for t in tried if t["pitch_deg"] == 0.0 and t["reachable"]]
             raise StageFailure("find", "the view of the work measured nothing the jaws could close on"
                                + (f" across the declared {self._contact_width * 1000:.0f} mm contact"
-                                  if self._contact_width else ""))
+                                  if self._contact_width else "")
+                               + (f". It was taken {pitch:.0f} deg above horizontal, because a level look at this "
+                                  "part is out of the arm's reach from where the rover stands"
+                                  if not level and pitch > 0 else ""))
         marked = render_candidates(f.bgr, cands, f.up_cam)  # the vision model is shown the image, not its path
         record["marked"] = self.save("candidates.jpg", marked)
         self.stage("select", views=1, candidates=len(cands))
