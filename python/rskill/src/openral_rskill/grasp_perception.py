@@ -123,8 +123,15 @@ def refine_contact(depth: np.ndarray, K: np.ndarray, candidate: Candidate,
 
 def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = GripperGeometry(),
                     angles_deg: tuple[float, ...] = tuple(range(0, 180, 15)), max_candidates: int = 12,
-                    border_px: int = 28) -> list[Candidate]:
-    """Antipodal parallel-jaw candidates on a depth image (metres along the optical axis)."""
+                    border_px: int = 28, contact_width_m: float | None = None) -> list[Candidate]:
+    """Antipodal parallel-jaw candidates on a depth image (metres along the optical axis).
+
+    With `contact_width_m` -- the declared width of the item's contact interface -- only places the jaws would close
+    across that width are offered. An interface says what may be held: for a lifting eye that is the neck, not the
+    head, the pedestal, or the neck's other cross-section. Places that do not measure as that contact are not grasps
+    of the declared interface, so they are never offered for selection (g9f carried a 30 mm cut of the same neck and
+    the drive pulled it out of the jaws).
+    """
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     h, w = depth.shape
     z_all = depth.astype(np.float32).copy()
@@ -256,6 +263,9 @@ def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = Gr
         # narrowest cut at a place, so the narrowest wins there; places are then ranked by depth step and extent
         score = min(c["step"], 0.3) / 0.3 + min(c["length"], 0.06) / 0.06
         cands.append(dict(c, p=p, axis=axis, part_axis=part_axis, score=score))
+    if contact_width_m is not None:
+        # the same two pixels of doubt at each measured edge the harness reconciles with
+        cands = [c for c in cands if abs(c["width"] - contact_width_m) <= 4 * c["front"] / fx]
     cands.sort(key=lambda c: c["width"])
     kept = []
     for c in cands:
@@ -469,8 +479,8 @@ def locate_region(client, model: str, marked_bgr: np.ndarray, target: str, part:
 SELECT_PROMPT = """{n} views from the camera on a robot's gripper, of the same work area from different heights and sides. The numbered yellow bars span parts the two fingers could close on; the numbering runs across all the views, so each number appears in exactly one of them.
 
 Task: pick up {target}, holding it by {part}.
-{convention}
-Choose the numbered mark where closing the jaws would hold that item by that part so it can be lifted without slipping. A view from lower down sees the sides of a part that a view from above cannot, so judge the marks across all the views and take the one that sits on the described part itself. Only a mark on the described item counts; if none is, the choice is null.
+
+Choose the numbered mark that lies on that part of that item. Judge every view: a view from lower down sees the sides of a part that a view from above cannot, and a mark on another object, on another part of the item, or on the structure it stands on is not a choice. If no mark lies on the described part of the described item, the choice is null.
 
 Reply with JSON only: {{"choice": <mark number or null>, "reason": "<one short sentence>"}}"""
 # Every view in one question. The single-view question this replaced was a concession to a gateway that timed out on
@@ -482,10 +492,9 @@ Reply with JSON only: {{"choice": <mark number or null>, "reason": "<one short s
 
 
 def select_candidate(client, model: str, marked_views: list[np.ndarray], target: str, part: str,
-                     ids: set[int], convention: str = "") -> dict:
+                     ids: set[int]) -> dict:
     """VLM set-of-mark choice over every marked view at once. Returns the parsed answer plus the raw reply."""
-    prompt = SELECT_PROMPT.format(n=len(marked_views), target=target, part=part,
-                                  convention=f"\n{convention}\n" if convention else "")
+    prompt = SELECT_PROMPT.format(n=len(marked_views), target=target, part=part)
     answer, reply = ask_json(client, model, prompt, marked_views)
     choice = answer.get("choice")
     choice = choice if choice in ids else None

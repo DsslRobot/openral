@@ -52,7 +52,6 @@ procedural:
       "vlm_endpoint": "https://api.deepseek.com",
       "reach_zone_x_m": -1.07,
       "overview_pose": [-0.85, 0.0, 1.10, 50, 0],
-      "handle_convention": "",
       "clearance_m": 0.015,
       "image_rows_px": 480,
       "grasp_clear_radius_m": 0.10,

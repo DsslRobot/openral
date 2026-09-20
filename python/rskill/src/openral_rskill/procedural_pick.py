@@ -182,6 +182,11 @@ class PickRskill(EyeInHandSkill):
             raise StageFailure(stage, f"the vision-language model ({self.goal['vlm_model']}) did not answer: {type(exc).__name__}") from exc
 
     # ---- find + select --------------------------------------------------------------------------------------------------
+    @property
+    def _contact_width(self) -> float | None:
+        """The width the jaws close across at the item's declared contact interface (equipment catalogue), if given."""
+        return (self.goal.get("held_item") or {}).get("closing_width_m")
+
     def find_and_select(self) -> tuple[Candidate, dict]:
         """Side views of the arm's reach zone from the top of the grasp band downwards. Each view pose, and the joint path
         to it, must lie in space the views already taken saw through (the first is above the band). Every view is taken
@@ -294,7 +299,8 @@ class PickRskill(EyeInHandSkill):
             np.save(self.evidence_dir / f"view_p{int(pitch):02d}_depth.npy", f.depth)
             shot_cands, marked_images = [], []
             for shot_info, shot, shot_q in shots:
-                cands = find_candidates(shot.depth, shot.K, self.geom, max_candidates=int(g["candidates_per_view"]))
+                cands = find_candidates(shot.depth, shot.K, self.geom, max_candidates=int(g["candidates_per_view"]),
+                                        contact_width_m=self._contact_width)
                 for c in cands:
                     c.id, next_id = next_id, next_id + 1
                 tag = f"p{int(pitch):02d}" + ("_rolled" if shot_info.get("roll") else "")
@@ -310,12 +316,13 @@ class PickRskill(EyeInHandSkill):
         # the lower views are the ones that see the sides of a part (research repo F60)
         if not gathered:
             raise StageFailure("find", f"none of the {len(record['views'])} views of the item measured anything the "
-                                       "jaws could close on")
+                                       "jaws could close on"
+                               + (f" across the declared {self._contact_width * 1000:.0f} mm contact"
+                                  if self._contact_width else ""))
         all_cands = [c for _, cs, _, _ in gathered for c in cs]
         self.stage("select", views=len(gathered), candidates=len(all_cands))
         a = self.vlm_call("select", lambda: select_candidate(
-            self.vlm, g["vlm_model"], [m for _, _, m, _ in gathered], g["target"], g["part"],
-            {c.id for c in all_cands}, g["handle_convention"]))
+            self.vlm, g["vlm_model"], [m for _, _, m, _ in gathered], g["target"], g["part"], {c.id for c in all_cands}))
         record["select"] = {k: a[k] for k in ("item_visible", "what_is_visible", "choice", "reason")}
         if a["choice"] is None:
             raise StageFailure("select", f"none of the {len(all_cands)} marks in the {len(gathered)} views is on the "
@@ -361,7 +368,8 @@ class PickRskill(EyeInHandSkill):
         not cover, with room above them for whatever overhangs them. When they sit too near that edge, the tool moves up
         or down by the measured offset and the view is taken again."""
         g = self.goal
-        cands = find_candidates(f.depth, f.K, self.geom, max_candidates=int(g["candidates_per_view"]))
+        cands = find_candidates(f.depth, f.K, self.geom, max_candidates=int(g["candidates_per_view"]),
+                                contact_width_m=self._contact_width)
         if not cands:
             return f, {"candidates": 0}
         v = float(np.median([c.v for c in cands]))
