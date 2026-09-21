@@ -906,7 +906,8 @@ class EyeInHandSkill(rSkillBase):
               step_m: float = 0.04, step_rad: float = 0.2, guard: Callable[[np.ndarray], str] | None = None,
               null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
               max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4,
-              check_scene: bool = True, gain_per_s: float | None = None, advance_m_s: float | None = None) -> dict:
+              check_scene: bool = True, gain_per_s: float | None = None, advance_m_s: float | None = None,
+              advance_ramp_s: float = 0.0) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
         servoing); `goal()` returning None keeps the last goal. Each cycle the goal, corrected by the integral of the
         remaining position error (arm sag under a load), goes through the arm's inverse kinematics on its working branch
@@ -930,7 +931,11 @@ class EyeInHandSkill(rSkillBase):
         path drifts sideways by about 0.23 mm for every millimetre it advances: sideways error settled at 8-11 mm in
         gb7r4 (the model in `experiments/lateral.py` gives 11.1 mm) against a slot that leaves a finger 5 mm each
         side. At 1 cm/s that error is 2.2 mm. The tolerance, the progress test and the stall test still read the
-        distance to the true goal."""
+        distance to the true goal. `advance_ramp_s` brings the reference up to speed smoothly: the arm's joints do not
+        start together, and the breakaway threw the tool 9 mm high in gb7r5; the loop integrated that into its
+        command, which fell 6.5 mm below the goal when the tool came back and put a finger on the collar. A model of
+        that loop (`experiments/dip.py`): a ramp that halves the disturbance and a gain of 0.5 per second hold the
+        command within 4 mm of the goal (a 12 mm dip at a gain of 1)."""
         t0 = t_prev = self._clock()
         best, t_best, inside, last_goal, integ, blocked = math.inf, t0, 0, None, np.zeros(3), 0
         p_start, t_adv = None, t0
@@ -958,7 +963,10 @@ class EyeInHandSkill(rSkillBase):
                     p_start, t_adv = p.copy(), now
                 line = gp - p_start
                 reach = float(np.linalg.norm(line))
-                ec = p_start + line / max(reach, 1e-9) * min(reach, advance_m_s * (now - t_adv)) - p
+                te = now - t_adv
+                travelled = advance_m_s * (te * te / (2 * advance_ramp_s) if te < advance_ramp_s else te - advance_ramp_s / 2) \
+                    if advance_ramp_s else advance_m_s * te
+                ec = p_start + line / max(reach, 1e-9) * min(reach, travelled) - p
             r = mat_to_rotvec(gR @ R.T)
             en, rn = float(np.linalg.norm(e)), float(np.linalg.norm(r))
             if en < tol_m and rn < tol_rad:
