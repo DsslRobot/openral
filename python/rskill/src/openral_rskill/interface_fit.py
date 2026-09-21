@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-__all__ = ["Fit", "boxes", "locate", "track", "yaw_of"]
+__all__ = ["DiscFit", "Fit", "boxes", "locate", "locate_disc", "track", "yaw_of"]
 
 SIGMA_M = 0.003  # a depth pixel that agrees: within one pixel's worth of range at the working distance
 
@@ -201,3 +201,103 @@ def track(depth: np.ndarray, K: np.ndarray, dims: dict, up_cam: np.ndarray, xyz_
     if len(zm) < 20:
         return Fit(np.asarray(xyz_cam, float), yaw, 0.0, 9.9, 0)
     return _judge(depth, K, up, B, _fit(rays, zm, up, B, [*xyz_cam, yaw], iters=4))
+
+
+@dataclass
+class DiscFit:
+    tip_cam: np.ndarray     # the button's front-most point, on its axis, in the camera
+    normal_cam: np.ndarray  # the plate's normal, towards the camera
+    agreement: float        # fraction of the button's own projected pixels the depth agrees with
+    residual_m: float
+    points: int
+
+    def as_dict(self) -> dict:
+        return {"tip_cam": [round(float(v), 4) for v in self.tip_cam], "normal_cam": [round(float(v), 4) for v in self.normal_cam],
+                "agreement": round(self.agreement, 3), "residual_m": round(self.residual_m, 4), "points": self.points}
+
+
+def _cap_profile(rho: np.ndarray, d: dict) -> np.ndarray:
+    """Height above the plate of the declared button at distance `rho` from its axis: the dome, then the collar
+    round its foot, then the plate."""
+    h = np.zeros_like(rho)
+    h[rho <= d["collar_radius_m"]] = d["collar_top_height_m"]
+    dome = rho <= d["cap_radius_m"]
+    h[dome] = d["cap_centre_height_m"] + np.sqrt(np.maximum(d["cap_radius_m"] ** 2 - rho[dome] ** 2, 0.0))
+    return h
+
+
+def _plate(P: np.ndarray, iters: int = 80) -> tuple[np.ndarray, np.ndarray]:
+    """The plane most of `P` lies in (points within two depth pixels' worth of it), normal towards the camera."""
+    rng = np.random.default_rng(0)
+    best, best_n = None, -1
+    for _ in range(iters):
+        s = P[rng.choice(len(P), 3, replace=False)]
+        n = np.cross(s[1] - s[0], s[2] - s[0])
+        if np.linalg.norm(n) < 1e-9:
+            continue
+        n /= np.linalg.norm(n)
+        k = int((np.abs((P - s[0]) @ n) < 2 * SIGMA_M).sum())
+        if k > best_n:
+            best, best_n = (n, s[0]), k
+    n, p0 = best
+    inl = np.abs((P - p0) @ n) < 2 * SIGMA_M
+    c = P[inl].mean(0)
+    n = np.linalg.svd(P[inl] - c)[2][2]
+    return (-n if n[2] > 0 else n), c
+
+
+def locate_disc(depth: np.ndarray, K: np.ndarray, dims: dict, hint_px: tuple[float, float]) -> DiscFit | None:
+    """Where a declared push button is, from one wrist depth frame, as `locate` does for the lifting interface.
+
+    The catalogue says what the button is -- a dome on a collar on a plate, with its dimensions. The plate is what
+    most of the picture around the hint lies in; the button is then the position on that plate at which the declared
+    shape explains the depth better than the bare plate does. The hint is the vision model's pixel and only says
+    which feature is meant: it may be centimetres off (mc1: 5.7 cm at the stand-off view) and the answer does not
+    depend on it, provided the button is within reach of the window. Nothing is thresholded; the answer says how well
+    the shape agrees over its own footprint, and a hint on something that is not this button agrees badly."""
+    fx, u0, v0 = float(K[0, 0]), int(round(hint_px[0])), int(round(hint_px[1]))
+    z0 = np.nanmedian(depth[max(v0 - 3, 0):v0 + 4, max(u0 - 3, 0):u0 + 4])
+    if not np.isfinite(z0) or z0 < 0.05:
+        return None
+    Rc = float(dims["collar_radius_m"])
+    half = int(3.2 * float(dims["cap_radius_m"]) * fx / z0)
+    v, u = np.mgrid[max(v0 - half, 0):min(v0 + half + 1, depth.shape[0]), max(u0 - half, 0):min(u0 + half + 1, depth.shape[1])]
+    step = max(1, int(np.sqrt(v.size / 9000)))
+    v, u = v[::step, ::step].ravel(), u[::step, ::step].ravel()
+    z = depth[v, u]
+    ok = np.isfinite(z) & (z > 0.05)
+    v, u, z = v[ok], u[ok], z[ok]
+    P = np.stack([(u - K[0, 2]) * z / K[0, 0], (v - K[1, 2]) * z / K[1, 1], z], -1)
+    c0 = np.array([(u0 - K[0, 2]) * z0 / K[0, 0], (v0 - K[1, 2]) * z0 / K[1, 1]])
+    rho = np.linalg.norm(P[:, :2] - c0, axis=1)
+    ring = (rho > 1.7 * Rc) & (rho < 3.0 * Rc)
+    if ring.sum() < 200:
+        return None
+    n, p0 = _plate(P[ring])
+    e1 = np.cross(n, [0.0, 1.0, 0.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    a, b, h = (P - p0) @ e1, (P - p0) @ e2, (P - p0) @ n
+    a0, b0 = (np.array([c0[0], c0[1], z0]) - p0) @ e1, (np.array([c0[0], c0[1], z0]) - p0) @ e2
+    w = 2 * SIGMA_M
+
+    def gain(ca: np.ndarray, cb: np.ndarray) -> np.ndarray:
+        """How much better the button at (ca, cb) explains the depth than the bare plate: the sum over the picture of
+        (agreement with the shape) - (agreement with the plate)."""
+        r = np.hypot(a[None, :] - ca[:, None], b[None, :] - cb[:, None])
+        return (np.exp(-((h[None, :] - _cap_profile(r, dims)) / w) ** 2) - np.exp(-((h / w) ** 2))[None, :]).sum(1)
+
+    reach = 1.5 * float(dims["cap_radius_m"])
+    gs, step_m = np.meshgrid(np.arange(-reach, reach + 1e-9, 0.003), np.arange(-reach, reach + 1e-9, 0.003))
+    cand = np.stack([a0 + gs.ravel(), b0 + step_m.ravel()], 1)
+    best = cand[int(np.argmax(gain(cand[:, 0], cand[:, 1])))]
+    fine = np.stack(np.meshgrid(best[0] + np.arange(-0.003, 0.0031, 0.0005), best[1] + np.arange(-0.003, 0.0031, 0.0005)), -1).reshape(-1, 2)
+    ca, cb = fine[int(np.argmax(gain(fine[:, 0], fine[:, 1])))]
+    r = np.hypot(a - ca, b - cb)
+    inside = r <= Rc
+    if inside.sum() < 30:
+        return DiscFit(p0, n, 0.0, 9.9, int(inside.sum()))
+    res = np.abs(h[inside] - _cap_profile(r[inside], dims))
+    good = res < 2 * SIGMA_M
+    tip = p0 + e1 * ca + e2 * cb + n * (dims["cap_centre_height_m"] + dims["cap_radius_m"])
+    return DiscFit(tip, n, float(good.mean()), float(res[good].mean()) if good.any() else 9.9, int(inside.sum()))

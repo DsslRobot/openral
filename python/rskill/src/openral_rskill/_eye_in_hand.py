@@ -921,7 +921,7 @@ class EyeInHandSkill(rSkillBase):
               null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
               max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4,
               check_scene: bool = True, gain_per_s: float | None = None, advance_m_s: float | None = None,
-              advance_ramp_s: float = 0.0, scene_from_measured: bool = False) -> dict:
+              advance_ramp_s: float = 0.0, scene_from_measured: bool = False, stall_returns: bool = False) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
         servoing); `goal()` returning None keeps the last goal. Each cycle the goal, corrected by the integral of the
         remaining position error (arm sag under a load), goes through the arm's inverse kinematics on its working branch
@@ -953,7 +953,9 @@ class EyeInHandSkill(rSkillBase):
         from the goal and the command 6 mm below it: the arm settles about 6 mm above what it is told, so a loop that
         integrates the error holds a command below the goal, where the fingers are on the collar in the model and
         clear of it in the world. `scene_from_measured` asks the scene the physical question: from where the arm
-        is, does the next step touch anything."""
+        is, does the next step touch anything. With `stall_returns` a stall -- the tool no longer approaching a goal it
+        is still being driven to -- comes back as a result ({"stalled": True, ...}) and not as a failure, for a stroke
+        whose end is a surface taking the load."""
         t0 = t_prev = self._clock()
         best, t_best, inside, last_goal, integ, blocked = math.inf, t0, 0, None, np.zeros(3), 0
         p_start, t_adv = None, t0
@@ -1002,6 +1004,8 @@ class EyeInHandSkill(rSkillBase):
                     {"stage": stage, "tcp": [round(float(v), 3) for v in p], "goal": [round(float(v), 3) for v in gp],
                      "joints": np.round(q_meas, 2).tolist(), "command_minus_measured": np.round(lag, 2).tolist(),
                      "image": self.save(f"stall_{stage}_{len(self._evidence.get('stalls', []))}.jpg", self.frame(after=self._clock() - 0.05).bgr)})
+                if stall_returns:  # a stall is the outcome the caller is looking for (a face taking the load), not a failure
+                    return {"stalled": True, "pos_err_m": round(en, 4), "rot_err_rad": round(rn, 4), "sim_s": round(now - t0, 2)}
                 raise StageFailure(stage, f"arm stopped making progress {en * 100:.1f} cm / {math.degrees(rn):.0f} deg from its goal; "
                                           f"tool at {[round(float(v), 3) for v in p]}, joints {np.round(q_meas, 2).tolist()}, "
                                           f"commanded minus measured {np.round(lag, 2).tolist()}"
