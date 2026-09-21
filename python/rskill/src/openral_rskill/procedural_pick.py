@@ -311,7 +311,8 @@ class PickRskill(EyeInHandSkill):
             info = self.servo(goal_now, "approach", tol_m=0.006, tol_rad=0.04,
                               max_speed_m_s=float(g["approach_speed_m_s"]),
                               max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
-                              timeout_s=float(g["approach_timeout_s"]), stall_s=6.0)
+                              timeout_s=float(g["approach_timeout_s"]), stall_s=6.0,
+                              gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)  # empty jaws: no load to sag under
         except StageFailure as exc:
             # the stand-off is a place to close in from, not a pose to hit (g5g stopped 0.4 cm short of it)
             if not exc.local_retry:
@@ -331,7 +332,8 @@ class PickRskill(EyeInHandSkill):
             info = self.servo(goal_now, "approach", tol_m=0.003, tol_rad=0.04,
                               max_speed_m_s=float(g["close_in_speed_m_s"]),
                               max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
-                              timeout_s=60.0, stall_s=6.0, sag_integral=False, posture_gain=0.0)
+                              timeout_s=60.0, stall_s=6.0, sag_integral=False, posture_gain=0.0,
+                              gain_per_s=float(g["servo_gain_per_s"]))
         except StageFailure as exc:
             # stopping short along the slot is still on the neck; across it, or in orientation, is not (g9g)
             if not exc.local_retry or not self.on_contact(*goal_now())["on_contact"]:

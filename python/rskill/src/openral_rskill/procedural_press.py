@@ -14,7 +14,9 @@ Stages (each with its own evidence):
               there, where it is larger and its depth better, and the stand-off corrected once.
 3. press   -- a guarded straight close-in along the tool axis past the face by `press_depth_m`, stopped by contact:
               the tool stops advancing while still commanded to (the panel takes the load), which is how `place` reads
-              a support taking a payload.
+              a support taking a payload. If the whole stroke is made and nothing pushes back, that is recorded
+              (`contact.resisted` false) and the operation goes on to retreat: whether the press happened is the
+              independent check's to say, from where the tool went.
 4. retreat -- straight back out to the stand-off.
 
 Failures return the stage reached and its evidence. Nothing here chooses another target or moves the base.
@@ -28,7 +30,7 @@ import math
 
 from openral_rskill._eye_in_hand import BASE_FRAME_ID, READY, TCP_FRAME_ID, EyeInHandSkill, StageFailure, mat_to_rotvec
 from openral_rskill.grasp_perception import depth_at, locate_point, upright
-from openral_rskill.procedural_pick import tool_rotation
+from openral_rskill.procedural_pick import tool_in_view, tool_rotation
 
 __all__ = ["PressRskill"]
 
@@ -54,6 +56,7 @@ class PressRskill(EyeInHandSkill):
         self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=120,
                           max_retries=0, http_client=http)
         self._evidence.update(target=g["target"])
+        self._tool_view = None  # where the gripper is in its own camera; read off the first frame
         try:
             self.press_it()
         finally:
@@ -108,9 +111,18 @@ class PressRskill(EyeInHandSkill):
         if pt is None:
             raise StageFailure("locate", f"the wrist camera does not see {self.goal['target']!r}: {rec['reason']}",
                                local_retry=False)
+        # The target must not be the gripper's own body in its own camera. How far out that body reaches in the camera
+        # follows from the mount and the tool's dimensions (`tool_in_view`, 0.285 m, as `pick` uses it): a surface
+        # measured beyond it cannot be the gripper. A depth written down instead (`min_depth_m` 0.315) refused a
+        # button measured at 0.3142 m in plain view in the middle of the frame, and the gripper's silhouette mask,
+        # which over-covers by design, reaches the button's lower edge (F94).
+        if self._tool_view is None:
+            self._tool_view = tool_in_view(f.K, np.linalg.inv(self.T(TCP_FRAME_ID, f.frame_id)), *f.depth.shape)
         d = depth_at(f.depth, *pt)
-        if d is None or d < float(self.goal["min_depth_m"]):
-            raise StageFailure("locate", f"nothing measurable at that pixel (depth {d})", local_retry=False)
+        if d is None or d <= float(self._tool_view["self_depth_m"]):
+            raise StageFailure("locate", f"the pixel the vision model chose measures {d} m, within the gripper's own reach "
+                                         f"in this camera ({self._tool_view['self_depth_m']} m): that is the gripper, not the target",
+                               local_retry=False)
         x = (pt[0] - f.K[0, 2]) * d / f.K[0, 0]
         y = (pt[1] - f.K[1, 2]) * d / f.K[1, 1]
         self._evidence["views"][-1]["depth_m"] = round(float(d), 4)
@@ -176,13 +188,18 @@ class PressRskill(EyeInHandSkill):
         v_in = float(g["press_speed_m_s"])
         t_start = t_cmd = self._clock()
         q_cmd = np.array(self.arm_q())
-        prev, slow_since, contact = self.tcp()[0], None, False
-        while not contact:
+        prev, slow_since, contact, stroke_done = self.tcp()[0], None, False, False
+        while not contact and not stroke_done:
             p, R_now = self.tcp()
             self.working_on(p)
             if float(np.dot(p - goal_p, -n)) >= 0.0:
-                raise StageFailure("press", f"went {g['press_depth_m']} m past the face without meeting it",
-                                   local_retry=False)
+                # The whole stroke, and nothing pushed back. That is a fact to record, not a failure to declare: a
+                # button that gives way, or a face the simulator does not resist, ends here with the tool at its
+                # full travel, and whether the press happened is for the independent check to say from where the tool
+                # went and whether the lamp changed. Declaring it a miss reported "failed" for a press the evaluator
+                # had counted -- PDU-2's fault was cleared and the skill said it never met the face (F94).
+                stroke_done = True
+                break
             now = self._clock()
             dt = max(now - t_cmd, 1e-3)
             q_cmd = self.resolved_rate_step(q_cmd, -n * v_in * 0.5, mat_to_rotvec(R @ R_now.T) * 0.5, 0.3 * dt)
@@ -203,11 +220,15 @@ class PressRskill(EyeInHandSkill):
         self.hold_here()
         self.wait(0.3)
         p_contact = self.tcp()[0]
-        self._evidence["contact"] = {"tcp": [round(float(v), 4) for v in p_contact],
+        self._evidence["contact"] = {"tcp": [round(float(v), 4) for v in p_contact], "resisted": bool(contact),
                                      "past_face_m": round(float(np.dot(X - p_contact, n)), 4),
                                      "image": self.save("contact.jpg", upright(self.frame(after=self._clock() - 0.05).bgr, None))}
 
         self.stage("retreat")
-        self.servo(lambda: (X + n * self._stand, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0)
+        # straight back out along the line it came in on: the panel's collision box stands proud of the button by more
+        # than the tool went past it, so the start of this stroke is inside the box by construction (F94) -- the same
+        # reason `pick`'s lift does not check the scene for the stroke that leaves what it holds
+        self.servo(lambda: (X + n * self._stand, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=False,
+                   gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
         self._evidence["retreated_to"] = [round(float(v), 4) for v in self.tcp()[0]]
         self._evidence["outcome"] = "pressed"

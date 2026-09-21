@@ -46,11 +46,11 @@ procedural:
       "vlm_endpoint": "https://api.deepseek.com",
       "view_part_depth_m": [0.42, 0.34, 0.52],
       "standoff_m": 0.10,
+      "servo_gain_per_s": 1.0,
       "press_depth_m": 0.03,
       "press_speed_m_s": 0.02,
       "contact_confirm_s": 0.6,
-      "correction_done_m": 0.006,
-      "min_depth_m": 0.315
+      "correction_done_m": 0.006
     }
 
 goal_params_schema:

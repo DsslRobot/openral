@@ -906,13 +906,22 @@ class EyeInHandSkill(rSkillBase):
               step_m: float = 0.04, step_rad: float = 0.2, guard: Callable[[np.ndarray], str] | None = None,
               null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
               max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4,
-              check_scene: bool = True) -> dict:
+              check_scene: bool = True, gain_per_s: float | None = None) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
         servoing); `goal()` returning None keeps the last goal. Each cycle the goal, corrected by the integral of the
         remaining position error (arm sag under a load), goes through the arm's inverse kinematics on its working branch
         seeded at the measured joints, and the joint targets move towards the solution at a limited rate.
         A short empty-jaw insertion turns off the sag integral and the posture pull: with the joints lagging their
-        targets by up to a second, both carried the tool past and beside a close-in goal (g8q replay, F78)."""
+        targets by up to a second, both carried the tool past and beside a close-in goal (g8q replay, F78).
+
+        `gain_per_s` is the loop's speed per metre of error. Left None the step is the whole remaining error every cycle
+        (limited only by `max_speed_m_s`): a command that integrates the measured error at 20 per second, through an
+        arm that answers a command 0.5-0.75 s late (gb7's bag: the command's peaks lead the measured joints' by that
+        much), is a limit cycle for any delay over 0.3 s -- the tool swings +-1 cm about the goal and never sits inside
+        a 3 mm band, and the stage ends 'arm stopped making progress 2.9 cm from its goal' (gb7r1; gb2's 2.6 cm
+        stall was the same). A gain of 1 per second is stable for delays up to a second on the simulated loop
+        (`experiments/servo_loop.py`) with no sag integral; that integral adds a second integrator and is only for
+        stages that carry a load."""
         t0 = t_prev = self._clock()
         best, t_best, inside, last_goal, integ, blocked = math.inf, t0, 0, None, np.zeros(3), 0
         trace: list[dict] = []
@@ -961,6 +970,8 @@ class EyeInHandSkill(rSkillBase):
             # move the tool a short way along the straight line to the goal, through the Jacobian: a step, not a new
             # arm configuration
             dx = (e + integ) * min(1.0, step_m / max(en, 1e-6))
+            if gain_per_s is not None:
+                dx = dx * min(1.0, gain_per_s * dt)
             if max_speed_m_s is not None:
                 dx *= min(1.0, max_speed_m_s * dt / max(float(np.linalg.norm(dx)), 1e-9))
             dw = r * min(1.0, step_rad / max(rn, 1e-6))
