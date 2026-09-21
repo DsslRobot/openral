@@ -47,15 +47,17 @@ procedural:
       "view_part_depth_m": [0.42, 0.34, 0.52],
       "standoff_m": 0.10,
       "servo_gain_per_s": 0.5,
-      "press_depth_m": 0.03,
       "press_speed_m_s": 0.02,
-      "contact_confirm_s": 0.6,
+      "press_ramp_s": 2.0,
+      "press_stall_s": 4.0,
+      "min_fit_agreement": 0.3,
       "correction_done_m": 0.006
     }
 
 goal_params_schema:
   type: object
   properties:
-    target: {type: string, description: "what to press, described in words"}
+    target: {type: string, description: "which feature is meant, in words: it only tells the vision model where to point; the button itself is found by its declared shape"}
     feature_xyz_map: {type: array, description: "the surveyed site point of the target, in map, from the boundary"}
+    interface: {type: object, description: "the button the catalogue declares at that point (cap_radius_m, cap_centre_height_m, collar_radius_m, collar_top_height_m, travel_m), from the boundary"}
   required: ["target"]

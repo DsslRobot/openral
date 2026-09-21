@@ -1,35 +1,34 @@
-"""PressRskill -- press something described in words (one physical operation).
+"""PressRskill -- press a push button the catalogue declares (one physical operation).
 
-``kind: procedural``, LunarBot (research repo plan v4 §3, §4). This is the fold of Mission A's contact: what used to
-be `approach_target` + `move_tool` + `grasp` called in order by the model is one call here, and the stages are the
-skill's own. The caller says *what* to press; the stand-off, the speeds, how far past the face to go and how contact
-is recognised are this skill's defaults, recorded in its result.
+``kind: procedural``, LunarBot. The caller names the site point it is pressing at; the equipment catalogue says what
+is there -- a mushroom button, a dome on a collar on a plate, with its dimensions -- and everything else is measured.
+The vision model is asked once, only for which feature is meant; where the button is comes from fitting the
+declared shape to the wrist depth image (`interface_fit.locate_disc`), the same way `pick` finds its handle. Every
+motion is the shared servo.
 
-Stages (each with its own evidence):
-
-1. locate  -- the target in the wrist camera's own view: a pixel from the vision model, its depth from the camera's
-              depth image, and the point those give in the rover frame. A button is a patch on a panel, so this asks
-              for the pixel rather than choosing among structures the way `pick` does (`grasp_perception.locate_point`).
-2. approach-- stand off in front of it, tool facing the surface, jaw axis vertical. The target is looked at again from
-              there, where it is larger and its depth better, and the stand-off corrected once.
-3. press   -- a guarded straight close-in along the tool axis past the face by `press_depth_m`, stopped by contact:
-              the tool stops advancing while still commanded to (the panel takes the load), which is how `place` reads
-              a support taking a payload. If the whole stroke is made and nothing pushes back, that is recorded
-              (`contact.resisted` false) and the operation goes on to retreat: whether the press happened is the
-              independent check's to say, from where the tool went.
-4. retreat -- straight back out to the stand-off.
+1. locate   -- the button in the wrist camera's view: the fitted shape's front-most point and the plate's normal.
+2. approach -- stand off in front of it, tool facing the plate, jaw axis vertical. The button is fitted again from
+               there, starting from where the first fit put it and not from the vision model, and the stand-off is
+               corrected once.
+3. press    -- the jaws close first: a button between open fingers passes through them. Then the tool goes straight in
+               along the plate's normal past the button's tip by the declared travel, the reference advancing at a
+               set speed, and stops where the button takes the load or the travel is made. Whether the tool was on the
+               button is recorded (how far off its axis the tool was) beside how far past its tip it went.
+4. retreat  -- straight back out to the stand-off, jaws open again.
 
 Failures return the stage reached and its evidence. Nothing here chooses another target or moves the base.
 """
 
 from __future__ import annotations
 
-import numpy as np
-
 import math
 
-from openral_rskill._eye_in_hand import BASE_FRAME_ID, READY, TCP_FRAME_ID, EyeInHandSkill, StageFailure, mat_to_rotvec
-from openral_rskill.grasp_perception import depth_at, locate_point, upright
+import cv2
+import numpy as np
+
+from openral_rskill._eye_in_hand import (BASE_FRAME_ID, JAW_EMPTY_MAX_RAD, READY, TCP_FRAME_ID, EyeInHandSkill, StageFailure)
+from openral_rskill.grasp_perception import locate_point, upright
+from openral_rskill.interface_fit import locate_disc
 from openral_rskill.procedural_pick import tool_in_view, tool_rotation
 
 __all__ = ["PressRskill"]
@@ -56,6 +55,10 @@ class PressRskill(EyeInHandSkill):
         self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=120,
                           max_retries=0, http_client=http)
         self._evidence.update(target=g["target"])
+        if not g.get("interface"):
+            raise StageFailure("locate", "the catalogue declares no interface for this press point, so there is no shape to "
+                                         "look for: the point needs one in the site survey", local_retry=False)
+        self.iface = g["interface"]
         self._tool_view = None  # where the gripper is in its own camera; read off the first frame
         try:
             self.press_it()
@@ -102,31 +105,48 @@ class PressRskill(EyeInHandSkill):
                                      f"the {len(tried)} viewing poses is in reach. The rover has to stand somewhere else.",
                            local_retry=False)
 
-    def look_for(self, tag: str):
-        """The target's point in the rover frame, as this view measures it, or a stage failure saying what was seen."""
+    def measure(self, tag: str, near: np.ndarray | None = None):
+        """The button in this view, as the declared shape fits it: its front-most point and the plate's normal in the
+        rover frame. The first view asks the vision model which feature is meant; a later one starts from where the
+        last measurement puts the button in this view."""
+        g = self.goal
         f = self.frame(after=self._clock() - 0.05)
-        pt, rec = locate_point(self.vlm, self.goal["vlm_model"], f.bgr, self.goal["target"], f.up_cam)
-        rec["image"] = self.save(f"view_{tag}.jpg", upright(f.bgr, f.up_cam))
-        self._evidence.setdefault("views", []).append({"at": tag, **{k: v for k, v in rec.items() if k != "raw"}})
-        if pt is None:
-            raise StageFailure("locate", f"the wrist camera does not see {self.goal['target']!r}: {rec['reason']}",
+        if near is None:
+            hint, rec = locate_point(self.vlm, g["vlm_model"], f.bgr, g["target"], f.up_cam)
+            if hint is None:
+                raise StageFailure("locate", f"the wrist camera does not see {g['target']!r}: {rec['reason']}", local_retry=False)
+            note = {k: v for k, v in rec.items() if k != "raw"}
+        else:
+            p = f.T_base_cam[:3, :3].T @ (near - f.T_base_cam[:3, 3])
+            hint = (f.K[0, 0] * p[0] / p[2] + f.K[0, 2], f.K[1, 1] * p[1] / p[2] + f.K[1, 2])
+            note = {"hint_from": "the previous measurement, projected into this view"}
+        fit = locate_disc(f.depth, f.K, self.iface, hint)
+        img = f.bgr.copy()
+        cv2.drawMarker(img, (int(hint[0]), int(hint[1])), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 2)  # where the hint was
+        if fit is not None:
+            u, v = f.K[0, 0] * fit.tip_cam[0] / fit.tip_cam[2] + f.K[0, 2], f.K[1, 1] * fit.tip_cam[1] / fit.tip_cam[2] + f.K[1, 2]
+            cv2.drawMarker(img, (int(u), int(v)), (0, 255, 255), cv2.MARKER_CROSS, 26, 2)  # the fitted button
+            cv2.putText(img, f"agree {fit.agreement:.2f}", (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        self._evidence.setdefault("views", []).append({"at": tag, "hint_px": [round(float(hint[0]), 1), round(float(hint[1]), 1)],
+                                                       **note, "fit": None if fit is None else fit.as_dict(),
+                                                       "image": self.save(f"view_{tag}.jpg", upright(img, f.up_cam))})
+        if fit is None or fit.agreement < float(g["min_fit_agreement"]):
+            raise StageFailure("locate", f"the declared button is not in the wrist view where {g['target']!r} was pointed: its shape "
+                                         f"agrees with the depth over {0.0 if fit is None else fit.agreement:.0%} of its footprint",
                                local_retry=False)
-        # The target must not be the gripper's own body in its own camera. How far out that body reaches in the camera
-        # follows from the mount and the tool's dimensions (`tool_in_view`, 0.285 m, as `pick` uses it): a surface
-        # measured beyond it cannot be the gripper. A depth written down instead (`min_depth_m` 0.315) refused a
-        # button measured at 0.3142 m in plain view in the middle of the frame, and the gripper's silhouette mask,
-        # which over-covers by design, reaches the button's lower edge (F94).
+        # The button must not be the gripper's own body in its own camera (how far that body reaches follows from the
+        # mount and the tool's dimensions, as `pick` uses it)
         if self._tool_view is None:
             self._tool_view = tool_in_view(f.K, np.linalg.inv(self.T(TCP_FRAME_ID, f.frame_id)), *f.depth.shape)
-        d = depth_at(f.depth, *pt)
-        if d is None or d <= float(self._tool_view["self_depth_m"]):
-            raise StageFailure("locate", f"the pixel the vision model chose measures {d} m, within the gripper's own reach "
-                                         f"in this camera ({self._tool_view['self_depth_m']} m): that is the gripper, not the target",
-                               local_retry=False)
-        x = (pt[0] - f.K[0, 2]) * d / f.K[0, 0]
-        y = (pt[1] - f.K[1, 2]) * d / f.K[1, 1]
-        self._evidence["views"][-1]["depth_m"] = round(float(d), 4)
-        return f.to_base(np.array([x, y, d])), f
+        if fit.tip_cam[2] <= float(self._tool_view["self_depth_m"]):
+            raise StageFailure("locate", f"the shape fits {fit.tip_cam[2]:.3f} m away, within the gripper's own reach in this "
+                                         f"camera ({self._tool_view['self_depth_m']} m): that is the gripper", local_retry=False)
+        n = f.T_base_cam[:3, :3] @ fit.normal_cam
+        n[2] = 0.0  # a panel stands upright; the tool comes at it horizontally, jaw axis vertical
+        if np.linalg.norm(n) < 0.5:
+            raise StageFailure("locate", "the plate the button stands on faces up or down, not out: this operation presses "
+                                         "horizontally", local_retry=False)
+        return f.to_base(fit.tip_cam), n / np.linalg.norm(n), fit
 
     def stand_in_front(self, X: np.ndarray, n: np.ndarray, R: np.ndarray, stand: float, stage: str) -> None:
         """Put the tool at the stand-off in front of the target, facing it, with the planner.
@@ -157,89 +177,57 @@ class PressRskill(EyeInHandSkill):
         g = self.goal
         self.stage("locate")
         self.face_the_work_zone()  # whatever posture the arm was left in, look where the rover docked first
-        X, f = self.look_for("start")
-        # the tool comes at the face the way the camera sees it, horizontally: a panel stands upright, and its own
-        # normal is not measured -- the direction the view is taken from is what the arm can actually withdraw along
-        view_from = f.T_base_cam[:3, 3]
-        n = np.array([view_from[0] - X[0], view_from[1] - X[1], 0.0])
-        n /= max(float(np.linalg.norm(n)), 1e-9)
+        X, n, _ = self.measure("start")
         R = facing(n)
         stand = float(g["standoff_m"])
 
         self.stage("approach")
         self.working_on(X)
         # the planner, not a servo: a servo is a straight line from wherever the tool is, and the tool may be stowed
-        # inside the hull or raised somewhere else entirely. Standing in front of the target is one reconfiguration
-        # (the same reason `pick.take_standoff` gives), and it is what lets this skill be called from any posture --
-        # which matters, because at a work pose close enough to reach a panel the ready posture may not fit at all,
-        # and an agent that must raise the arm first has nowhere to raise it (research repo F62 §3).
+        # inside the hull or raised somewhere else entirely; standing in front of the button is one reconfiguration
         self.stand_in_front(X, n, R, stand, "approach")
-        X2, _ = self.look_for("stand-off")  # nearer, the target is larger and its depth better: correct once
+        X2, n2, _ = self.measure("stand-off", near=X)  # nearer, the shape is larger and its depth better
         moved = float(np.linalg.norm(X2 - X))
         self._evidence["correction_m"] = round(moved, 4)
+        X, n, R = X2, n2, facing(n2)
         if moved > float(g["correction_done_m"]):
-            X = X2
             self.working_on(X)
             self.stand_in_front(X, n, R, stand, "approach")
         self._evidence["target_rover"] = [round(float(v), 4) for v in X]
 
+        # The jaws close before anything touches: with them open the button passes between the fingers and the tool
+        # presses the plate beside it (mc1: jaw 0.82 rad at both presses, the tool on the plate a hand's width off).
+        jaw = self.set_jaw(False, "press")
+        self._evidence["jaw_closed_rad"] = round(jaw, 4)
+        if jaw > JAW_EMPTY_MAX_RAD:
+            raise StageFailure("press", f"the jaws did not close on nothing (jaw {jaw:.3f} rad): something is between the fingers",
+                               local_retry=False)
+
         self.stage("press")
-        goal_p = X - n * float(g["press_depth_m"])
-        v_in = float(g["press_speed_m_s"])
-        t_start = t_cmd = self._clock()
-        q_cmd = np.array(self.arm_q())
-        prev, slow_since, contact, stroke_done = self.tcp()[0], None, False, False
-        while not contact and not stroke_done:
-            p, R_now = self.tcp()
-            self.working_on(p)
-            if float(np.dot(p - goal_p, -n)) >= 0.0:
-                # The whole stroke, and nothing pushed back. That is a fact to record, not a failure to declare: a
-                # button that gives way, or a face the simulator does not resist, ends here with the tool at its
-                # full travel, and whether the press happened is for the independent check to say from where the tool
-                # went and whether the lamp changed. Declaring it a miss reported "failed" for a press the evaluator
-                # had counted -- PDU-2's fault was cleared and the skill said it never met the face (F94).
-                stroke_done = True
-                break
-            now = self._clock()
-            dt = max(now - t_cmd, 1e-3)
-            q_cmd = self.resolved_rate_step(q_cmd, -n * v_in * 0.5, mat_to_rotvec(R @ R_now.T) * 0.5, 0.3 * dt)
-            with self._cmd_lock:
-                self._check_stop()
-                self._joints = tuple(float(v) for v in q_cmd)
-            t_cmd = now
-            self.wait(0.1)
-            now2 = self._clock()
-            p2 = self.tcp()[0]
-            rate = float(np.dot(p2 - prev, -n)) / max(now2 - now, 1e-3)  # how fast it actually advanced
-            prev = p2
-            if now2 - t_start > 1.5 and rate < 0.3 * v_in:  # commanded in, not advancing: the face takes the load
-                slow_since = slow_since or now2
-                contact = now2 - slow_since > float(g["contact_confirm_s"])
-            else:
-                slow_since = None
+        goal_p = X - n * float(self.iface["travel_m"])  # the declared travel past the button's tip
+        info = self.servo(lambda: (goal_p, R), "press", tol_m=0.004, tol_rad=0.05, timeout_s=60.0, stall_s=float(g["press_stall_s"]),
+                          check_scene=False, sag_integral=False, posture_gain=0.0, gain_per_s=float(g["servo_gain_per_s"]),
+                          advance_m_s=float(g["press_speed_m_s"]), advance_ramp_s=float(g["press_ramp_s"]), stall_returns=True)
         self.hold_here()
         self.wait(0.3)
-        p_contact = self.tcp()[0]
-        self._evidence["contact"] = {"tcp": [round(float(v), 4) for v in p_contact], "resisted": bool(contact),
-                                     "past_face_m": round(float(np.dot(X - p_contact, n)), 4),
+        p, d = self.tcp()[0], self.tcp()[0] - X
+        self._evidence["contact"] = {"tcp": [round(float(v), 4) for v in p], "resisted": bool(info.get("stalled")),
+                                     "past_face_m": round(float(np.dot(-d, n)), 4),
+                                     "off_axis_m": round(float(np.linalg.norm(d - n * np.dot(d, n))), 4),
+                                     "cap_radius_m": float(self.iface["cap_radius_m"]), "jaw_rad": round(self.jaw(), 4), "servo": info,
                                      "image": self.save("contact.jpg", upright(self.frame(after=self._clock() - 0.05).bgr, None))}
 
         self.stage("retreat")
-        # straight back out along the line it came in on: the panel's collision box stands proud of the button by more
-        # than the tool went past it, so the start of this stroke is inside the box by construction (F94) -- the same
-        # reason `pick`'s lift does not check the scene for the stroke that leaves what it holds
-        self.servo(lambda: (X + n * self._stand, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=False,
+        # straight back out along the line it came in on; the panel's collision box stands proud of the button by more
+        # than the tool went past it, so the start of this stroke is inside the box by construction (F94)
+        self.servo(lambda: (X + n * stand, R), "retreat", tol_m=0.006, tol_rad=0.06, timeout_s=40.0, check_scene=False,
                    gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
-        # An operation must not leave the arm where its own planner cannot start from. The retreat stops within a
-        # centimetre of the stand-off, and the panel's collision box -- 5.8 cm proud of the button -- can still hold a
-        # finger there: ma5r4 ended 5 mm inside it, and every plan afterwards, `stow` first, failed with -2 (invalid
-        # motion plan) because its start state was in collision. So back out along the same line until the planning
-        # scene accepts the state.
-        out = 0.0
-        while not self.state_valid(np.array(self.arm_q())) and out < 0.10:
-            out += 0.01
-            self.servo(lambda o=out: (X + n * (self._stand + o), R), "retreat", tol_m=0.005, tol_rad=0.06, timeout_s=20.0,
-                       check_scene=False, gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
+        self.set_jaw(True, "retreat")
         self._evidence["retreated_to"] = [round(float(v), 4) for v in self.tcp()[0]]
-        self._evidence["retreat_clear_extra_m"] = round(out, 3)
+        # An operation must not leave the arm where its own planner cannot start from (ma5r4's `stow` failed with -2 from
+        # a state 5 mm inside the panel's box): the state is checked and, if it is not accepted, that is the result
+        if not self.state_valid(np.array(self.arm_q())):
+            raise StageFailure("retreat", "the arm is back at the stand-off but the planning scene still holds its state inside "
+                                          "the panel's collision volume: it has to move further out before anything can be planned",
+                               local_retry=False)
         self._evidence["outcome"] = "pressed"
