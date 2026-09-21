@@ -910,7 +910,13 @@ class EyeInHandSkill(rSkillBase):
             self._sleep(0.01)
         res = fut.result().motion_plan_response
         if res.error_code.val != 1 or not res.trajectory.joint_trajectory.points:
-            raise StageFailure(stage, f"no collision-free path to that arm posture (planner error {res.error_code.val})")
+            # when the posture itself is what touches something, say what: no path can be found to it, and the caller
+            # can act on "the ready posture is inside site/pdu_2_panel from where the rover stands" and not on a code
+            why = ""
+            if not self.state_valid(np.asarray(q_goal, float)):
+                touching = [f"{c['body1']} with {c['body2']}" for c in self._evidence.get("last_state_validity", {}).get("contacts", [])[:3]]
+                why = "; that posture itself touches " + ", ".join(touching) if touching else "; that posture is itself in collision"
+            raise StageFailure(stage, f"no collision-free path to that arm posture (planner error {res.error_code.val}{why})")
         pts = res.trajectory.joint_trajectory.points
         names = list(res.trajectory.joint_trajectory.joint_names)
         order = [names.index(j) for j in ARM_JOINT_NAMES]
