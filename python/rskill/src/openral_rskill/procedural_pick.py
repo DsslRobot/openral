@@ -333,7 +333,7 @@ class PickRskill(EyeInHandSkill):
                               max_speed_m_s=float(g["close_in_speed_m_s"]),
                               max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
                               timeout_s=60.0, stall_s=6.0, sag_integral=False, posture_gain=0.0,
-                              gain_per_s=float(g["servo_gain_per_s"]))
+                              gain_per_s=float(g["servo_gain_per_s"]), advance_m_s=float(g["close_in_speed_m_s"]))
         except StageFailure as exc:
             # stopping short along the slot is still on the neck; across it, or in orientation, is not (g9g)
             if not exc.local_retry or not self.on_contact(*goal_now())["on_contact"]:

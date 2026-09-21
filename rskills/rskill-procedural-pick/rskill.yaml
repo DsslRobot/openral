@@ -59,7 +59,7 @@ procedural:
       "servo_gain_per_s": 1.0,
       "approach_speed_m_s": 0.05,
       "approach_timeout_s": 60.0,
-      "close_in_speed_m_s": 0.025,
+      "close_in_speed_m_s": 0.010,
       "close_in_short_ok_m": 0.02,
       "blind_ok_m": 0.06,
       "lift_m": 0.15,

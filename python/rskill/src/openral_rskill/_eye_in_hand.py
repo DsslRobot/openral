@@ -906,7 +906,7 @@ class EyeInHandSkill(rSkillBase):
               step_m: float = 0.04, step_rad: float = 0.2, guard: Callable[[np.ndarray], str] | None = None,
               null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
               max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4,
-              check_scene: bool = True, gain_per_s: float | None = None) -> dict:
+              check_scene: bool = True, gain_per_s: float | None = None, advance_m_s: float | None = None) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
         servoing); `goal()` returning None keeps the last goal. Each cycle the goal, corrected by the integral of the
         remaining position error (arm sag under a load), goes through the arm's inverse kinematics on its working branch
@@ -914,16 +914,26 @@ class EyeInHandSkill(rSkillBase):
         A short empty-jaw insertion turns off the sag integral and the posture pull: with the joints lagging their
         targets by up to a second, both carried the tool past and beside a close-in goal (g8q replay, F78).
 
-        `gain_per_s` is the loop's speed per metre of error. Left None the step is the whole remaining error every cycle
+        `gain_per_s` is the loop's speed per metre (and per radian) of error. Left None the step is the whole remaining error every cycle
         (limited only by `max_speed_m_s`): a command that integrates the measured error at 20 per second, through an
         arm that answers a command 0.5-0.75 s late (gb7's bag: the command's peaks lead the measured joints' by that
         much), is a limit cycle for any delay over 0.3 s -- the tool swings +-1 cm about the goal and never sits inside
         a 3 mm band, and the stage ends 'arm stopped making progress 2.9 cm from its goal' (gb7r1; gb2's 2.6 cm
         stall was the same). A gain of 1 per second is stable for delays up to a second on the simulated loop
         (`experiments/servo_loop.py`) with no sag integral; that integral adds a second integrator and is only for
-        stages that carry a load."""
+        stages that carry a load.
+
+        `advance_m_s` makes the loop track a reference point that leaves the tool's starting position along the line
+        to the goal at that speed, instead of the goal itself: every component of the error is then a few
+        millimetres and takes the same gain. Aimed at the far goal, the speed cap is applied to the whole error
+        vector, so a 12 cm axial error throttled the sideways correction by the same factor (0.42), while the arm's
+        path drifts sideways by about 0.23 mm for every millimetre it advances: sideways error settled at 8-11 mm in
+        gb7r4 (the model in `experiments/lateral.py` gives 11.1 mm) against a slot that leaves a finger 5 mm each
+        side. At 1 cm/s that error is 2.2 mm. The tolerance, the progress test and the stall test still read the
+        distance to the true goal."""
         t0 = t_prev = self._clock()
         best, t_best, inside, last_goal, integ, blocked = math.inf, t0, 0, None, np.zeros(3), 0
+        p_start, t_adv = None, t0
         trace: list[dict] = []
         self._evidence.setdefault("servo_traces", {})[f"{stage}_{len(self._evidence.get('servo_traces', {}))}"] = trace
         q_cmd = np.array(self.arm_q())
@@ -942,6 +952,13 @@ class EyeInHandSkill(rSkillBase):
             p, R = self.tcp()
             gp, gR = last_goal
             e = gp - p
+            ec = e  # what the loop controls on: the error to the goal, or to a reference point advancing towards it
+            if advance_m_s is not None:
+                if p_start is None:
+                    p_start, t_adv = p.copy(), now
+                line = gp - p_start
+                reach = float(np.linalg.norm(line))
+                ec = p_start + line / max(reach, 1e-9) * min(reach, advance_m_s * (now - t_adv)) - p
             r = mat_to_rotvec(gR @ R.T)
             en, rn = float(np.linalg.norm(e)), float(np.linalg.norm(r))
             if en < tol_m and rn < tol_rad:
@@ -969,12 +986,15 @@ class EyeInHandSkill(rSkillBase):
                 integ = np.clip(integ + e * dt * 0.8, -0.05, 0.05)
             # move the tool a short way along the straight line to the goal, through the Jacobian: a step, not a new
             # arm configuration
-            dx = (e + integ) * min(1.0, step_m / max(en, 1e-6))
+            dx = (ec + integ) * min(1.0, step_m / max(float(np.linalg.norm(ec)), 1e-6))
             if gain_per_s is not None:
                 dx = dx * min(1.0, gain_per_s * dt)
             if max_speed_m_s is not None:
                 dx *= min(1.0, max_speed_m_s * dt / max(float(np.linalg.norm(dx)), 1e-9))
             dw = r * min(1.0, step_rad / max(rn, 1e-6))
+            if gain_per_s is not None:
+                dw = dw * min(1.0, gain_per_s * dt)  # the orientation loop has the same plant: gb7r3 swung +-9 mm sideways at
+                # 1.6 Hz with the position gain fixed and this one at 20/s -- a wrist swing about a 0.2 m lever
             q_meas = np.array(self.arm_q())
             q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt, posture_gain=posture_gain,
                                              null_grad=None if null_objective is None else null_objective(q_meas))
