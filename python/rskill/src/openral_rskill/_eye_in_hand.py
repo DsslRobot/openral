@@ -907,7 +907,7 @@ class EyeInHandSkill(rSkillBase):
               null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
               max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4,
               check_scene: bool = True, gain_per_s: float | None = None, advance_m_s: float | None = None,
-              advance_ramp_s: float = 0.0) -> dict:
+              advance_ramp_s: float = 0.0, scene_from_measured: bool = False) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
         servoing); `goal()` returning None keeps the last goal. Each cycle the goal, corrected by the integral of the
         remaining position error (arm sag under a load), goes through the arm's inverse kinematics on its working branch
@@ -935,7 +935,11 @@ class EyeInHandSkill(rSkillBase):
         start together, and the breakaway threw the tool 9 mm high in gb7r5; the loop integrated that into its
         command, which fell 6.5 mm below the goal when the tool came back and put a finger on the collar. A model of
         that loop (`experiments/dip.py`): a ramp that halves the disturbance and a gain of 0.5 per second hold the
-        command within 4 mm of the goal (a 12 mm dip at a gain of 1)."""
+        command within 4 mm of the goal (a 12 mm dip at a gain of 1). Even so, gb7r7 was refused with the tool 0.3 mm
+        from the goal and the command 6 mm below it: the arm settles about 6 mm above what it is told, so a loop that
+        integrates the error holds a command below the goal, where the fingers are on the collar in the model and
+        clear of it in the world. `scene_from_measured` asks the scene the physical question: from where the arm
+        is, does the next step touch anything."""
         t0 = t_prev = self._clock()
         best, t_best, inside, last_goal, integ, blocked = math.inf, t0, 0, None, np.zeros(3), 0
         p_start, t_adv = None, t0
@@ -1006,11 +1010,16 @@ class EyeInHandSkill(rSkillBase):
             q_meas = np.array(self.arm_q())
             q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt, posture_gain=posture_gain,
                                              null_grad=None if null_objective is None else null_objective(q_meas))
-            why = "" if not check_scene or self.state_valid(q_next) else "the robot's own planning scene"
+            q_check = q_meas + (q_next - q_cmd) if scene_from_measured else q_next
+            why = "" if not check_scene or self.state_valid(q_check) else "the robot's own planning scene"
             if not why and guard is not None:
                 why = guard(q_next)
             if why:
                 blocked += 1
+                if blocked == 1:
+                    self._evidence.setdefault("blocked_at", []).append(
+                        {"stage": stage, "t": round(now - t0, 2), "measured_minus_goal_mm": [round(float(v) * 1000, 1) for v in p - gp],
+                         "command_minus_goal_mm": [round(float(v) * 1000, 1) for v in self.fk(q_check)[:3, 3] - gp]})
                 if blocked > 10:
                     raise StageFailure(stage, f"the arm cannot continue towards the goal without touching {why} "
                                               f"({en * 100:.1f} cm / {math.degrees(rn):.0f} deg away)")
@@ -1019,9 +1028,8 @@ class EyeInHandSkill(rSkillBase):
                 with self._cmd_lock:
                     self._check_stop()
                     self._joints = tuple(float(v) for v in q_cmd)
-            if len(trace) < 60 and now - (trace[-1]["t"] if trace else -1) > 0.5:
-                trace.append({"t": round(now - t0, 1), "tcp": [round(float(v), 3) for v in p], "goal": [round(float(v), 3) for v in gp],
-                              "err_m": round(en, 3)})
+            if len(trace) < 200 and now - t0 - (trace[-1]["t"] if trace else -1) > 0.25:
+                trace.append({"t": round(now - t0, 2), "tcp_minus_goal_mm": [round(float(v) * 1000, 1) for v in p - gp], "err_m": round(en, 3)})
             self.wait(0.05)
 
     def command_towards(self, p: np.ndarray, R: np.ndarray, q_cmd: np.ndarray, max_dq: float, max_jump: float | None = None):
