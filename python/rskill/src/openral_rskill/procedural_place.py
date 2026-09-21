@@ -98,7 +98,15 @@ class PlaceRskill(EyeInHandSkill):
         self._evidence["over"] = {"support_rover": [round(float(v), 3) for v in s], "tcp": [round(float(v), 3) for v in self.tcp()[0]]}
 
         self.stage("lower")
-        floor = s[2] + float(g["min_tool_above_support_m"])
+        held = g.get("held_item")
+        # Where the support should take the item's weight: the surveyed surface plus how far the handle rides above the
+        # item's base, give or take the neck's length, which is how far the item can sit in the jaws. A stall high above
+        # that is not the support: gb7r12's tool height while lowering rose and fell 3-10 cm in a saw-tooth, and a
+        # speed-only test released the ORU at 1.08, 1.03 and 0.97 m against 0.967 expected.
+        expected = s[2] + float(held["handle_above_base_m"]) if held else None
+        tol = float(held["neck_height_m"]) if held else None
+        floor = expected - tol if held else s[2] + float(g["min_tool_above_support_m"])
+        rejected: list[dict] = []
         v_down = float(g["lower_speed_m_s"])
         t_start = t_cmd = self._clock()
         z_prev, slow_since, contact = p0[2], None, False
@@ -107,8 +115,11 @@ class PlaceRskill(EyeInHandSkill):
             p, R = self.tcp()
             self.working_on(p)
             if p[2] <= floor:
-                raise StageFailure("lower", f"no contact before the tool was {g['min_tool_above_support_m']} m above the "
-                                            "support point", local_retry=False)
+                raise StageFailure("lower", ("no contact by the time the item's bottom would be below the support's surface; "
+                                             f"the descent stalled {[r['above_expected_m'] for r in rejected]} m above where the "
+                                             "support should hold it, which is not the support") if held else
+                                   f"no contact before the tool was {g['min_tool_above_support_m']} m above the support point",
+                                   local_retry=False)
             now = self._clock()
             # how far the joints may move this cycle is the cycle that just elapsed -- measured from when the last
             # command went out, not from the last reading, or the step is a millisecond's worth and the arm stands still
@@ -126,12 +137,19 @@ class PlaceRskill(EyeInHandSkill):
             z_prev = z
             if now2 - t_start > 1.5 and rate < 0.3 * v_down:  # commanded down, not descending: the support holds the item
                 slow_since = slow_since or now2
-                contact = now2 - slow_since > float(g["contact_confirm_s"])
+                if now2 - slow_since > float(g["contact_confirm_s"]):
+                    if held and z - expected > tol:
+                        rejected.append({"tcp_z": round(float(z), 3), "above_expected_m": round(float(z - expected), 3)})
+                        slow_since, q_cmd = None, np.array(self.arm_q())  # not the support: keep lowering from where the arm is
+                    else:
+                        contact = True
             else:
                 slow_since = None
         self.hold_here()
         self.wait(0.3)
-        self._evidence["contact"] = {"tcp": [round(float(v), 4) for v in self.tcp()[0]], "support_rover": [round(float(v), 4) for v in s]}
+        self._evidence["contact"] = {"tcp": [round(float(v), 4) for v in self.tcp()[0]], "support_rover": [round(float(v), 4) for v in s],
+                                     **({"expected_tcp_z": round(float(expected), 4), "stalls_rejected_above_expected": rejected}
+                                        if held else {})}
 
         self.stage("release")
         jaw = self.set_jaw(True, "release")
