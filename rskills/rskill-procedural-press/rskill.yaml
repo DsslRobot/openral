@@ -44,9 +44,7 @@ procedural:
       "evidence_dir": "/tmp/openral_evidence",
       "vlm_model": "deepseek-flash",
       "vlm_endpoint": "https://api.deepseek.com",
-      "look_x_m": -0.55,
-      "look_heights_m": [0.95, 1.05, 0.85, 1.15],
-      "look_pitch_deg": [10, 0, 20],
+      "view_part_depth_m": [0.42, 0.34, 0.52],
       "standoff_m": 0.10,
       "press_depth_m": 0.03,
       "press_speed_m_s": 0.02,
@@ -59,4 +57,5 @@ goal_params_schema:
   type: object
   properties:
     target: {type: string, description: "what to press, described in words"}
+    feature_xyz_map: {type: array, description: "the surveyed site point of the target, in map, from the boundary"}
   required: ["target"]

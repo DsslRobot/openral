@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from openral_rskill._eye_in_hand import READY, EyeInHandSkill, StageFailure, mat_to_rotvec
+import math
+
+from openral_rskill._eye_in_hand import BASE_FRAME_ID, READY, TCP_FRAME_ID, EyeInHandSkill, StageFailure, mat_to_rotvec
 from openral_rskill.grasp_perception import depth_at, locate_point, upright
 from openral_rskill.procedural_pick import tool_rotation
 
@@ -58,20 +60,28 @@ class PressRskill(EyeInHandSkill):
             self.working_on(None)
 
     def face_the_work_zone(self) -> None:
-        """Point the camera into the work zone behind the rover before looking for anything.
+        """Point the camera at the surveyed target before looking for anything.
 
-        The skill plans its own way to the target once it knows where the target is -- but it cannot find it in a
-        frame of empty sky. Whatever posture the arm was left in, the camera has to be looking the way the rover
-        docked before the first view is worth taking (ma4's first `press` saw "the gripper against a dark starfield").
-        The poses tried are derived, not a written-down posture: the tool points out of the rover's back, where a
-        `dock` puts the work, at the heights the arm can hold it."""
+        The caller names the site point it is pressing at; the boundary sends its surveyed position. The camera goes
+        onto that point from the depth this wrist measures a part at, along the line from the rover to it, as level
+        as the arm can manage where the rover stands -- the same derivation `pick` uses for its support. What this
+        replaces was a written-down posture (`look_x_m` -0.55, four heights, three pitches) that the arm could not
+        take at any of the press stands the boundary chose: ma5 failed `locate` twice with every one of the twelve
+        out of reach, at two different stands (F94)."""
         g = self.goal
+        if "feature_xyz_map" not in g:
+            raise StageFailure("locate", "this press did not name the site point it is pressing at, so there is "
+                                         "nothing to point the camera at: pass `feature`.", local_retry=False)
+        T_bm = self.T(BASE_FRAME_ID, "map")
+        at = T_bm[:3, :3] @ np.array(g["feature_xyz_map"], float) + T_bm[:3, 3]
+        yaw = math.degrees(math.atan2(-at[1], -at[0]))  # the direction from the rover to the point, in tool_rotation's terms
+        behind = float(np.linalg.norm(self.T(TCP_FRAME_ID, self.frame().frame_id)[:3, 3]))
         tried = []
-        for z in [float(v) for v in g["look_heights_m"]]:
-            for pitch in [float(v) for v in g["look_pitch_deg"]]:
-                R = tool_rotation(pitch, 0.0, 180.0)  # camera above the tool axis, as everywhere else
-                q = self.ik(np.array([float(g["look_x_m"]), 0.0, z]), R, READY)
-                tried.append({"z": z, "pitch": pitch, "reachable": q is not None})
+        for back in [float(d) - behind for d in g["view_part_depth_m"]]:
+            for pitch in (0.0, 10.0, 20.0, 30.0):
+                R = tool_rotation(pitch, yaw, 180.0)  # camera above the tool axis, as everywhere else
+                q = self.ik(at - R[:, 2] * back, R, READY)
+                tried.append({"back_m": round(back, 3), "pitch": pitch, "reachable": q is not None})
                 if q is None:
                     continue
                 try:
@@ -79,11 +89,14 @@ class PressRskill(EyeInHandSkill):
                 except StageFailure as exc:
                     tried[-1]["blocked"] = exc.why
                     continue
-                self._evidence["faced_work_zone"] = {"z": z, "pitch": pitch, "tried": len(tried)}
+                self._evidence["faced_work_zone"] = {"at": [round(float(v), 3) for v in at], "back_m": round(back, 3),
+                                                     "pitch": pitch, "tried": len(tried)}
                 self.wait(0.6)
                 return
-        self._evidence["faced_work_zone"] = {"z": None, "tried": tried}
-        raise StageFailure("locate", "the arm cannot point its camera into the work zone from where the rover stands",
+        self._evidence["faced_work_zone"] = {"at": [round(float(v), 3) for v in at], "tried": tried}
+        raise StageFailure("locate", f"the arm cannot put its camera on the target ({at[2]:.2f} m up, "
+                                     f"{float(np.hypot(at[0], at[1])):.2f} m out) from where the rover stands: none of "
+                                     f"the {len(tried)} viewing poses is in reach. The rover has to stand somewhere else.",
                            local_retry=False)
 
     def look_for(self, tag: str):
