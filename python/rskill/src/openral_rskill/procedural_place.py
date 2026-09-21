@@ -190,5 +190,5 @@ def scene_still(a, b, self_depth_m: float, tool_mask: np.ndarray, moved_mm: floa
         return {"still": False, "median_flow_px": None, "near_pixels": int(near.sum()), "why": "nothing in view to judge"}
     med = float(np.median(np.linalg.norm(flow[near], axis=1)))
     limit = a.K[0, 0] * (moved_mm / 1000.0) / float(np.median(z[near]))
-    return {"still": med < limit, "median_flow_px": round(med, 2), "limit_px": round(float(limit), 2),
+    return {"still": bool(med < limit), "median_flow_px": round(med, 2), "limit_px": round(float(limit), 2),
             "near_pixels": int(near.sum())}

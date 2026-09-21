@@ -523,7 +523,7 @@ class PickRskill(EyeInHandSkill):
             best = (0.0, raise_only)  # out of the way of what it stood on, even when nothing can be pulled in
         self._evidence["bring_in"] = {"from": [round(float(v), 3) for v in p], "in_by_m": best[0] if best else 0.0,
                                       "raised_by_m": best[1] if best else 0.0, "tried": tried[:12]}
-        if best is None:
+        if best is None or not any(best):  # nothing can be pulled in or raised: the grasp stands, the lever stays
             return
         waypoints = ([p + np.array([0.0, 0.0, best[1]])] if best[1] else []) + (
             [p + np.array([best[0], 0.0, best[1]])] if best[0] else [])
