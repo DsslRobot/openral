@@ -141,8 +141,7 @@ def refine_contact(depth: np.ndarray, K: np.ndarray, candidate: Candidate,
 
 def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = GripperGeometry(),
                     angles_deg: tuple[float, ...] = tuple(range(0, 180, 15)), max_candidates: int = 12,
-                    border_px: int = 28, contact_width_m: float | None = None,
-                    contact_length_m: float | None = None) -> list[Candidate]:
+                    border_px: int = 28, contact_width_m: float | None = None) -> list[Candidate]:
     """Antipodal parallel-jaw candidates on a depth image (metres along the optical axis).
 
     With `contact_width_m` -- the declared width of the item's contact interface -- only places the jaws would close
@@ -150,20 +149,9 @@ def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = Gr
     head, the pedestal, or the neck's other cross-section. Places that do not measure as that contact are not grasps
     of the declared interface, so they are never offered for selection (g9f carried a 30 mm cut of the same neck and
     the drive pulled it out of the jaws).
-
-    `contact_length_m` is the same declaration about the other dimension -- how far the contact runs along the pads --
-    and it is used the other way round, because the two are not measured alike. The width is a cut across the part in
-    the image plane and reads true from any direction the part is seen in the round from; the length runs *up* the
-    part, so any look from off its own square foreshortens it, and whatever stands at its ends cuts into it. Where it
-    is declared, the catalogue has already said the interface takes the pads, and this search only has to locate the
-    part: the floor drops to what the perception can resolve at all. Undeclared, the pads set it, since a part shorter
-    than they are has nothing to clamp. Requiring the image to certify the declared length again is what threw the
-    part away in gb2: 28 mm of slot read 9.5 mm from 10 degrees above the horizontal and no candidate survived
-    (research repo F91).
     """
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     h, w = depth.shape
-    min_length = geom.min_part_width_m if (contact_length_m or 0.0) >= geom.pad_height_m else geom.pad_height_m
     z_all = depth.astype(np.float32).copy()
     self_mask = np.isfinite(z_all) & (z_all > 0) & (z_all < geom.self_depth_m)
     z_all[~np.isfinite(z_all) | (z_all <= 0) | (z_all > geom.max_range_m)] = np.inf
@@ -234,7 +222,7 @@ def find_candidates(depth: np.ndarray, K: np.ndarray, geom: GripperGeometry = Gr
             rows = [runs[j] for j in chain]
             front = float(np.median([x[3] for x in rows]))
             length = (rows[-1][0] - rows[0][0] + 2) * front / fy
-            if length < min_length:
+            if length < geom.pad_height_m:
                 continue
             # one candidate per pad height along a long part
             top, bot = rows[0], rows[-1]
