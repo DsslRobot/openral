@@ -7,8 +7,9 @@ itself is never localized: it hangs from the jaws and is lowered until the suppo
 Stages:
 
 1. over    -- carry the tool at its current height to above the support point, tool orientation kept.
-2. lower   -- straight down at a slow speed until contact: the tool stops descending while still commanded down (the
-              support takes the load); a floor just above the support ends the stage as "no contact".
+2. lower   -- straight down, the shared servo's reference advancing at a slow speed, until the tool stalls while still
+              driven down (the support takes the load). The tool is driven to the low end of where the support should
+              take the item, and reaching it without a stall is "no contact".
 3. release -- open the jaws.
 4. retreat -- withdraw under the interface's release constraint, then up, clear of the item.
 5. settle  -- two wrist images a moment apart after the retreat: the item stays where it was set (no image motion on
@@ -22,8 +23,9 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from openral_rskill._eye_in_hand import JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure, mat_to_rotvec
+from openral_rskill._eye_in_hand import JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure
 from openral_rskill.grasp_perception import GripperGeometry
+from openral_rskill.interface_fit import fit_wall
 from openral_rskill.procedural_pick import tool_in_view
 
 __all__ = ["PlaceRskill"]
@@ -35,6 +37,34 @@ class PlaceRskill(EyeInHandSkill):
             self.put_it_down()
         finally:
             self.working_on(None)  # the world model measures this space as it finds it again
+
+    def wall_correction(self, s: np.ndarray, n_out: np.ndarray, f0) -> float:
+        """How far along the support's outward normal the wall behind it is from where the survey and the rover's
+        localization put it, from the depth image: the wall is the biggest flat thing in view that faces this way. The
+        declared depth of the support says how far behind its centre the wall is. Zero, with the reason recorded, when
+        the wall is not measured, or is measured further off than a localization error could account for."""
+        depth_m = float((self.goal.get("interface") or {}).get("depth_m", 0.0))
+        rec = {"expected_wall_m": None}
+        self._evidence["wall"] = rec
+        if depth_m <= 0.0:
+            rec["not_measured"] = "the catalogue declares no depth for this support"
+            return 0.0
+        R_cb = f0.T_base_cam[:3, :3].T
+        got = fit_wall(f0.depth, f0.K, R_cb @ n_out)
+        if got is None:
+            rec["not_measured"] = "no flat surface facing the way the survey says the wall faces"
+            return 0.0
+        n_c, p_c, frac = got
+        p_b = f0.to_base(p_c)
+        measured = float(n_out @ p_b)
+        expected = float(n_out @ (s - n_out * depth_m / 2))
+        corr = measured - expected
+        rec.update(expected_wall_m=round(expected, 4), measured_wall_m=round(measured, 4), correction_m=round(corr, 4),
+                   explains=round(frac, 3), tilt_deg=round(float(np.degrees(np.arccos(min(1.0, float(n_out @ (f0.T_base_cam[:3, :3] @ n_c)))))), 2))
+        if abs(corr) > depth_m / 3:
+            rec["not_applied"] = "further than a localization error could account for"
+            return 0.0
+        return corr
 
     def put_it_down(self) -> None:
         g = self.goal
@@ -56,6 +86,11 @@ class PlaceRskill(EyeInHandSkill):
             # swept the item into the shelf edge (g8s stall, g8t drop; F78). The rover's own body is checked too.
             self.carry_item(g["held_item"])
             height = max(height, s[2] + self.held_bottom_below_tcp())
+        n_out = T_bm[:3, :3] @ np.array(g.get("support_normal_map") or [0.0, 0.0, 0.0], float)
+        n_out[2] = 0.0
+        if np.linalg.norm(n_out) > 1e-6:
+            n_out /= np.linalg.norm(n_out)
+            s = s + n_out * self.wall_correction(s, n_out, f0)
         over = np.array([s[0], s[1], height])
         # The surveyed point is the middle of the surface, and an item whose envelope is nearly as deep as the
         # surface cannot sit there: a shelf cantilevered off a wall has the wall right behind it, and in ga5 the
@@ -99,48 +134,31 @@ class PlaceRskill(EyeInHandSkill):
 
         self.stage("lower")
         held = g.get("held_item")
-        # Where the support should take the item's weight by the catalogue and the survey: the surveyed surface plus how
-        # far the handle rides above the item's base. Recorded beside where the descent actually stopped, not used to
-        # decide: released 5 runs, the contact height ranged over 0.90-1.08 m against 0.967 expected, and a stage that
-        # refused any stall more than the neck's length above it (gb7r14) lowered the item through the expected surface
-        # without meeting anything. The two numbers go to the reasoner, who can see the picture.
+        # Where the support should take the item's weight: the surface plus how far the handle rides above the item's
+        # base, give or take the neck's length, which is how far the item can sit in the jaws. The tool is driven to the
+        # low end of that; a stall on the way is the support, and reaching the end without one is not.
         expected = s[2] + float(held["handle_above_base_m"]) if held else None
-        floor = s[2] + float(g["min_tool_above_support_m"])
-        v_down = float(g["lower_speed_m_s"])
-        t_start = t_cmd = self._clock()
-        z_prev, slow_since, contact = p0[2], None, False
-        q_cmd = np.array(self.arm_q())
-        while not contact:
-            p, R = self.tcp()
-            self.working_on(p)
-            if p[2] <= floor:
-                raise StageFailure("lower", f"no contact before the tool was {g['min_tool_above_support_m']} m above the "
-                                            "support point", local_retry=False)
-            now = self._clock()
-            # how far the joints may move this cycle is the cycle that just elapsed -- measured from when the last
-            # command went out, not from the last reading, or the step is a millisecond's worth and the arm stands still
-            dt = max(now - t_cmd, 1e-3)
-            dx = np.array([over[0] - p[0], over[1] - p[1], -v_down * 0.5])  # a waypoint half a second below, over the support
-            q_cmd = self.resolved_rate_step(q_cmd, dx, mat_to_rotvec(R0 @ R.T) * 0.5, 0.3 * dt)
-            with self._cmd_lock:
-                self._check_stop()
-                self._joints = tuple(float(v) for v in q_cmd)
-            t_cmd = now
-            self.wait(0.1)
-            now2 = self._clock()
-            z = self.tcp()[0][2]
-            rate = (z_prev - z) / max(now2 - now, 1e-3)  # how fast it actually fell over that cycle
-            z_prev = z
-            if now2 - t_start > 1.5 and rate < 0.3 * v_down:  # commanded down, not descending: the support holds the item
-                slow_since = slow_since or now2
-                contact = now2 - slow_since > float(g["contact_confirm_s"])
-            else:
-                slow_since = None
+        goal_z = expected - float(held["neck_height_m"]) if held else s[2] + float(g["min_tool_above_support_m"])
+        aim = np.array([over[0], over[1], goal_z])
+
+        def lowering():
+            self.working_on(self.tcp()[0])
+            return aim, R0
+
+        info = self.servo(lowering, "lower", tol_m=0.004, tol_rad=0.08, timeout_s=120.0, stall_s=float(g["lower_stall_s"]),
+                          check_scene=False, sag_integral=False, posture_gain=0.0, gain_per_s=float(g["servo_gain_per_s"]),
+                          max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
+                          advance_m_s=float(g["lower_speed_m_s"]), advance_ramp_s=float(g["lower_ramp_s"]), stall_returns=True)
         self.hold_here()
         self.wait(0.3)
-        self._evidence["contact"] = {"tcp": [round(float(v), 4) for v in self.tcp()[0]], "support_rover": [round(float(v), 4) for v in s],
+        p_stop = self.tcp()[0]
+        self._evidence["contact"] = {"tcp": [round(float(v), 4) for v in p_stop], "support_rover": [round(float(v), 4) for v in s],
+                                     "jaw_rad": round(self.jaw(), 4), "servo": info,
                                      **({"expected_tcp_z": round(float(expected), 4),
-                                         "stopped_above_expected_m": round(float(self.tcp()[0][2] - expected), 4)} if held else {})}
+                                         "stopped_above_expected_m": round(float(p_stop[2] - expected), 4)} if held else {})}
+        if not info.get("stalled"):
+            raise StageFailure("lower", "the item was driven to where its bottom would be under the support's surface and met nothing: "
+                                        "it is not over the support", local_retry=False)
 
         self.stage("release")
         jaw = self.set_jaw(True, "release")
@@ -148,7 +166,10 @@ class PlaceRskill(EyeInHandSkill):
         self.carry_item(None)  # the support has the item now
 
         self.stage("retreat")
-        p, R = self.tcp()
+        self.hold_here()
+        self.wait(0.5)
+        p, R = self.tcp()  # the orientation the tool has now the load is off it, not the one it carried: holding the carried one
+        # turned the wrist against the handle the open fingers were still round (gb7 gc1: 15 deg off, joint 7 0.67 rad behind)
         withdraw = -R[:, 2].copy()
         if g["release_constraint"] == "below_overhang":
             # This operation lowers onto a horizontal support. An overhang above a side grasp must not be
@@ -164,9 +185,11 @@ class PlaceRskill(EyeInHandSkill):
                                     "withdraw_to": back.tolist()}
         # The open jaws start around the part they just released, which the live scene measures: the withdrawal stroke
         # out of it is not tested against that measurement (the lift out of a grasp is not either); the stroke up is.
-        self.servo(lambda: (back, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=False)
+        self.servo(lambda: (back, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=False,
+                   gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
         up = back + np.array([0.0, 0.0, float(g["retreat_up_m"])])
-        self.servo(lambda: (up, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0)
+        self.servo(lambda: (up, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0,
+                   gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
 
         self.stage("settle")
         self.wait_until_still()  # gb7r12: the frames were taken while the arm was still moving (0.1-0.5 rad/s), and the camera's own motion read as the item's

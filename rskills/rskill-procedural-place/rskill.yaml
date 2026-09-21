@@ -52,10 +52,12 @@ procedural:
       "support_normal_map": [1.0, 0.0, 0.0],
       "evidence_dir": "/tmp/openral_evidence",
       "carry_speed_m_s": 0.05,
-      "carry_servo": {"tol_m": 0.03, "tol_rad": 0.08, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0},
+      "carry_servo": {"tol_m": 0.03, "tol_rad": 0.08, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0, "gain_per_s": 0.5, "sag_integral": false},
+      "servo_gain_per_s": 0.5,
       "lower_speed_m_s": 0.02,
+      "lower_ramp_s": 2.0,
+      "lower_stall_s": 4.0,
       "min_tool_above_support_m": 0.15,
-      "contact_confirm_s": 0.6,
       "retreat_m": 0.15,
       "retreat_up_m": 0.10,
       "settle_s": 1.5
@@ -66,6 +68,7 @@ goal_params_schema:
   properties:
     support: {type: string, description: "where to set the held item down"}
     held_item: {type: object, description: "catalogue envelope of the carried item (size_m, handle_above_base_m, neck_height_m), from the boundary"}
+    interface: {type: object, description: "what the catalogue declares of the support (depth_m, width_m, lip_height_m), from the boundary"}
     release_constraint:
       type: string
       enum: [unconstrained, below_overhang]

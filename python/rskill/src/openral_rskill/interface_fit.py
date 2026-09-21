@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-__all__ = ["DiscFit", "Fit", "boxes", "locate", "locate_disc", "track", "yaw_of"]
+__all__ = ["DiscFit", "Fit", "boxes", "fit_wall", "locate", "locate_disc", "track", "yaw_of"]
 
 SIGMA_M = 0.003  # a depth pixel that agrees: within one pixel's worth of range at the working distance
 
@@ -301,3 +301,39 @@ def locate_disc(depth: np.ndarray, K: np.ndarray, dims: dict, hint_px: tuple[flo
     good = res < 2 * SIGMA_M
     tip = p0 + e1 * ca + e2 * cb + n * (dims["cap_centre_height_m"] + dims["cap_radius_m"])
     return DiscFit(tip, n, float(good.mean()), float(res[good].mean()) if good.any() else 9.9, int(inside.sum()))
+
+
+def fit_wall(depth: np.ndarray, K: np.ndarray, normal_cam: np.ndarray, tilt_rad: float = 0.35) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """The plane most of the depth image lies in, among those facing the way the survey says the wall behind a support
+    faces: (unit normal towards the camera, a point on it, the fraction of the image it explains). A wall is the
+    biggest flat thing in view, and the survey's direction is only there to keep the answer from being a floor or a
+    ceiling; None when nothing flat faces that way."""
+    v, u = np.mgrid[0:depth.shape[0]:max(1, int(np.sqrt(depth.size / 6000))), 0:depth.shape[1]:max(1, int(np.sqrt(depth.size / 6000)))]
+    z = depth[v, u].ravel()
+    ok = np.isfinite(z) & (z > 0.05) & (z < 4.0)
+    z, v, u = z[ok], v.ravel()[ok], u.ravel()[ok]
+    if len(z) < 300:
+        return None
+    P = np.stack([(u - K[0, 2]) * z / K[0, 0], (v - K[1, 2]) * z / K[1, 1], z], -1)
+    want = np.asarray(normal_cam, float) / np.linalg.norm(normal_cam)
+    rng = np.random.default_rng(1)
+    best, best_n = None, 0
+    for _ in range(300):
+        s3 = P[rng.choice(len(P), 3, replace=False)]
+        n = np.cross(s3[1] - s3[0], s3[2] - s3[0])
+        if np.linalg.norm(n) < 1e-9:
+            continue
+        n /= np.linalg.norm(n)
+        n = n if n @ want > 0 else -n
+        if math.acos(min(1.0, float(n @ want))) > tilt_rad:
+            continue
+        k = int((np.abs((P - s3[0]) @ n) < 2 * SIGMA_M).sum())
+        if k > best_n:
+            best, best_n = (n, s3[0]), k
+    if best is None or best_n < 0.05 * len(P):
+        return None
+    n, p0 = best
+    inl = np.abs((P - p0) @ n) < 2 * SIGMA_M
+    c = P[inl].mean(0)
+    n = np.linalg.svd(P[inl] - c)[2][2]
+    return (n if n @ want > 0 else -n), c, float(inl.mean())
