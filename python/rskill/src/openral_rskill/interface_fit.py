@@ -118,13 +118,27 @@ def _crop(depth, K, centre, radius_m, n_pts):
 
 
 def _judge(depth, K, up, B, p) -> Fit:
-    rays, zm = _crop(depth, K, p[:3], 0.08, 4000)
-    z = _predict(rays, frame_of(up, p[3]), p[:3], B)
+    """The answer and its evidence, judged over everything the shape projects to -- every pixel in the window
+    round it, sky included. A pixel the interface should occupy but the camera saw nothing at is a disagreement;
+    judged over measured points only, a distant structure agreed 0.79 with the shape hanging half over the void
+    (gui_verified replay)."""
+    R, t = frame_of(up, p[3]), p[:3]
+    h, w = depth.shape
+    half = int(0.15 * K[0, 0] / max(t[2], 0.1))
+    cu, cv = int(round(K[0, 0] * t[0] / t[2] + K[0, 2])), int(round(K[1, 1] * t[1] / t[2] + K[1, 2]))
+    v0, v1, u0, u1 = max(cv - half, 0), min(cv + half + 1, h), max(cu - half, 0), min(cu + half + 1, w)
+    if v1 <= v0 or u1 <= u0 or t[2] <= 0.05:  # the fit ran out of the picture: nothing to judge it on
+        return Fit(t.copy(), float(p[3]), 0.0, 9.9, 0)
+    step = max(1, int(np.sqrt((v1 - v0) * (u1 - u0) / 6000)))  # a fraction does not need every pixel
+    v, u = np.mgrid[v0:v1:step, u0:u1:step]
+    rays = np.stack([(u.ravel() - K[0, 2]) / K[0, 0], (v.ravel() - K[1, 2]) / K[1, 1], np.ones(u.size)], -1)
+    z = _predict(rays, R, t, B)
     hit = np.isfinite(z)
-    r = np.abs(zm[hit] - z[hit])
+    zm = depth[v.ravel(), u.ravel()][hit]
+    r = np.abs(np.where(np.isfinite(zm), zm, 9.0) - z[hit])
     good = r < SIGMA_M
     n = int(hit.sum())
-    return Fit(p[:3].copy(), float(p[3]), float(good.sum() / max(n, 1)), float(r[good].mean()) if good.any() else 9.9, n)
+    return Fit(t.copy(), float(p[3]), float(good.sum() / max(n, 1)), float(r[good].mean()) if good.any() else 9.9, n)
 
 
 def _explained(depth, K, up, B, p) -> float:
