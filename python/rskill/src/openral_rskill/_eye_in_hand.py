@@ -44,6 +44,40 @@ READY = (0.0, -1.0, 0.0, -1.4, 0.0, 1.2, math.pi)
 JOINT_LIMITS_RAD = (3.107, 2.269, 3.107, 2.356, 3.107, 2.234, 6.283)
 #: how far a seeded IK solution may sit from the seed before it is another arm configuration rather than a nearby one
 BRANCH_JUMP_RAD = 1.2
+
+
+def acceptable(q, seed) -> tuple[bool, list[str], float]:
+    """Whether a solution is this arm's own configuration: on the working branch, or next to the seed it was solved
+    from. The skills' inverse kinematics and the boundary's stand feasibility both ask this, so a stand the boundary
+    lists is one a skill can take (ma5 and mc3: listed stands the skill's own rule refused). Returns (accepted, the
+    joints outside their working window, the largest joint travel from the seed)."""
+    jump = max(abs(a - b) for a, b in zip(q, seed))
+    off = [j for j, (centre, half) in POSTURE.items() if abs(q[ARM_JOINT_NAMES.index(j)] - centre) > half]
+    return (not off or jump <= BRANCH_JUMP_RAD), off, jump
+
+
+def posture_cost(q) -> float:
+    """How poor a configuration is to work from, for choosing among the solutions a planned move can take: how far each
+    joint is outside its working window, how close any joint is to its limit, and how close the elbow or the wrist pitch
+    is to straight (where the arm has no reach left in one direction and cannot bend the other way without a large joint
+    move). A soft form of `acceptable`: a configuration outside the window is taken when it is the only one, and the least
+    outside wins."""
+    outside = sum(max(0.0, abs(q[ARM_JOINT_NAMES.index(j)] - c) - h) for j, (c, h) in POSTURE.items())
+    at_limit = sum(max(0.0, 0.3 - (JOINT_LIMITS_RAD[i] - abs(q[i]))) for i in range(7))
+    straight = max(0.0, 0.3 - min(abs(q[3]), abs(q[5])))
+    return outside + at_limit + straight
+
+
+def working_seeds(k: int = 8) -> list[list[float]]:
+    """Arm configurations to start inverse kinematics from: the ready posture, then a fixed spread over the working
+    branch. One seed finds one configuration; a planned move is not tied to the configuration the arm happens to be
+    in, so it tries these too."""
+    rng = np.random.default_rng(3)
+    bank = [list(READY)]
+    for _ in range(k):
+        bank.append([float(np.clip(rng.uniform(c - h, c + h), -JOINT_LIMITS_RAD[i] + 0.05, JOINT_LIMITS_RAD[i] - 0.05))
+                     for i, (c, h) in enumerate(POSTURE.get(n, (0.0, JOINT_LIMITS_RAD[i])) for i, n in enumerate(ARM_JOINT_NAMES))])
+    return bank
 #: How far the carried item pivots about the jaw closing axis while it hangs from its handle: the largest tilt from
 #: vertical measured over every carry bag (g8s 14.1, g8t 4.7, g9m 12.5, g9o 15.4 deg), rounded up. The same bags say
 #: its yaw does not change -- modulo the box's own symmetry it stays within 14 deg of where it started -- so a
@@ -511,9 +545,41 @@ class EyeInHandSkill(rSkillBase):
         raise StageFailure(stage, f"arm stopped short of the posture: joint{worst + 1} {err[worst]:+.2f} rad off, tool at "
                                   f"{[round(float(v), 3) for v in tcp]} (blocked by contact or a joint limit)")
 
-    def ik(self, p: np.ndarray, R: np.ndarray, seed: list[float]) -> list[float] | None:
+    def ik(self, p: np.ndarray, R: np.ndarray, seed: list[float], planned: bool = False) -> list[float] | None:
         """Arm joints that put the TCP at (p, R) in chassis_base_link, nearest the seed (MoveIt IK on the robot's own
-        model and planning scene); None when no collision-free configuration reaches it."""
+        model and planning scene); None when no collision-free configuration reaches it. With `planned` -- a move the
+        planner makes, or a pose that is only being checked -- the seed is not the only place to start: the working-branch
+        seeds are tried after it, and the first solution that is this arm's own configuration is taken. A servo step
+        from where the arm is keeps the seed alone, because there a jump to another configuration is a hazard; the
+        planner does not care how far the joints travel (mc3: a stand-off whose only solution was 1.41 rad from the view
+        pose, refused twice; gc2: a carry-in from an outstretched arm, refused, and the ORU slid out)."""
+        ev = self._evidence
+        if not planned:
+            q = self._ik_once(p, R, seed)
+            if q is None:
+                return None
+            ok, off, jump = acceptable(q, seed)
+            if not ok:
+                ev["last_ik"].update(branch_jump_rad=round(jump, 3), off_branch=off)
+                return None
+            return q
+        # A planner takes the arm wherever the solution is, so no window and no jump limit apply -- they refused every
+        # stand-off at the panel (the window is the working branch for the arm's usual reach; a target this close needs
+        # the shoulder folded past it). What does matter is where the arm will then work from: gc2's grasp was solved with
+        # the elbow at 0.08 rad, the arm fully stretched, and nothing could be brought in from there. So of the solutions the
+        # seeds give, the one with the least `posture_cost` wins, and among those within 0.05 of each other the nearest to
+        # where the arm is.
+        best = None
+        for s in [list(seed)] + working_seeds():
+            q = self._ik_once(p, R, s)
+            if q is None:
+                continue
+            key = (-round(posture_cost(q) / 0.05), -max(abs(a - b) for a, b in zip(q, seed)))
+            if best is None or key > best[0]:
+                best = (key, q)
+        return None if best is None else best[1]
+
+    def _ik_once(self, p: np.ndarray, R: np.ndarray, seed: list[float]) -> list[float] | None:
         from moveit_msgs.srv import GetPositionIK
 
         if self._ik_client is None:
@@ -547,20 +613,6 @@ class EyeInHandSkill(rSkillBase):
             return None
         js = res.solution.joint_state
         q = [float(js.position[list(js.name).index(j)]) for j in ARM_JOINT_NAMES]
-        # What the redundancy must not do is jump to the mirrored arm configuration mid-operation (research F57).
-        # Neither half of that says it alone. The joint window by itself refused poses the arm was already in and
-        # made every bring_in height unreachable (g9l, F78); the distance from the seed by itself refused every
-        # deliberate reconfiguration, because the postures seeded at READY turn the wrist to look down -- all four
-        # `find` overviews solve on the working branch and still sit 1.6-2.6 rad from READY, in joint6/joint7, which
-        # are not in POSTURE (g9n). A solution is this arm's own configuration when it is on the working branch, or
-        # when it is next to the one the arm is in; a mirrored branch is neither, and reach, collision and the servo
-        # decide the rest.
-        jump = max(abs(a - b) for a, b in zip(q, seed))
-        off_branch = [j for j, (centre, half) in POSTURE.items()
-                      if abs(q[ARM_JOINT_NAMES.index(j)] - centre) > half]
-        if off_branch and jump > BRANCH_JUMP_RAD:
-            self._evidence["last_ik"].update(branch_jump_rad=round(jump, 3), off_branch=off_branch)
-            return None
         return q
 
     #: arm links whose position is checked against what the cameras measured (the elbow and forearm sweep too)

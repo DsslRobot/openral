@@ -356,7 +356,7 @@ class PickRskill(EyeInHandSkill):
             p_contact = state["p_base"] + R[:, 2] * self.geom.seat_depth_m
             for standoff_m in standoffs_m:
                 p_g = state["p_base"] - R[:, 2] * standoff_m
-                q = self.ik(p_g, R, list(self.arm_q()))
+                q = self.ik(p_g, R, list(self.arm_q()), planned=True)
                 blocked = None if q is None else ("" if self.state_valid(np.asarray(q)) else str(self._evidence["last_state_validity"]))
                 q_contact = None
                 if q is not None and not blocked:
@@ -516,9 +516,9 @@ class PickRskill(EyeInHandSkill):
         # it stops where the item would still clear after sagging one grid step (g9a). Of the raises that pull in equally
         # far the highest wins: a drive only ever lowers the load (5.3 cm in ga8, 5.6 cm in gb7r9, a step longer than
         # the grid's), and gb7r9's lowest tie left the item's bottom 1 mm under the deck top when the drive ended.
-        step = 0.05
-        best, raise_only, tried = None, None, []
-        for dz in [round(0.02 * k, 2) for k in range(0, 11 if self._held else 1)]:
+        step, raise_step = float(self.goal["bring_in_step_m"]), float(self.goal["bring_in_raise_step_m"])
+        best, raise_only, tried, stopped = None, None, [], []
+        for dz in [round(raise_step * k, 2) for k in range(0, 11 if self._held else 1)]:
             seed = list(self.arm_q())
             q = self.ik(p + np.array([0.0, 0.0, dz]), R, seed)
             if q is None or not self.state_valid(np.array(q), held_drop_m=step if self._held else 0.0):
@@ -530,6 +530,9 @@ class PickRskill(EyeInHandSkill):
             for dx in [round(step * k, 2) for k in range(1, 13)]:
                 q = self.ik(p + np.array([dx, 0.0, dz]), R, seed)
                 if q is None or not self.state_valid(np.array(q), held_drop_m=step if self._held else 0.0):
+                    stopped.append({"raise_m": dz, "at_in_m": dx, "why": "no solution on this branch" if q is None else
+                                    "the scene: " + str([(c["body1"], c["body2"], round(c["depth_m"], 3)) for c in
+                                                         self._evidence["last_state_validity"]["contacts"]][:3])})
                     break
                 found, seed = dx, list(q)
             if found is not None and (best is None or found >= best[0]):  # as far in as it goes; of those, the highest
@@ -537,7 +540,7 @@ class PickRskill(EyeInHandSkill):
         if best is None and raise_only is not None:
             best = (0.0, raise_only)  # out of the way of what it stood on, even when nothing can be pulled in
         self._evidence["bring_in"] = {"from": [round(float(v), 3) for v in p], "in_by_m": best[0] if best else 0.0,
-                                      "raised_by_m": best[1] if best else 0.0, "tried": tried[:12]}
+                                      "raised_by_m": best[1] if best else 0.0, "tried": tried[:12], "search_stopped": stopped[:12]}
         if best is None or not any(best):  # nothing can be pulled in or raised: the grasp stands, the lever stays
             return
         waypoints = ([p + np.array([0.0, 0.0, best[1]])] if best[1] else []) + (

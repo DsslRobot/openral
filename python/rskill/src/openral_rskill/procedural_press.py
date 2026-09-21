@@ -156,7 +156,7 @@ class PressRskill(EyeInHandSkill):
         tried = []
         for k in (1.0, 1.4, 0.7, 1.8):
             d = stand * k
-            q = self.ik(X + n * d, R, list(self.arm_q()))
+            q = self.ik(X + n * d, R, list(self.arm_q()), planned=True)
             tried.append({"stand_off_m": round(d, 3), "reachable": q is not None})
             if q is None:
                 continue
