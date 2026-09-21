@@ -160,6 +160,7 @@ class PlaceRskill(EyeInHandSkill):
         self.servo(lambda: (up, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0)
 
         self.stage("settle")
+        self.wait_until_still()  # gb7r12: the frames were taken while the arm was still moving (0.1-0.5 rad/s), and the camera's own motion read as the item's
         a = self.frame(after=self._clock() - 0.05)
         self.wait(float(g["settle_s"]))
         b = self.frame(after=self._clock() - 0.05)

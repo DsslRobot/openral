@@ -344,6 +344,20 @@ class EyeInHandSkill(rSkillBase):
         with self._cmd_lock:
             self._joints, self._twist = tuple(self.arm_q()), None
 
+    def wait_until_still(self, still_m: float = 0.0005, window_s: float = 0.3, timeout_s: float = 10.0) -> None:
+        """Hold the arm where it is and wait until the tool stops moving, so that what a wrist camera sees moving
+        is the world and not the camera. A servo ends when the tool is within tolerance, with the command still ahead
+        of the arm by its lag, and the arm keeps going for a second or more."""
+        self.hold_here()
+        p_prev = self.tcp()[0]
+        t0 = self._clock()
+        while self._clock() - t0 < timeout_s:
+            self.wait(window_s)
+            p = self.tcp()[0]
+            if float(np.linalg.norm(p - p_prev)) < still_m:
+                return
+            p_prev = p
+
     def contact_scene(self, prepare: bool) -> None:
         """Acquire/release an applied shared scene for one stationary contact operation."""
         import json
