@@ -513,7 +513,9 @@ class PickRskill(EyeInHandSkill):
         p, R = self.tcp()
         self.working_on(p)  # what is in the jaws travels with them; it is the job, not an obstacle to it (F59)
         # the same search may first raise the tool, so the carried item clears the rover's own deck (g8s/g8t, F78);
-        # it stops where the item would still clear after sagging one grid step (g9a)
+        # it stops where the item would still clear after sagging one grid step (g9a). Of the raises that pull in equally
+        # far the highest wins: a drive only ever lowers the load (5.3 cm in ga8, 5.6 cm in gb7r9, a step longer than
+        # the grid's), and gb7r9's lowest tie left the item's bottom 1 mm under the deck top when the drive ended.
         step = 0.05
         best, raise_only, tried = None, None, []
         for dz in [round(0.02 * k, 2) for k in range(0, 11 if self._held else 1)]:
@@ -530,7 +532,7 @@ class PickRskill(EyeInHandSkill):
                 if q is None or not self.state_valid(np.array(q), held_drop_m=step if self._held else 0.0):
                     break
                 found, seed = dx, list(q)
-            if found is not None and (best is None or found > best[0]):
+            if found is not None and (best is None or found >= best[0]):  # as far in as it goes; of those, the highest
                 best = (found, dz)
         if best is None and raise_only is not None:
             best = (0.0, raise_only)  # out of the way of what it stood on, even when nothing can be pulled in
