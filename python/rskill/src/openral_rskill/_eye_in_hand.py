@@ -736,10 +736,6 @@ class EyeInHandSkill(rSkillBase):
         }
         return bool(result.valid)
 
-    def contact_depth(self) -> float:
-        """How deep the deepest contact of the last state check goes."""
-        return max((c["depth_m"] for c in self._evidence["last_state_validity"]["contacts"]), default=0.0)
-
     def arm_q(self) -> list[float]:
         return [float(self._q[j]) for j in ARM_JOINT_NAMES]
 
@@ -946,7 +942,7 @@ class EyeInHandSkill(rSkillBase):
         is, does the next step touch anything."""
         t0 = t_prev = self._clock()
         best, t_best, inside, last_goal, integ, blocked = math.inf, t0, 0, None, np.zeros(3), 0
-        p_start, t_adv, allowed_depth = None, t0, None
+        p_start, t_adv = None, t0
         trace: list[dict] = []
         self._evidence.setdefault("servo_traces", {})[f"{stage}_{len(self._evidence.get('servo_traces', {}))}"] = trace
         q_cmd = np.array(self.arm_q())
@@ -1015,16 +1011,7 @@ class EyeInHandSkill(rSkillBase):
             q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt, posture_gain=posture_gain,
                                              null_grad=None if null_objective is None else null_objective(q_meas))
             q_check = q_meas + (q_next - q_cmd) if scene_from_measured else q_next
-            why = ""
-            if check_scene:
-                if allowed_depth is None:  # where the arm is: already touching something, or clear
-                    allowed_depth = 0.0 if self.state_valid(q_meas) else self.contact_depth()
-                if self.state_valid(q_check):
-                    allowed_depth = 0.0
-                elif self.contact_depth() > allowed_depth + 1e-4:
-                    why = "the robot's own planning scene"
-                else:
-                    allowed_depth = self.contact_depth()
+            why = "" if not check_scene or self.state_valid(q_check) else "the robot's own planning scene"
             if not why and guard is not None:
                 why = guard(q_next)
             if why:
