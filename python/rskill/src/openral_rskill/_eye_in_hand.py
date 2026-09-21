@@ -44,6 +44,26 @@ READY = (0.0, -1.0, 0.0, -1.4, 0.0, 1.2, math.pi)
 JOINT_LIMITS_RAD = (3.107, 2.269, 3.107, 2.356, 3.107, 2.234, 6.283)
 #: how far a seeded IK solution may sit from the seed before it is another arm configuration rather than a nearby one
 BRANCH_JUMP_RAD = 1.2
+#: how far short of a joint's stop a commanded angle is kept
+JOINT_MARGIN_RAD = 0.05
+
+
+def nearest_equivalent(q, near) -> list[float]:
+    """The same arm configuration with every joint that can turn more than a full turn (the wrist roll, +-2 pi) at the
+    turn closest to `near`. Inverse kinematics answers with whichever turn its solver happened to settle on, and a planned
+    move takes the joints literally: mc4's stand-off solution had the wrist roll a turn away from where the arm stood, so
+    the move rolled it 1.2 turns, ended 0.04 rad from its stop, and the retreat -- which needed 0.12 rad more roll -- was
+    refused at the stop while the tool sat within a millimetre of its goal."""
+    out = []
+    for i, (v, n) in enumerate(zip(q, near)):
+        room = JOINT_LIMITS_RAD[i] - JOINT_MARGIN_RAD
+        best = float(v)
+        for k in (-2, -1, 1, 2):
+            c = float(v) + k * 2 * math.pi
+            if abs(c) <= room and abs(c - n) < abs(best - n):
+                best = c
+        out.append(best)
+    return out
 
 
 def acceptable(q, seed) -> tuple[bool, list[str], float]:
@@ -75,7 +95,7 @@ def working_seeds(k: int = 8) -> list[list[float]]:
     rng = np.random.default_rng(3)
     bank = [list(READY)]
     for _ in range(k):
-        bank.append([float(np.clip(rng.uniform(c - h, c + h), -JOINT_LIMITS_RAD[i] + 0.05, JOINT_LIMITS_RAD[i] - 0.05))
+        bank.append([float(np.clip(rng.uniform(c - h, c + h), -JOINT_LIMITS_RAD[i] + JOINT_MARGIN_RAD, JOINT_LIMITS_RAD[i] - JOINT_MARGIN_RAD))
                      for i, (c, h) in enumerate(POSTURE.get(n, (0.0, JOINT_LIMITS_RAD[i])) for i, n in enumerate(ARM_JOINT_NAMES))])
     return bank
 #: How far the carried item pivots about the jaw closing axis while it hangs from its handle: the largest tilt from
@@ -558,6 +578,7 @@ class EyeInHandSkill(rSkillBase):
             q = self._ik_once(p, R, seed)
             if q is None:
                 return None
+            q = nearest_equivalent(q, seed)
             ok, off, jump = acceptable(q, seed)
             if not ok:
                 ev["last_ik"].update(branch_jump_rad=round(jump, 3), off_branch=off)
@@ -574,6 +595,7 @@ class EyeInHandSkill(rSkillBase):
             q = self._ik_once(p, R, s)
             if q is None:
                 continue
+            q = nearest_equivalent(q, seed)
             key = (-round(posture_cost(q) / 0.05), -max(abs(a - b) for a, b in zip(q, seed)))
             if best is None or key > best[0]:
                 best = (key, q)
@@ -660,28 +682,36 @@ class EyeInHandSkill(rSkillBase):
             J[3:, i] = mat_to_rotvec(Ti[:3, :3] @ T0[:3, :3].T) / delta
         return J
 
-    def resolved_rate_step(self, q_cmd: np.ndarray, dx: np.ndarray, dw: np.ndarray, max_dq: float, damping: float = 0.05,
-                           posture_gain: float = 0.4, null_grad: np.ndarray | None = None, null_gain: float = 1.0) -> np.ndarray:
+    def resolved_rate_step(self, q_cmd: np.ndarray, dx: np.ndarray, dw: np.ndarray, max_dq: float, dt: float,
+                           damping: float = 0.05, posture_gain: float = 0.05, null_grad: np.ndarray | None = None,
+                           null_gain: float = 1.0) -> np.ndarray:
         """One joint step that moves the TCP by (dx, dw) from the measured configuration: damped least squares on the
         Jacobian, limited per joint and kept inside the joint stops. Local by construction -- unlike an inverse
         kinematics call, which may answer with a different arm configuration for a nearby pose. The redundancy is used
         to hold the arm on its working branch (`POSTURE`): free-floating, the 7-DoF arm drifts into a mirrored
-        configuration in which it cannot move on (research repo F57)."""
+        configuration in which it cannot move on (research repo F57).
+
+        The pull is a rate: `posture_gain` per second of a joint's distance from the centre of its window, in the null
+        space, so it cannot move the tool. It used to be a step scaled up to the joint-rate limit whenever the arm was
+        away from the centre, i.e. always -- the elbow was rolled at 0.3 rad/s from a standstill; the joints answer at their
+        own lags, so the tool left its goal by 12 cm in half a second and the arm rang at 1 Hz for five seconds (gc3: the
+        carried ORU shook out of the fingers as `over` started). The branch drifts over tens of seconds, so a pull with a
+        time constant of 20 s holds it and does not excite the arm."""
         q = np.array(self.arm_q())
         J = self.jacobian(q, self.fk(q))
         dq = J.T @ np.linalg.solve(J @ J.T + damping ** 2 * np.eye(6), np.concatenate([dx, dw]))
-        # null-space pull towards the working branch, scaled like the task step
+        null_space = np.eye(7) - np.linalg.pinv(J) @ J
         ref = np.array(q)
         for joint, (centre, _half) in POSTURE.items():
             ref[ARM_JOINT_NAMES.index(joint)] = centre
-        want = (ref - q) * posture_gain
+        pull = null_space @ ((ref - q) * posture_gain * dt)
+        dq = dq + pull * min(1.0, max_dq / max(float(np.max(np.abs(pull))), 1e-9))
         if null_grad is not None:  # e.g. lift the arm away from what the cameras measured under it
-            want = want + null_grad * null_gain
-        null = (np.eye(7) - np.linalg.pinv(J) @ J) @ want
-        dq = dq + null * min(1.0, max_dq / max(float(np.max(np.abs(null))), 1e-9))
+            away = null_space @ (null_grad * null_gain)
+            dq = dq + away * min(1.0, max_dq / max(float(np.max(np.abs(away))), 1e-9))
         scale = min(1.0, max_dq / max(float(np.max(np.abs(dq))), 1e-9))
         q_next = q_cmd + dq * scale
-        return np.clip(q_next, [-(l - 0.05) for l in JOINT_LIMITS_RAD], [l - 0.05 for l in JOINT_LIMITS_RAD])
+        return np.clip(q_next, [-(l - JOINT_MARGIN_RAD) for l in JOINT_LIMITS_RAD], [l - JOINT_MARGIN_RAD for l in JOINT_LIMITS_RAD])
 
     def carry_item(self, held: dict | None) -> None:
         """Account for the item hanging from the jaws in every collision check, or stop doing so.
@@ -971,7 +1001,7 @@ class EyeInHandSkill(rSkillBase):
               max_joint_rate_rad_s: float = 0.3, timeout_s: float = 40.0, stall_s: float = 4.0, settle_cycles: int = 3,
               step_m: float = 0.04, step_rad: float = 0.2, guard: Callable[[np.ndarray], str] | None = None,
               null_objective: Callable[[np.ndarray], np.ndarray] | None = None,
-              max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.4,
+              max_speed_m_s: float | None = None, sag_integral: bool = True, posture_gain: float = 0.05,
               check_scene: bool = True, gain_per_s: float | None = None, advance_m_s: float | None = None,
               advance_ramp_s: float = 0.0, scene_from_measured: bool = False, stall_returns: bool = False) -> dict:
         """Move the TCP (chassis_base_link) to `goal()` = (position, rotation), re-evaluated every cycle (visual
@@ -1078,7 +1108,7 @@ class EyeInHandSkill(rSkillBase):
                 dw = dw * min(1.0, gain_per_s * dt)  # the orientation loop has the same plant: gb7r3 swung +-9 mm sideways at
                 # 1.6 Hz with the position gain fixed and this one at 20/s -- a wrist swing about a 0.2 m lever
             q_meas = np.array(self.arm_q())
-            q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt, posture_gain=posture_gain,
+            q_next = self.resolved_rate_step(q_cmd, dx, dw, max_joint_rate_rad_s * dt, dt, posture_gain=posture_gain,
                                              null_grad=None if null_objective is None else null_objective(q_meas))
             q_check = q_meas + (q_next - q_cmd) if scene_from_measured else q_next
             why = "" if not check_scene or self.state_valid(q_check) else "the robot's own planning scene"

@@ -70,6 +70,7 @@ class PlaceRskill(EyeInHandSkill):
         g = self.goal
         self._evidence.update(support=g["support"])
         self.stage("over")
+        self.wait_until_still()  # the rover has just stopped: the arm and what it carries may still be ringing from it
         # the gripper's own place in its camera, from the mount: what is nearer than this is the tool, not the scene
         f0 = self.frame(after=self._clock() - 0.05)
         self._tool_view = tool_in_view(f0.K, np.linalg.inv(self.T("tcp_frame", f0.frame_id)), *f0.depth.shape)
