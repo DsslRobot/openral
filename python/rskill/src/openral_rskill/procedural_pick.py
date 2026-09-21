@@ -41,7 +41,7 @@ import numpy as np
 from openral_rskill._eye_in_hand import (BASE_FRAME_ID, READY, JAW_EMPTY_MAX_RAD, EyeInHandSkill, Frame, StageFailure,
                                           TCP_FRAME_ID, mat_to_rotvec)
 from openral_rskill.grasp_perception import GripperGeometry, find_regions, locate_region, render_regions, upright
-from openral_rskill.interface_fit import Fit, locate, track, yaw_of
+from openral_rskill.interface_fit import SIGMA_M, Fit, locate, track, yaw_of
 
 __all__ = ["PickRskill", "tool_rotation"]
 
@@ -258,14 +258,22 @@ class PickRskill(EyeInHandSkill):
             T_bo = self.T("chassis_base_link", "odom")
             state["p_base"] = T_bo[:3, :3] @ state["odom"] + T_bo[:3, 3]
 
-        R = self.take_standoff(state, [float(v) for v in np.atleast_1d(g["standoff_m"])])
-        # the contact the jaws may make: the neck, across, along the slot, to the depth the fingers pass
+        # the contact the jaws may make -- the neck, across, along the slot, to the depth the fingers pass -- is
+        # declared before the stand-off is planned: the planner's endpoint check is only permitted against a
+        # registered region (gb5 failed here with "no selected measured contact region"). Both grasp rotations
+        # share this box: same approach, same slot, the jaw axis only mirrored.
+        # The box is the neck's own volume let out by the depth's resolution on the two axes its faces lie on, so
+        # the measured faces fall inside it and not on its boundary (gb7 registered the neck's exact box, it held
+        # no measured triangle, nothing was exempted, and the insertion was refused on the first touch); along the
+        # slot it is drawn *in* by the same amount, so the head's and collar's faces stay protected.
         region = np.eye(4)
         region[:3, 3] = state["odom"]
-        region[:3, :3] = T_ob[:3, :3] @ R  # x across the neck, y along the slot (vertical), z the approach
-        dims = np.array([self.dims["neck_thickness"], self.dims["neck_height"], self.geom.depth_step_m])
+        region[:3, :3] = T_ob[:3, :3] @ self.grasp_rotations()[0]  # x across the neck, y along the slot, z the approach
+        slack = 2 * SIGMA_M
+        dims = np.array([self.dims["neck_thickness"] + slack, self.dims["neck_height"] - slack, self.dims["neck_width"] + slack])
         self._contact_region = (region, dims)
         self.contact_permission("register", region, dims, str(self.evidence_dir / "view_depth.npy"))
+        R = self.take_standoff(state, [float(v) for v in np.atleast_1d(g["standoff_m"])])
 
         def goal_now():
             refresh()
@@ -318,7 +326,9 @@ class PickRskill(EyeInHandSkill):
         state["standoff"] = -self.geom.seat_depth_m  # drive the neck to the middle of the pads
         self.stage("approach", close_in=True)
         try:
-            info = self.servo(goal_now, "approach", tol_m=0.005, tol_rad=0.04,
+            # the slot leaves the fingers (neck_height - finger_height)/2 = 5 mm each way: the close-in has to settle
+            # finer than that, or a finger lands on the collar (gb7: 5.4 mm along the slot, the collar's top face)
+            info = self.servo(goal_now, "approach", tol_m=0.003, tol_rad=0.04,
                               max_speed_m_s=float(g["close_in_speed_m_s"]),
                               max_joint_rate_rad_s=float(g["carry_servo"]["max_joint_rate_rad_s"]),
                               timeout_s=60.0, stall_s=6.0, sag_integral=False, posture_gain=0.0)
@@ -421,7 +431,7 @@ class PickRskill(EyeInHandSkill):
         sideways = float(abs(np.dot(e, gR[:, 0])))
         depth = float(abs(np.dot(e, gR[:, 2])))
         side_budget = max(0.0, (self.geom.open_width_m - self.dims["neck_thickness"]) / 2 - self.geom.clearance_m)
-        slack = max(0.0, (self.dims["neck_height"] - self.geom.pad_height_m) / 2)
+        slack = max(0.0, (self.dims["neck_height"] - self.geom.finger_height_m) / 2)  # the fingers' own height, not the pads' minimum
         rotation_error = float(np.linalg.norm(mat_to_rotvec(gR @ R.T)))
         self._evidence["closure_precondition"] = {
             "position_error_m": float(np.linalg.norm(e)), "along_part_m": along, "along_part_budget_m": round(slack, 4),

@@ -29,6 +29,7 @@ class GripperGeometry:
     open_width_m: float = 0.066
     clearance_m: float = 0.010  # per side, between a finger and the grasped part when the jaws are open
     finger_width_m: float = 0.016  # finger thickness along the closing axis
+    finger_height_m: float = 0.018  # the fingers' extent along the part, from their meshes (eg2_link5/6 span y +-0.009, F84)
     pad_height_m: float = 0.014  # minimum extent of the part along the pads (perpendicular to closing and approach)
     min_part_width_m: float = 0.005
     #: where along the approach a part is actually clamped, past the tool origin -- from the gripper's own collision
