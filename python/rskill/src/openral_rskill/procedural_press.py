@@ -230,5 +230,16 @@ class PressRskill(EyeInHandSkill):
         # reason `pick`'s lift does not check the scene for the stroke that leaves what it holds
         self.servo(lambda: (X + n * self._stand, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=False,
                    gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
+        # An operation must not leave the arm where its own planner cannot start from. The retreat stops within a
+        # centimetre of the stand-off, and the panel's collision box -- 5.8 cm proud of the button -- can still hold a
+        # finger there: ma5r4 ended 5 mm inside it, and every plan afterwards, `stow` first, failed with -2 (invalid
+        # motion plan) because its start state was in collision. So back out along the same line until the planning
+        # scene accepts the state.
+        out = 0.0
+        while not self.state_valid(np.array(self.arm_q())) and out < 0.10:
+            out += 0.01
+            self.servo(lambda o=out: (X + n * (self._stand + o), R), "retreat", tol_m=0.005, tol_rad=0.06, timeout_s=20.0,
+                       check_scene=False, gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
         self._evidence["retreated_to"] = [round(float(v), 4) for v in self.tcp()[0]]
+        self._evidence["retreat_clear_extra_m"] = round(out, 3)
         self._evidence["outcome"] = "pressed"
