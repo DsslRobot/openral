@@ -186,11 +186,18 @@ class PlaceRskill(EyeInHandSkill):
                                     "withdraw_to": back.tolist()}
         # The open jaws start around the part they just released, which the live scene measures: the withdrawal stroke
         # out of it is not tested against that measurement (the lift out of a grasp is not either); the stroke up is.
-        self.servo(lambda: (back, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=False,
-                   gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
+        # A low, steep release pose can put a joint at its stop before the tool reaches the withdrawal target -- the
+        # elbow pinned 0.05 rad short of its stop, the fixed release orientation with nowhere left to give (gt2c1:
+        # joint4 at -2.31, limit -2.356, 15 mm short of the goal). That is the servo finding it has no more of this
+        # joint to spend, not the item back in the way; clear of the released item is what retreat is for, so a stall
+        # here is a result, like a stroke a surface stops.
+        self._evidence["retreat"]["back_servo"] = self.servo(lambda: (back, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0,
+                                                              check_scene=False, gain_per_s=float(g["servo_gain_per_s"]),
+                                                              sag_integral=False, stall_returns=True)
         up = back + np.array([0.0, 0.0, float(g["retreat_up_m"])])
-        self.servo(lambda: (up, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0,
-                   gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
+        self._evidence["retreat"]["up_servo"] = self.servo(lambda: (up, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0,
+                                                            gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False,
+                                                            stall_returns=True)
 
         self.stage("settle")
         self.wait_until_still()  # gb7r12: the frames were taken while the arm was still moving (0.1-0.5 rad/s), and the camera's own motion read as the item's
