@@ -20,10 +20,12 @@ Failures return the stage and evidence; nothing here chooses another support.
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 
-from openral_rskill._eye_in_hand import JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure
+from openral_rskill._eye_in_hand import JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure, joints_off_their_stops
 from openral_rskill.grasp_perception import GripperGeometry
 from openral_rskill.interface_fit import fit_wall
 from openral_rskill.procedural_pick import tool_in_view
@@ -65,6 +67,31 @@ class PlaceRskill(EyeInHandSkill):
             rec["not_applied"] = "further than a localization error could account for"
             return 0.0
         return corr
+
+    def _retreat_leg(self, target: np.ndarray, R: np.ndarray, stage: str, check_scene: bool) -> None:
+        """One straight-line step of the retreat, holding orientation: the local servo, continuing from wherever the
+        arm already is. A low, steep release pose can leave that branch with no more of one joint to give before the
+        tool gets there -- `lower` and `over` are local tracking too, so nothing chose the release configuration for
+        room to retreat from (gt2c1: joint4 pinned 0.046 rad from its stop, 15 mm short, no collision -- check_scene
+        was off on this leg for exactly this kind of near-miss, and it was still the joint, not the scene, that
+        stopped it).
+
+        A stall with nothing in the way gets that one joint moved off its stop directly, in joint space -- no target
+        pose, no inverse kinematics: `posture_cost` already calls a joint "at its limit" inside 0.3 rad of the stop
+        (`_eye_in_hand.py`), so a joint found there is walked to exactly that clear, towards its own working centre,
+        and nothing else is touched. A collision-aware planned move (`plan_to`) makes the joint step, since the scene
+        by then (already most of the way through the withdrawal) is not what the released item sits against."""
+        info = self.servo(lambda: (target, R), stage, tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=check_scene,
+                          gain_per_s=float(self.goal["servo_gain_per_s"]), sag_integral=False, stall_returns=True)
+        self._evidence.setdefault("retreat_legs", []).append({"target": target.tolist(), "servo": info})
+        if not info.get("stalled"):
+            return
+        q, freed = joints_off_their_stops(self.arm_q())
+        if not freed:
+            raise StageFailure(stage, f"the arm stopped {info['pos_err_m'] * 100:.1f} cm / {math.degrees(info['rot_err_rad']):.0f} "
+                                      "deg short of the retreat target, and no joint is at its stop to explain why")
+        self._evidence["retreat_legs"][-1]["freed_joints"] = freed
+        self.plan_to(np.array(q), stage)
 
     def put_it_down(self) -> None:
         g = self.goal
@@ -186,18 +213,9 @@ class PlaceRskill(EyeInHandSkill):
                                     "withdraw_to": back.tolist()}
         # The open jaws start around the part they just released, which the live scene measures: the withdrawal stroke
         # out of it is not tested against that measurement (the lift out of a grasp is not either); the stroke up is.
-        # A low, steep release pose can put a joint at its stop before the tool reaches the withdrawal target -- the
-        # elbow pinned 0.05 rad short of its stop, the fixed release orientation with nowhere left to give (gt2c1:
-        # joint4 at -2.31, limit -2.356, 15 mm short of the goal). That is the servo finding it has no more of this
-        # joint to spend, not the item back in the way; clear of the released item is what retreat is for, so a stall
-        # here is a result, like a stroke a surface stops.
-        self._evidence["retreat"]["back_servo"] = self.servo(lambda: (back, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0,
-                                                              check_scene=False, gain_per_s=float(g["servo_gain_per_s"]),
-                                                              sag_integral=False, stall_returns=True)
+        self._retreat_leg(back, R, "retreat", check_scene=False)
         up = back + np.array([0.0, 0.0, float(g["retreat_up_m"])])
-        self._evidence["retreat"]["up_servo"] = self.servo(lambda: (up, R), "retreat", tol_m=0.015, tol_rad=0.06, timeout_s=40.0,
-                                                            gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False,
-                                                            stall_returns=True)
+        self._retreat_leg(up, R, "retreat", check_scene=True)
 
         self.stage("settle")
         self.wait_until_still()  # gb7r12: the frames were taken while the arm was still moving (0.1-0.5 rad/s), and the camera's own motion read as the item's

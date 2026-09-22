@@ -88,6 +88,23 @@ def posture_cost(q) -> float:
     return outside + at_limit + straight
 
 
+def joints_off_their_stops(q: list[float]) -> tuple[list[float], dict[str, tuple[float, float]]]:
+    """`q`, with every joint `posture_cost` would call "at its limit" (within 0.3 rad of the stop) walked back to
+    exactly that clear, towards its own working centre; everything else untouched. Pure joint arithmetic, no target
+    pose and no inverse kinematics -- a joint pinned at its stop is a joint-space fact, not a Cartesian one, and does
+    not need a re-solve to fix. Returns the corrected joints and, for every joint moved, (from, to) for evidence."""
+    q = list(q)
+    freed: dict[str, tuple[float, float]] = {}
+    for j, (centre, _half) in POSTURE.items():
+        i = ARM_JOINT_NAMES.index(j)
+        clear = JOINT_LIMITS_RAD[i] - 0.3
+        if q[i] > clear and centre <= clear:
+            freed[j] = (round(q[i], 3), round(clear, 3)); q[i] = clear
+        elif q[i] < -clear and centre >= -clear:
+            freed[j] = (round(q[i], 3), round(-clear, 3)); q[i] = -clear
+    return q, freed
+
+
 def working_seeds(k: int = 8) -> list[list[float]]:
     """Arm configurations to start inverse kinematics from: the ready posture, then a fixed spread over the working
     branch. One seed finds one configuration; a planned move is not tied to the configuration the arm happens to be

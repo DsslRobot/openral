@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 from openral_core.schemas import RobotDescription, RSkillManifest
-from openral_rskill._eye_in_hand import JOINT_LIMITS_RAD, POSTURE, nearest_equivalent
+from openral_rskill._eye_in_hand import ARM_JOINT_NAMES, JOINT_LIMITS_RAD, POSTURE, joints_off_their_stops, nearest_equivalent
 from openral_rskill.procedural_place import PlaceRskill
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,3 +52,20 @@ def test_posture_pull_is_a_rate_not_a_step_at_the_joint_rate_limit():
     assert math.isclose(step[3], want, rel_tol=1e-6)
     assert abs(step[3]) < max_dq / 4  # it was the whole joint-rate limit, from a standstill, every tick
     assert np.allclose(np.delete(step, 3), 0.0)
+
+
+def test_a_joint_pinned_at_its_stop_is_walked_off_it_and_nothing_else_moves():
+    # gt2c1: retreat stalled with joint4 at -2.31, limit -2.356 -- 0.046 rad from the stop, inside posture_cost's 0.3 rad margin
+    q = [-0.01, -0.75, -0.04, -2.31, -0.04, 1.61, 1.6]
+    freed_q, freed = joints_off_their_stops(q)
+    i4 = ARM_JOINT_NAMES.index("joint4")
+    assert freed_q[i4] == -(JOINT_LIMITS_RAD[i4] - 0.3)
+    assert freed["joint4"] == (-2.31, freed_q[i4])
+    assert list(freed) == ["joint4"]  # no other joint here is within 0.3 rad of its own stop
+    other = [i for i in range(7) if i != i4]
+    assert [freed_q[i] for i in other] == [q[i] for i in other]
+
+
+def test_a_joint_well_inside_its_window_is_left_alone():
+    q, freed = joints_off_their_stops([POSTURE[j][0] for j in ARM_JOINT_NAMES if j in POSTURE] + [0.0, 0.0])
+    assert freed == {}
