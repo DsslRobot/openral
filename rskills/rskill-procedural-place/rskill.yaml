@@ -58,13 +58,8 @@ procedural:
       "lower_ramp_s": 2.0,
       "lower_stall_s": 4.0,
       "min_tool_above_support_m": 0.15,
-      # A retreat of 0.15 + 0.10 m (0.18 m total) placed the ORU well within tolerance on every axis (gt2c1: 2.2-2.7 cm
-      # off centre, upright, still) and the whole chain still reported it not delivered: "held" is a real, independent
-      # geometric check (the tool's distance from the item's own handle, not the skill's say-so) and 0.18 m does not
-      # clear it. 0.25 + 0.20 m (0.32 m) does, with margin, and neither leg grew past what `over_offset`'s own search
-      # already found safe to stand off this shelf by (0.225 m half the item's own width).
-      "retreat_m": 0.25,
-      "retreat_up_m": 0.20,
+      "retreat_m": 0.30,
+      "retreat_up_m": 0.25,
       "settle_s": 1.5
     }
 

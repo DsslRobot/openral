@@ -915,6 +915,8 @@ class EyeInHandSkill(rSkillBase):
         r.workspace_parameters.max_corner.x = r.workspace_parameters.max_corner.y = r.workspace_parameters.max_corner.z = 2.0
         r.start_state.joint_state.name = list(ARM_JOINT_NAMES)
         r.start_state.joint_state.position = [float(v) for v in self.arm_q()]
+        if self._held is not None:  # a planned move made while carrying must not swing what it carries into the scene
+            r.start_state.attached_collision_objects = [self._held_body()]
         goal = Constraints()
         goal.joint_constraints = [JointConstraint(joint_name=j, position=float(v), tolerance_above=tol_rad,
                                                   tolerance_below=tol_rad, weight=1.0) for j, v in zip(ARM_JOINT_NAMES, q_goal)]

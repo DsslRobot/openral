@@ -68,30 +68,33 @@ class PlaceRskill(EyeInHandSkill):
             return 0.0
         return corr
 
-    def _retreat_leg(self, target: np.ndarray, R: np.ndarray, stage: str, check_scene: bool) -> None:
-        """One straight-line step of the retreat, holding orientation: the local servo, continuing from wherever the
-        arm already is. A low, steep release pose can leave that branch with no more of one joint to give before the
-        tool gets there -- `lower` and `over` are local tracking too, so nothing chose the release configuration for
-        room to retreat from (gt2c1: joint4 pinned 0.046 rad from its stop, 15 mm short, no collision -- check_scene
-        was off on this leg for exactly this kind of near-miss, and it was still the joint, not the scene, that
-        stopped it).
+    def _move_or_free_a_joint(self, goal, stage: str, evidence_key: str, extra: dict | None = None, **servo_kwargs) -> None:
+        """A local servo step, continuing from wherever the arm already is; on a stall with nothing in the way, the
+        one joint it is pinned at gets moved off its stop directly, in joint space. `over` and `retreat` both drive
+        the tool with no look-ahead -- each step continues the branch the arm already happens to be on -- so neither
+        chose its own ending configuration for room to move on from (gt2c1: `retreat` pinned joint4 0.046 rad from its
+        stop, no collision, 15 mm short; the same local tracking is what `over` does to get there in the first place,
+        so the same dead end can just as well show up there instead, on a different release pose).
 
-        A stall with nothing in the way gets that one joint moved off its stop directly, in joint space -- no target
-        pose, no inverse kinematics: `posture_cost` already calls a joint "at its limit" inside 0.3 rad of the stop
-        (`_eye_in_hand.py`), so a joint found there is walked to exactly that clear, towards its own working centre,
-        and nothing else is touched. A collision-aware planned move (`plan_to`) makes the joint step, since the scene
-        by then (already most of the way through the withdrawal) is not what the released item sits against."""
-        info = self.servo(lambda: (target, R), stage, tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=check_scene,
-                          gain_per_s=float(self.goal["servo_gain_per_s"]), sag_integral=False, stall_returns=True)
-        self._evidence.setdefault("retreat_legs", []).append({"target": target.tolist(), "servo": info})
+        `posture_cost` already calls a joint "at its limit" inside 0.3 rad of the stop (`_eye_in_hand.py`); a joint
+        found there is walked to exactly that clear, towards its own working centre, and nothing else is touched --
+        no target pose, no inverse kinematics. A collision-aware planned move (`plan_to`) makes the joint step."""
+        info = self.servo(goal, stage, stall_returns=True, **servo_kwargs)
+        entry = {**(extra or {}), "servo": info}
+        self._evidence.setdefault(evidence_key, []).append(entry)
         if not info.get("stalled"):
             return
         q, freed = joints_off_their_stops(self.arm_q())
         if not freed:
             raise StageFailure(stage, f"the arm stopped {info['pos_err_m'] * 100:.1f} cm / {math.degrees(info['rot_err_rad']):.0f} "
-                                      "deg short of the retreat target, and no joint is at its stop to explain why")
-        self._evidence["retreat_legs"][-1]["freed_joints"] = freed
+                                      "deg short of its goal, and no joint is at its stop to explain why")
+        entry["freed_joints"] = freed
         self.plan_to(np.array(q), stage)
+
+    def _retreat_leg(self, target: np.ndarray, R: np.ndarray, stage: str, check_scene: bool) -> None:
+        self._move_or_free_a_joint(lambda: (target, R), stage, "retreat_legs", extra={"target": target.tolist()},
+                                   tol_m=0.015, tol_rad=0.06, timeout_s=40.0, check_scene=check_scene,
+                                   gain_per_s=float(self.goal["servo_gain_per_s"]), sag_integral=False)
 
     def put_it_down(self) -> None:
         g = self.goal
@@ -157,7 +160,7 @@ class PlaceRskill(EyeInHandSkill):
                 self.working_on(self.tcp()[0])
                 return target, R0
 
-            self.servo(carrying, "over", **g["carry_servo"])
+            self._move_or_free_a_joint(carrying, "over", "over_legs", extra={"target": target.tolist()}, **g["carry_servo"])
         self._evidence["over"] = {"support_rover": [round(float(v), 3) for v in s], "tcp": [round(float(v), 3) for v in self.tcp()[0]]}
 
         self.stage("lower")
