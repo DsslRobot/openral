@@ -56,7 +56,7 @@ procedural:
   # reasoner is expected to override 'joint_targets' on every real dispatch.
   default_goal_json: |
     {
-      "joint_targets": [0.0, -0.6, 0.0, 1.2, 0.0, 0.6, 0.0],
+      "joint_targets": [0.0, 0.40, 0.0, -0.70, 0.0, -1.27, 3.14159265],
       "tolerance_rad": 0.05,
       "timeout_s": 15.0
     }

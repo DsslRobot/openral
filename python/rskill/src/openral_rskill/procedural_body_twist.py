@@ -62,6 +62,7 @@ class ProceduralBodyTwistRskill(rSkillBase):
         goal_params_json: str = "",
         tf_lookup: Any = None,
         clock: Any = None,
+        ros_node: Any = None,  # the runner node; unused -- this skill subscribes to nothing
     ) -> None:
         del tf_lookup  # unused — a fixed body-twist hold needs no TF feedback;
         # accepted so every `kind: procedural` skill shares one constructor

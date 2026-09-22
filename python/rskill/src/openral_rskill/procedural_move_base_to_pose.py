@@ -82,6 +82,7 @@ class MoveBaseToPoseRskill(rSkillBase):
         goal_params_json: str = "",
         tf_lookup: TfLookup | None = None,
         clock: Any = None,
+        ros_node: Any = None,  # the runner node; unused -- this skill subscribes to nothing
     ) -> None:
         del robot_description
         if manifest.procedural is None:

@@ -93,6 +93,7 @@ class GripperRskill(rSkillBase):
         goal_params_json: str = "",
         tf_lookup: Any = None,
         clock: Any = None,
+        ros_node: Any = None,  # the runner node; unused -- this skill subscribes to nothing
     ) -> None:
         del tf_lookup, robot_description  # unused — reads one named joint, not TF.
         if manifest.procedural is None:

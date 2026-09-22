@@ -2,6 +2,24 @@
 
 > Part of the OpenRAL [public-symbol inventory](../METHODS.md). Hand-curated; `(LNN)` markers are refreshed by `tools/refresh_methods_linenos.py`.
 
+### `python/rskill/src/openral_rskill/grasp_perception.py`
+
+- `refine_contact(depth, K, candidate, geom) -> tuple[Candidate, dict]` — Refine the selected contact's closing/part axes from the observed local depth surface before target commitment. Returns surface-fit evidence; no object model or world-truth input.
+
+### `python/rskill/src/openral_rskill/procedural_pick.py`
+
+- `grasp_camera_sides(part_axis_b) -> list[np.ndarray]` — Enumerate both antipodal jaw rolls. A single offset pixel never prunes a legal pose; shared IK, collision and insertion observation checks decide executability before motion. No tilted fallback.
+- `PickRskill.contact_path_observed(tool_points, tool_links, start, end, rotation) -> dict` — Check measured free rays for the actual open-gripper surface along insertion; invalid/occluded pixels remain unknown; declared contact-link samples inside the locked patch are counted separately as expected contact.
+
+### `python/rskill/src/openral_rskill/_eye_in_hand.py`
+
+- `EyeInHandSkill.contact_permission(phase, region=None, dimensions=None, evidence_ref="")` — Declare an immutable measured contact patch; acknowledge endpoint-check/insertion permission and revocation.
+- `EyeInHandSkill.contact_scene(prepare: bool) -> None` — Acquire/release the applied stationary-contact scene through acknowledged shared services; retain scene/evidence references.
+- `EyeInHandSkill.gripper_surface_points(with_links=False)` — Articulated collision-mesh vertices in TCP coordinates, from installed robot geometry and measured joint-state FK; optionally retain each vertex's owning link.
+- `Frame.depth_semantics` — Optional sensor-sourced range/no-return metadata retained with the observation; `WristRGBD` receives it from the camera bridge. Missing metadata does not authorize infinite-depth rays.
+- `EyeInHandSkill.servo(..., max_speed_m_s=None) -> dict` — Existing per-step whole-robot collision-checked joint servo; optional Cartesian increment limit preserves approach speed limits.
+- Removed pick's `guard_or_empty` and `item_cells`: contact planning/approach no longer authorize motion through separate height-map target exclusions.
+
 ### `python/rskill/src/openral_rskill/base.py`
 _rSkillBase — abstract base class with lifecycle state machine._
 
@@ -19,7 +37,10 @@ _rSkillBase — abstract base class with lifecycle state machine._
   - `on_unload_weights() -> None` — Hook: release weights, called by `shutdown()` (VRAM eviction). (L286)
   - `on_quantize() -> None` — Hook: apply quantization. (L296)
   - `on_warmup() -> None` — Hook: dummy forward pass, called by `activate()` before `_activate_impl`. Default is a no-op. **Implemented on the deploy path** by `_PolicyAdapterSkill.on_warmup` (`packages/openral_rskill_ros/openral_rskill_ros/rskill_runner_node.py`), which delegates to `_vla_core.warm_up_lerobot_policy` and swallows+logs any failure. (L303)
-  - `_configure_impl/_activate_impl/_deactivate_impl/_shutdown_impl/_step_impl()` [@abstractmethod] (L313)
+  - `evidence() -> dict` — Raw stage/measurement record returned on all outcomes; default empty.
+  - `stop_actions(world_state: WorldState) -> list[Action]` — Revoke asynchronous work and propose final holding actions through the existing safety/HAL path; default empty. Command application is not a physical-rest acknowledgement.
+  - `finish_stop() -> None` — Join background work after holding commands have been applied; default no-op.
+  - `_configure_impl/_activate_impl/_deactivate_impl/_shutdown_impl/_step_impl()` [@abstractmethod] (L338)
   - private: `_transition`, `_update`, `_require_transition`, `_enter_error`
 
 ### `python/rskill/src/openral_rskill/runtime.py`
@@ -135,15 +156,15 @@ _Action-chunk executor — promoted from `smolvla` so every chunked VLA family r
 ### `python/rskill/src/openral_rskill/ros_action_rskill.py`
 _ROS-wrapping rSkill adapter — bridges arbitrary ROS 2 action / service servers (MoveIt, Nav2, …) into the `rSkillBase` lifecycle. Selected by `make_default_skill_resolver` when `manifest.kind in {"ros_action", "ros_service"}`._
 
-- `build_joint_permutation_from_names(*, source_names, target_names) -> list[int]` — Build the permutation that reorders a wrapped server's `JointTrajectory.positions` into the host `RobotDescription.joints` order. Raises `ROSConfigError` on set-inequality so a joint mismatch surfaces loudly instead of silently swapping bytes. (L172)
+- `build_joint_permutation_from_names(*, source_names, target_names) -> list[int]` — Build the permutation that reorders a wrapped server's `JointTrajectory.positions` into the host `RobotDescription.joints` order. Raises `ROSConfigError` on set-inequality so a joint mismatch surfaces loudly instead of silently swapping bytes. (L193)
 - `CUMOTION_PIPELINE_ID = "isaac_ros_cumotion"` — the cuMotion MoveIt planning-pipeline id.
 - `maybe_inject_cumotion_pipeline(goal_dict, *, interface_type, capabilities) -> dict` — On a host that clears the cuMotion GPU floor (`RobotCapabilities.supports_cumotion()`), set `request.pipeline_id = CUMOTION_PIPELINE_ID` on a `MoveGroup` goal so MoveIt plans with cuMotion; no-op for non-MoveGroup actions, CPU/low-VRAM hosts (→ OMPL default), an already-set `pipeline_id`, or a goal with no `request` block. Pure; never mutates the input. Called by `_configure_impl` after the goal-merge.
-- `class ROSActionRskill(rSkillBase)` — `rSkillBase` shim wrapping a ROS 2 ActionClient (or service client). Two modes selected by `manifest.ros_integration.result_trajectory_field`: trajectory mode replays one waypoint per `step()` and raises `ROSRskillGoalSatisfied` after the last; result-only mode awaits the wrapped result and raises `ROSRskillGoalSatisfied` on success without emitting any `Action`. ROS imports are deferred to `_configure_impl` so the module imports cleanly without ROS sourced. (L299)
-  - `__init__(*, manifest, ros_node, robot_description, prompt, prompt_metadata_json)` (L332)
-  - `_configure_impl()` — Lazy-import IDL, build ActionClient/service client, parse `default_goal_json`. (L403)
-  - `_activate_impl()` — no-op; the wrapped action dispatches on first `step()`. (L493)
-  - `_deactivate_impl()` / `_shutdown_impl()` — Release the wrapped client. (L496)
-  - `_step_impl(world_state) -> Action` — First call sends goal and caches result; subsequent calls dequeue waypoints. (L513)
+- `class ROSActionRskill(rSkillBase)` — `rSkillBase` shim wrapping a ROS 2 ActionClient (or service client). Two modes selected by `manifest.ros_integration.result_trajectory_field`: trajectory mode replays one waypoint per `step()` and raises `ROSRskillGoalSatisfied` after the last; result-only mode awaits the wrapped result and raises `ROSRskillGoalSatisfied` on success without emitting any `Action`. ROS imports are deferred to `_configure_impl` so the module imports cleanly without ROS sourced. (L320)
+  - `__init__(*, manifest, ros_node, robot_description, prompt, prompt_metadata_json)` (L353)
+  - `_configure_impl()` — Lazy-import IDL, build ActionClient/service client, parse `default_goal_json`. (L442)
+  - `_activate_impl()` — no-op; the wrapped action dispatches on first `step()`. (L532)
+  - `_deactivate_impl()` / `_shutdown_impl()` — Release the wrapped client. (L535)
+  - `_step_impl(world_state) -> Action` — First call sends goal and caches result; subsequent calls dequeue waypoints. (L552)
 
 ### `python/rskill/src/openral_rskill/look_at_rskill.py`
 _Camera-aiming MoveGroup skill. Selected by `make_default_skill_resolver` when `manifest.ros_integration.goal_builder == "look_at"` (new `RosIntegration.goal_builder` field; `RSkillAction` gains `LOOK = "look"`)._

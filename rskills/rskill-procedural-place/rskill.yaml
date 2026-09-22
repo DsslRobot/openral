@@ -1,0 +1,76 @@
+# rSkill manifest -- set the held item down on a named support (kind: procedural).
+# One physical operation for the reasoner; over / lower / release / retreat / settle are its internal stages
+# (openral_rskill.procedural_place). Research repo plan v4.
+# Over tolerance 3 cm / 0.08 rad: a third of the ~10 cm clearance a catalogued module has on the PDU shelf (research F78).
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-place"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "cartesian_twist"
+    control_mode_semantics:
+      mode: "absolute"
+      reference_frame: "chassis_base_link"
+  - kind: "joint_position"
+    control_mode_semantics:
+      mode: "absolute"
+      joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+  - kind: "gripper_binary"
+    control_mode_semantics:
+      mode: "absolute"
+      gripper_convention: "normalized_open_unit"
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Set the item held in the jaws down on a surveyed support: carry the tool above the support point, lower slowly
+  until the support takes the load, open, retreat clear and check in the wrist image that the item stays put.
+  Fails with the stage reached (over, lower, release, retreat, settle) and its evidence.
+actions:
+  - "place"
+objects: []
+scenes:
+  - "any"
+
+procedural:
+  entrypoint: "openral_rskill.procedural_place:PlaceRskill"
+  default_goal_json: |
+    {
+      "support": "",
+      "release_constraint": "unconstrained",
+      "support_xyz_map": [0.0, 0.0, 0.0],
+      "support_normal_map": [1.0, 0.0, 0.0],
+      "evidence_dir": "/tmp/openral_evidence",
+      "carry_speed_m_s": 0.05,
+      "carry_servo": {"tol_m": 0.03, "tol_rad": 0.08, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0, "gain_per_s": 0.5, "sag_integral": false},
+      "servo_gain_per_s": 0.5,
+      "lower_speed_m_s": 0.02,
+      "lower_ramp_s": 2.0,
+      "lower_stall_s": 4.0,
+      "min_tool_above_support_m": 0.15,
+      "retreat_m": 0.30,
+      "retreat_up_m": 0.25,
+      "settle_s": 1.5
+    }
+
+goal_params_schema:
+  type: object
+  properties:
+    support: {type: string, description: "where to set the held item down"}
+    held_item: {type: object, description: "catalogue envelope of the carried item (size_m, handle_above_base_m, neck_height_m), from the boundary"}
+    interface: {type: object, description: "what the catalogue declares of the support (depth_m, width_m, lip_height_m), from the boundary"}
+    release_constraint:
+      type: string
+      enum: [unconstrained, below_overhang]
+      description: "For a side grasp below an overhang, withdraw parallel to the horizontal support before lifting."
+  required: ["support"]

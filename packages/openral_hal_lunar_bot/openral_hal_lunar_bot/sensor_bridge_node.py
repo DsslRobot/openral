@@ -107,7 +107,7 @@ REQUIRED_SENSOR_NAMES = ("front", "front_depth", "wrist", "imu", "lidar")
 #: neither with the rover nor with the arm (research repo F53).
 CAMERA_MOUNTS = {
     "front": ("rgbd_camera_frame", (0.0, 0.0, 0.0), (0.0, 15.0, 0.0)),
-    "wrist": ("Link7", (0.0, -0.048, -0.018), (0.0, -73.10, 90.0)),
+    "wrist": ("Link7", (0.0, -0.12, -0.08), (0.0, -72.0, 90.0)),
 }
 #: World camera convention (+X forward, +Z up) -> ROS optical frame (+Z forward, +Y down), xyzw.
 _WORLD_TO_OPTICAL_XYZW = (0.5, -0.5, 0.5, -0.5)
@@ -455,6 +455,13 @@ if _ROS2_AVAILABLE:
             )
 
             # ── Lidar relay (data); its TF is handled by _publish_sensor_frames ──
+            # Relay the sensor's own depth-return semantics unchanged. Hardware
+            # without such metadata does not acquire simulated free-ray evidence.
+            from std_msgs.msg import String
+            for camera in ("front", "wrist"):
+                metadata_pub = self.create_publisher(String, f"/openral/cameras/{camera}/depth_semantics", _SENSOR_QOS)
+                self.create_subscription(String, f"/{self._env_tf_frame}/cam_{camera}/depth_semantics",
+                                         lambda msg, pub=metadata_pub: pub.publish(msg), _SENSOR_QOS)
             self._relay_pointcloud(
                 src_topic=f"/{self._env_tf_frame}/lidar_robot/pointcloud",
                 dst_topic="/openral/lidar/points",

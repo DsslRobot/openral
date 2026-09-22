@@ -1,0 +1,81 @@
+# rSkill manifest -- pick up an item described in words by a described part (kind: procedural).
+# One physical operation for the reasoner; find / select / approach / grasp / hold are its internal stages
+# (openral_rskill.procedural_pick). Research repo plan v4 (docs/semantic_to_metric_manipulation_plan.md).
+
+schema_version: "0.1"
+name: "OpenRAL/rskill-procedural-lunar_bot-pick"
+version: "0.1.0"
+license: "apache-2.0"
+role: "s1"
+kind: "procedural"
+
+embodiment_tags:
+  - "lunar_bot"
+
+actuators_required:
+  - kind: "cartesian_twist"
+    control_mode_semantics:
+      mode: "absolute"
+      reference_frame: "chassis_base_link"
+  - kind: "joint_position"
+    control_mode_semantics:
+      mode: "absolute"
+      joint_order: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+  - kind: "gripper_binary"
+    control_mode_semantics:
+      mode: "absolute"
+      gripper_convention: "normalized_open_unit"
+
+chunk_size: 1
+
+latency_budget:
+  per_chunk_ms: 200.0
+
+description: >
+  Pick up an item by its declared lifting interface: the vision-language model names the item's region in the wrist
+  view, the catalogue's interface shape is fitted to the depth image to find the slot, the tool servos in on that fit
+  every frame in the declared grasp orientation, then jaw closure and a lift with a hold check. Retries on the same
+  item only; fails with the stage reached and its evidence.
+actions:
+  - "pick"
+objects: []
+scenes:
+  - "any"
+
+# `view_part_depth_m`: depths at which this wrist camera measures a part well -- past the gripper in its own
+# view, and near enough that the declared contact still spans pixels to measure. A property of the camera and
+# the gripper, not of any item: the tool stand-off is derived from it and from the camera mount read off TF.
+procedural:
+  entrypoint: "openral_rskill.procedural_pick:PickRskill"
+  default_goal_json: |
+    {
+      "target": "",
+      "part": "",
+      "evidence_dir": "/tmp/openral_evidence",
+      "vlm_model": "deepseek-flash",
+      "vlm_endpoint": "https://api.deepseek.com",
+      "view_part_depth_m": [0.42, 0.34, 0.52],
+      "standoff_m": [0.10, 0.14, 0.07],
+      "servo_gain_per_s": 0.5,
+      "bring_in_step_m": 0.05,
+      "bring_in_raise_step_m": 0.02,
+      "approach_speed_m_s": 0.05,
+      "approach_timeout_s": 60.0,
+      "close_in_speed_m_s": 0.007,
+      "close_in_ramp_s": 2.0,
+      "close_in_short_ok_m": 0.02,
+      "blind_ok_m": 0.06,
+      "lift_m": 0.15,
+      "lift_speed_m_s": 0.04,
+      "carry_servo": {"tol_m": 0.01, "tol_rad": 0.05, "max_joint_rate_rad_s": 0.2, "timeout_s": 60.0,
+                     "gain_per_s": 0.5, "sag_integral": false},
+      "min_lift_m": 0.06
+    }
+
+goal_params_schema:
+  type: object
+  properties:
+    target: {type: string, description: "the item to pick, described in words"}
+    part: {type: string, description: "the part to hold it by, described in words"}
+    held_item: {type: object, description: "catalogue envelope of the carried item and its lifting interface (size_m, handle_above_base_m, interface: the declared dimensions), from the boundary"}
+  required: ["target", "part"]

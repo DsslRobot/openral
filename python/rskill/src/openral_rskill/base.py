@@ -307,6 +307,31 @@ class rSkillBase(abc.ABC):  # noqa: N801  # reason: rSkill is the official packa
         Default is a no-op; override to call the model once with dummy input.
         """
 
+    def evidence(self) -> dict:
+        """The skill's own record of the goal it ran (stages reached, measurements, evidence file paths).
+
+        Read by the runner when the goal ends, on every outcome, and returned as
+        ``ExecuteRskill.Result.evidence_json``. Raw evidence for the caller, never a verdict.
+        Default: nothing recorded.
+        """
+        return {}
+
+    def stop_actions(self, world_state: WorldState) -> list[Action]:
+        """Revoke asynchronous work and return final holding commands, if needed.
+
+        The runner sends these through its ordinary safety/HAL path before
+        calling ``finish_stop``. Returning commands is not a physical stop ack.
+        Default: synchronous skills have no background command producer.
+        """
+        return []
+
+    def finish_stop(self) -> None:
+        """Join background work after the runner has applied holding commands.
+
+        Return only when the old operation can no longer generate commands.
+        Default: no background work.
+        """
+
     # ── Abstract implementation hooks ─────────────────────────────────────────
 
     @abc.abstractmethod
