@@ -224,6 +224,14 @@ class PressRskill(EyeInHandSkill):
         self.servo(lambda: (X + n * stand, R), "retreat", tol_m=0.006, tol_rad=0.06, timeout_s=40.0, check_scene=False,
                    gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
         self.set_jaw(True, "retreat")
+        # the stand-off is measured from the button; a panel's collision box can stand proud of it by more than that
+        # (chain_l2a_bess_r3: the BMS panel pressed and the unit restored, the arm then held 'inside the panel's
+        # collision volume' at the stand-off and every later plan from there failed): back out further on the same line
+        for extra in (0.03, 0.06, 0.10):
+            if self.state_valid(np.array(self.arm_q())):
+                break
+            self.servo(lambda extra=extra: (X + n * (stand + extra), R), "retreat", tol_m=0.006, tol_rad=0.06, timeout_s=20.0,
+                       check_scene=False, gain_per_s=float(g["servo_gain_per_s"]), sag_integral=False)
         self._evidence["retreated_to"] = [round(float(v), 4) for v in self.tcp()[0]]
         # An operation must not leave the arm where its own planner cannot start from (ma5r4's `stow` failed with -2 from
         # a state 5 mm inside the panel's box): the state is checked and, if it is not accepted, that is the result
