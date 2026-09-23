@@ -40,6 +40,8 @@ from openral_rskill.base import rSkillBase
 #: fingers come from above and the camera must look from there -- the branch with the camera under the tool axis makes
 #: every view and every grasp differ by half a turn of the wrist (research repo F57).
 READY = (0.0, -1.0, 0.0, -1.4, 0.0, 1.2, math.pi)
+#: The folded travel posture, as rskill-procedural-stow commands it (its manifest's `joint_targets`).
+STOW = (0.0, 0.40, 0.0, -0.70, 0.0, -1.27, math.pi)
 #: RM-75 joint limits, joint1..joint7 (docs/lunar_bot_rm75_spec.md in the research repo)
 JOINT_LIMITS_RAD = (3.107, 2.269, 3.107, 2.356, 3.107, 2.234, 6.283)
 #: how far a seeded IK solution may sit from the seed before it is another arm configuration rather than a nearby one

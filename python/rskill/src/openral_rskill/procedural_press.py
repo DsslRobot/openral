@@ -14,7 +14,7 @@ motion is the shared servo.
                along the plate's normal past the button's tip by the declared travel, the reference advancing at a
                set speed, and stops where the button takes the load or the travel is made. Whether the tool was on the
                button is recorded (how far off its axis the tool was) beside how far past its tip it went.
-4. retreat  -- straight back out to the stand-off, jaws open again.
+4. retreat  -- straight back out to the stand-off, jaws open again, and the arm folds to its travel posture.
 
 Failures return the stage reached and its evidence. Nothing here chooses another target or moves the base.
 """
@@ -26,7 +26,8 @@ import math
 import cv2
 import numpy as np
 
-from openral_rskill._eye_in_hand import (BASE_FRAME_ID, JAW_EMPTY_MAX_RAD, READY, TCP_FRAME_ID, EyeInHandSkill, StageFailure)
+from openral_rskill._eye_in_hand import (BASE_FRAME_ID, JAW_EMPTY_MAX_RAD, READY, STOW, TCP_FRAME_ID, EyeInHandSkill,
+                                         StageFailure)
 from openral_rskill.grasp_perception import locate_point, upright
 from openral_rskill.interface_fit import locate_disc
 from openral_rskill.procedural_pick import tool_in_view, tool_rotation
@@ -232,7 +233,8 @@ class PressRskill(EyeInHandSkill):
                                local_retry=False)
         # ...and must not leave it out at the stand-off either: the rover drives next, and the next job's planner starts
         # wherever the arm was left. chain_l2a_bess_r2 pressed the HVAC shutter button, drove to the BMS panel with the
-        # arm still out at the button, and every view there was "no collision-free path" from that posture (3/3). The
-        # ready posture is where every view's inverse kinematics is seeded from.
-        self.plan_to(list(READY), "retreat")
+        # arm still out at the button, and every view there was "no collision-free path" (planner -2) from that posture,
+        # 3/3; chain_l2a_pdu, with the arm left at the ready posture, the same at PDU-1's panel, 3/3. Every press that
+        # found its view started folded: the arm goes back to the travel posture.
+        self.plan_to(list(STOW), "retreat")
         self._evidence["outcome"] = "pressed"
