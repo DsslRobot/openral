@@ -155,8 +155,17 @@ def _explained(depth, K, up, B, p) -> float:
 def _seeds(depth, K, up, d: dict, self_depth_m: float, near_m: float, hint: np.ndarray | None):
     """Where to start: each connected lump of surface beyond the gripper's own reach in its camera, its topmost
     band along the support normal (the head bar's top face), and the slot centre a declared distance below that.
-    Nearest to `hint` first when one is given."""
-    m = (np.isfinite(depth) & (depth > self_depth_m) & (depth < near_m)).astype(np.uint8)
+    Nearest to `hint` first when one is given.
+    A lump ends where the depth jumps: an item in an equipment bay has the cabinet wall a few decimetres behind it,
+    inside `near_m`, and one lump spanning item and wall put the seed at the top of the wall (chain_l4_far: the ORU in
+    PDU-1's bay, "nothing beyond the gripper" twice). The parts of one handle join within a few centimetres."""
+    valid = np.isfinite(depth) & (depth > self_depth_m) & (depth < near_m)
+    zz = np.where(valid, depth, 100.0)
+    edge = np.zeros_like(valid)
+    edge[:, 1:] |= np.abs(np.diff(zz, axis=1)) > 0.05
+    edge[1:, :] |= np.abs(np.diff(zz, axis=0)) > 0.05
+    edge = cv2.dilate(edge.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    m = (valid & ~edge).astype(np.uint8)
     n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     h, w = depth.shape
     v, u = np.mgrid[0:h, 0:w]
