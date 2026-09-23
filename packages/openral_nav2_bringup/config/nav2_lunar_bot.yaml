@@ -321,38 +321,17 @@ global_costmap:
       # disagree about what the robot is; nothing changes either at runtime.
       footprint: "[[0.35, 0.25], [-0.35, 0.25], [-0.35, -0.25], [0.35, -0.25]]"
       resolution: 0.05
-      # ``track_unknown_space: false`` is REQUIRED
-      # for SLAM-from-scratch deployments. With ``true`` (Nav2 default
-      # for pre-mapped envs), every un-scanned cell in the rolling
-      # window is treated as an obstacle, and the planner refuses to
-      # route through ANY un-scanned region: ``GridBased plugin failed
-      # to plan ... Failed to create plan with tolerance of: 0.5m``.
-      # With ``false``, unknown cells are FREE; the planner happily
-      # threads short paths through unmapped space, and the
-      # obstacle_layer fills in real obstacles as the lidar sees them.
+      # LunarBot localizes with AMCL against the base's surveyed map (served on /map by nav2_map_server, research repo
+      # F50), so the global costmap is that map: fixed, the size of the survey, with the static structures in it, and
+      # live lidar obstacles and inflation on top. The shared SLAM-from-scratch setup this file started from kept a
+      # rolling window with no static layer, which let the planner know only what the lidar had seen in the last few
+      # metres and put any goal beyond the window "off the global costmap" (60 m could not reach the battery unit from
+      # the ISRU yard, research repo F109).
       track_unknown_space: false
-      # Rolling window keyed to the robot so SLAM-from-scratch
-      # deployments can plan short relative-pose goals (1m back, 90°
-      # turn) regardless of where the robot is in the world. Without
-      # this, the costmap is anchored to whatever region the
-      # static_layer (= slam_toolbox `/map`) currently covers — at
-      # boot that's a tiny 5×5m around the SLAM origin, so any goal
-      # more than ~2.5m from origin aborts with "Goal Coordinates ...
-      # was outside bounds". 20m on each side gives the planner enough
-      # room for kitchen-scale navigation while staying cheap to
-      # compute (16 MB at 0.05m/cell).
-      rolling_window: true
-      width: 20
+      rolling_window: false
+      width: 20   # unused: a static layer sizes a non-rolling costmap to its map
       height: 20
-      # Drop ``static_layer`` from the rolling-window plugin chain.
-      # static_layer paints the slam_toolbox ``/map`` into the
-      # costmap; for SLAM-from-scratch (no pre-built map) the layer
-      # contributes nothing useful and risks blocking goals when the
-      # rolling window drifts outside the small mapped region.
-      # ``obstacle_layer`` (raw /scan) + ``inflation_layer`` are
-      # sufficient for short relative moves — the global costmap then
-      # behaves like a larger local costmap.
-      plugins: ["obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True

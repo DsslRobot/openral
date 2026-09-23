@@ -439,9 +439,7 @@ nav2_goal_checker_stateful: false
 nav2_max_linear_accel_m_s2: 0.3
 nav2_max_linear_decel_m_s2: 0.25
 nav2_max_angular_accel_rad_s2: 0.4
-# The lunar base's mission sites lie up to ~15 m from the dock (depot stand at y = -14.4);
-# the shared 20 m rolling window put them off the global costmap (F50).
-nav2_global_costmap_size_m: 60.0
+# No nav2_global_costmap_size_m: the global costmap is the surveyed base map itself (nav2_lunar_bot.yaml, F109).
 # Worksite-level Nav2 tuning (terrain relief, later MPPI critic weights for a slow rover) lives in
 # LunarBot's own base file, not in the shared panda_mobile one; the overrides above still apply.
 nav2_params_file: "nav2_lunar_bot.yaml"
