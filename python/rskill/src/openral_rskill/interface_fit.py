@@ -100,7 +100,12 @@ def _fit(rays, zm, up, B, p, iters=10, eps=3e-4):
             zk = _predict(rays[hit], R, q, B)
             J[:, k] = np.where(np.isfinite(zk), (zk - z0[hit]) / eps, 0.0)
         w = np.minimum(1.0, 0.004 / np.maximum(np.abs(r), 1e-6))
-        p[:3] += np.linalg.solve(J.T @ (J * w[:, None]) + 1e-6 * np.eye(3), J.T @ (w * r))
+        # Levenberg-Marquardt: along the head bar the depth hardly changes, the normal matrix is nearly singular there,
+        # and an undamped step turned noise into metres (chain_b_bess_f: a seed on the battery module's neck fitted
+        # 0.9 m off to the side, "nothing beyond the gripper"); damped relative to its own scale and at most 2 cm a step
+        A = J.T @ (J * w[:, None])
+        step = np.linalg.solve(A + 1e-3 * np.trace(A) * np.eye(3), J.T @ (w * r))
+        p[:3] += step * min(1.0, 0.02 / max(float(np.linalg.norm(step)), 1e-9))
     return p
 
 
