@@ -250,5 +250,11 @@ class PressRskill(EyeInHandSkill):
         # arm still out at the button, and every view there was "no collision-free path" (planner -2) from that posture,
         # 3/3; chain_l2a_pdu, with the arm left at the ready posture, the same at PDU-1's panel, 3/3. Every press that
         # found its view started folded: the arm goes back to the travel posture.
-        self.plan_to(list(STOW), "retreat")
-        self._evidence["outcome"] = "pressed"
+        # The press is done once the tool is back out; folding is tidying up. A fold the planner could not find must
+        # not turn a press into a failure: the caller's retry would press again, and a shutter's button toggles
+        # (chain_l2a_pdu_f2: pressed, fold -2, pressed again, shutter closed again). What was not done is reported.
+        try:
+            self.plan_to(list(STOW), "retreat")
+            self._evidence["outcome"] = "pressed"
+        except StageFailure as exc:
+            self._evidence["outcome"] = f"pressed; the arm was not folded: {exc.why}"
