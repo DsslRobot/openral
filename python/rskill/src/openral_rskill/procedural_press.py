@@ -35,6 +35,12 @@ from openral_rskill.procedural_pick import tool_in_view, tool_rotation
 __all__ = ["PressRskill"]
 
 
+#: How long the vision-language model may take to answer one view. On the paratera DeepSeek-V4.1-Flash gateway, six
+#: runs at once, a pick's region choice answered in 10-115 s (median 61 s, research repo F112) and 10 of 41 requests
+#: were cut by the former 120 s; the model reasons before it answers.
+VLM_TIMEOUT_S = 300.0
+
+
 def facing(n: np.ndarray) -> np.ndarray:
     """Tool +Z into the surface whose outward horizontal normal is `n`, jaw axis vertical (the press orientation)."""
     z = np.array([-n[0], -n[1], 0.0])
@@ -52,8 +58,8 @@ class PressRskill(EyeInHandSkill):
 
         import httpx
 
-        http = httpx.Client(limits=httpx.Limits(max_connections=4, keepalive_expiry=30.0), timeout=120.0)
-        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=120,
+        http = httpx.Client(limits=httpx.Limits(max_connections=4, keepalive_expiry=30.0), timeout=VLM_TIMEOUT_S)
+        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=VLM_TIMEOUT_S,
                           max_retries=0, http_client=http)
         self._evidence.update(target=g["target"])
         if not g.get("interface"):

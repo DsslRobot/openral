@@ -59,6 +59,12 @@ def tool_rotation(pitch_deg: float, yaw_deg: float, roll_deg: float = 0.0) -> np
     return np.stack([x, np.cross(z, x), z], axis=1)
 
 
+#: How long the vision-language model may take to answer one view. On the paratera DeepSeek-V4.1-Flash gateway, six
+#: runs at once, a pick's region choice answered in 10-115 s (median 61 s, research repo F112) and 10 of 41 requests
+#: were cut by the former 120 s; the model reasons before it answers.
+VLM_TIMEOUT_S = 300.0
+
+
 class PickRskill(EyeInHandSkill):
     def procedure(self) -> None:
         g = self.goal
@@ -67,8 +73,8 @@ class PickRskill(EyeInHandSkill):
         # No hidden retries: the model answers within the deadline or the stage returns with what it has (F58).
         import httpx
 
-        http = httpx.Client(limits=httpx.Limits(max_connections=8, keepalive_expiry=30.0), timeout=120.0)
-        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=120,
+        http = httpx.Client(limits=httpx.Limits(max_connections=8, keepalive_expiry=30.0), timeout=VLM_TIMEOUT_S)
+        self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=g["vlm_endpoint"], timeout=VLM_TIMEOUT_S,
                           max_retries=0, http_client=http)
         self.geom = GripperGeometry()
         self.dims = (g.get("held_item") or {}).get("interface")
