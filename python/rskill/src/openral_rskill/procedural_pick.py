@@ -195,13 +195,18 @@ class PickRskill(EyeInHandSkill):
         np.save(self._gripper_mask_path, self._tool_view["mask"])
         self._self_depth = float(self._tool_view["self_depth_m"])
         record["view"] = {"tool": [round(float(v), 3) for v in tool], "pitch_deg": tried[-1]["pitch_deg"],
-                          "image": self.save("view.jpg", upright(f.bgr, f.up_cam))}
+                          "image": self.save("view.jpg", upright(f.bgr, f.up_cam)),
+                          "K": np.round(f.K, 3).tolist(), "T_base_cam": np.round(f.T_base_cam, 4).tolist()}
         record["tool_in_view"] = {k: v for k, v in self._tool_view.items() if k != "mask"} | {"mask": self._gripper_mask_path}
         np.save(self.evidence_dir / "view_depth.npy", f.depth)
 
-        # which lump of the picture is the item: the model's job, at the granularity it is good at
+        # which lump of the picture is the item: the model says whether it is in view and which surface is its body;
+        # where to start fitting is the work the caller declared (the support's point at the interface's height),
+        # which the view was aimed at. The body the model can point at is often only a corner the gripper leaves
+        # uncovered -- in an equipment bay, a separate lump from the handle -- and seeding at it fitted the corner
+        # (chain_l3_pdu_r3, chain_l4_far: the ORU in a PDU bay; chain_l2b_pdu: the crate on a PDU shelf).
         regions = find_regions(f.depth, f.K, self.geom)
-        hint = None
+        hint = f.T_base_cam[:3, :3].T @ (at - f.T_base_cam[:3, 3])
         if regions:
             marked = render_regions(f.bgr, regions, f.up_cam)
             record["marked"] = self.save("regions.jpg", marked)
@@ -210,7 +215,6 @@ class PickRskill(EyeInHandSkill):
             if a["choice"] is None:
                 raise StageFailure("select", f"none of the {len(regions)} surfaces in view is the described item: "
                                              f"\"{a['what_is_visible']}\"")
-            hint = np.array(next(r.p_cam for r in regions if r.id == a["choice"]), float)
 
         # where the interface is: the declared shape, facing the declared way, fitted to the depth near that lump
         R_g = self.grasp_rotations()[0]
@@ -223,7 +227,7 @@ class PickRskill(EyeInHandSkill):
             raise StageFailure("find", "nothing beyond the gripper in the view to fit the declared interface to")
         if fit.agreement < 0.5:
             # more of the interface disagrees with the picture than agrees: what was found is not it
-            raise StageFailure("find", f"the declared interface was fitted where the model pointed, but only "
+            raise StageFailure("find", f"the declared interface was fitted at the declared work, but only "
                                        f"{fit.agreement:.0%} of its surface agrees with the depth image (mean residual "
                                        f"{fit.residual_m * 1000:.1f} mm over {fit.points} pixels): this is not that interface")
         self._locked_frame, self._contact_views = f, [f]
