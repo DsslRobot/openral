@@ -230,4 +230,9 @@ class PressRskill(EyeInHandSkill):
             raise StageFailure("retreat", "the arm is back at the stand-off but the planning scene still holds its state inside "
                                           "the panel's collision volume: it has to move further out before anything can be planned",
                                local_retry=False)
+        # ...and must not leave it out at the stand-off either: the rover drives next, and the next job's planner starts
+        # wherever the arm was left. chain_l2a_bess_r2 pressed the HVAC shutter button, drove to the BMS panel with the
+        # arm still out at the button, and every view there was "no collision-free path" from that posture (3/3). The
+        # ready posture is where every view's inverse kinematics is seeded from.
+        self.plan_to(list(READY), "retreat")
         self._evidence["outcome"] = "pressed"
