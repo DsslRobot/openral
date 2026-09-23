@@ -234,9 +234,12 @@ class PlaceRskill(EyeInHandSkill):
                                     "gripper_mask": self._gripper_mask_path, "self_depth_m": self._tool_view["self_depth_m"]}
         if jaw < JAW_OPEN_MIN_RAD:
             raise StageFailure("settle", f"the jaws are not open (jaw {jaw:.3f} rad)")
-        if not flow["still"]:
+        if flow["still"] is False:
             raise StageFailure("settle", f"the item is still moving after release (image motion {flow['median_flow_px']} px)")
-        self._evidence["outcome"] = "placed"
+        # Unjudged is not moving: after the retreat up the camera looks level over the item, and a stand in the open
+        # leaves nothing within range (chain_l3_isru_r2: the filter stood still on the ISRU stand, the frame was sky).
+        # The place reports what it could not see; whoever needs the item's state checks it.
+        self._evidence["outcome"] = "placed" if flow["still"] else "placed; settling not judged: nothing in view"
 
 
 def scene_still(a, b, self_depth_m: float, tool_mask: np.ndarray, moved_mm: float = 3.0) -> dict:
@@ -249,7 +252,7 @@ def scene_still(a, b, self_depth_m: float, tool_mask: np.ndarray, moved_mm: floa
     near = np.isfinite(z) & (z > self_depth_m) & (z < 1.0) & ~tool_mask
     if near.sum() < 200:
         # nothing measurable where the item was let go: that is not evidence that it stayed, and the caller is told so
-        return {"still": False, "median_flow_px": None, "near_pixels": int(near.sum()), "why": "nothing in view to judge"}
+        return {"still": None, "median_flow_px": None, "near_pixels": int(near.sum()), "why": "nothing in view to judge"}
     med = float(np.median(np.linalg.norm(flow[near], axis=1)))
     limit = a.K[0, 0] * (moved_mm / 1000.0) / float(np.median(z[near]))
     return {"still": bool(med < limit), "median_flow_px": round(med, 2), "limit_px": round(float(limit), 2),
