@@ -13,7 +13,7 @@ Stages:
 3. release -- open the jaws.
 4. retreat -- withdraw under the interface's release constraint, then up, clear of the item.
 5. settle  -- two wrist images a moment apart after the retreat: the item stays where it was set (no image motion on
-              the near foreground), and it is no longer in the jaws (jaw open).
+              the near foreground), and it is no longer in the jaws (jaw open, nothing between the fingers).
 
 Failures return the stage and evidence; nothing here chooses another support.
 """
@@ -28,7 +28,7 @@ import numpy as np
 from openral_rskill._eye_in_hand import JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure, joints_off_their_stops
 from openral_rskill.grasp_perception import GripperGeometry
 from openral_rskill.interface_fit import fit_wall
-from openral_rskill.procedural_pick import tool_in_view
+from openral_rskill.procedural_pick import IN_JAWS_MIN_POINTS, in_jaws, tool_in_view
 
 __all__ = ["PlaceRskill"]
 
@@ -232,10 +232,22 @@ class PlaceRskill(EyeInHandSkill):
                                     "before": self.save("settle_a.png", a.bgr), "after": self.save("settle_b.png", b.bgr),
                                     "before_depth": str(self.evidence_dir / "settle_a_depth.npy"),
                                     "gripper_mask": self._gripper_mask_path, "self_depth_m": self._tool_view["self_depth_m"]}
+        self._evidence["settle"]["K"] = np.round(a.K, 3).tolist()
+        self._evidence["settle"]["T_base_cam"] = np.round(a.T_base_cam, 4).tolist()
         if jaw < JAW_OPEN_MIN_RAD:
             raise StageFailure("settle", f"the jaws are not open (jaw {jaw:.3f} rad)")
         if flow["still"] is False:
             raise StageFailure("settle", f"the item is still moving after release (image motion {flow['median_flow_px']} px)")
+        # The item stays behind when the tool leaves. Onto a support something already stood on, the handle's head
+        # caught on the open fingers: the retreat lifted the item 0.24 m with it, the settle view saw it hanging still
+        # between the fingers, and the place reported success (research repo F115, check1/look_habitat_occupied).
+        # The pick's hold check asks the opposite (did the item rise with the tool); an emptied gripper has nothing
+        # between its fingers (none in the eight placed items recorded before).
+        inside = in_jaws(a, self.T("tcp_frame", a.frame_id))
+        self._evidence["settle"]["points_between_fingers"] = inside
+        if inside >= IN_JAWS_MIN_POINTS:
+            raise StageFailure("settle", f"the item came away with the tool: {inside} measured points are still between the "
+                                         f"open fingers after the retreat", local_retry=False)
         # Unjudged is not moving: after the retreat up the camera looks level over the item, and a stand in the open
         # leaves nothing within range (chain_l3_isru_r2: the filter stood still on the ISRU stand, the frame was sky).
         # The place reports what it could not see; whoever needs the item's state checks it.

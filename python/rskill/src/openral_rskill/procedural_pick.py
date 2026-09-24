@@ -600,6 +600,23 @@ def tool_in_view(K: np.ndarray, T_ct: np.ndarray, rows: int, cols: int, margin_m
     return {"self_depth_m": round(self_depth, 3), "tool_top_row": top, "mask": mask.astype(bool)}
 
 
+#: the space between the fingers, in the tool frame (rows x, y, z; metres): inside the finger pads, the fingers' own
+#: breadth, fingertips to palm -- where a grasped part sits (TOOL_POINTS has the fingers at x = +-0.045)
+GRIP_SPACE = np.array([[-0.03, 0.03], [-0.03, 0.03], [-0.04, 0.02]])
+#: fewer points than this between the fingers is speckle, not a part (the same floor `moved_with_gripper` keeps)
+IN_JAWS_MIN_POINTS = 200
+
+
+def in_jaws(frame: Frame, T_tc: np.ndarray) -> int:
+    """How many of the frame's measured points lie between the fingers (`T_tc`: the camera in the tool frame). An open
+    gripper that has let go of its part sees none there; a part still in or on the fingers fills it."""
+    v, u = np.nonzero(np.isfinite(frame.depth) & (frame.depth > 0))
+    z = frame.depth[v, u].astype(float)
+    K = frame.K
+    p = np.stack([(u - K[0, 2]) / K[0, 0] * z, (v - K[1, 2]) / K[1, 1] * z, z], 1) @ T_tc[:3, :3].T + T_tc[:3, 3]
+    return int(np.all((p >= GRIP_SPACE[:, 0]) & (p <= GRIP_SPACE[:, 1]), axis=1).sum())
+
+
 def moved_with_gripper(before: Frame, after: Frame, tool_mask: np.ndarray, self_depth_m: float,
                        beyond_m: float = 0.12) -> dict:
     """Did the item in the gripper rise with it? Dense optical flow between the wrist images before and after the
