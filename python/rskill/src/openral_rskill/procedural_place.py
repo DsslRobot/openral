@@ -243,8 +243,10 @@ class PlaceRskill(EyeInHandSkill):
         # between the fingers, and the place reported success (research repo F115, check1/look_habitat_occupied).
         # The pick's hold check asks the opposite (did the item rise with the tool); an emptied gripper has nothing
         # between its fingers (none in the eight placed items recorded before).
-        inside = in_jaws(a, self.T("tcp_frame", a.frame_id))
-        self._evidence["settle"]["points_between_fingers"] = inside
+        T_tc = self.T("tcp_frame", a.frame_id)
+        inside = in_jaws(a, T_tc)
+        # the camera in the tool frame rides along, so a verifier can recount from the recorded depth itself
+        self._evidence["settle"].update(points_between_fingers=inside, T_tool_cam=np.round(T_tc, 4).tolist())
         if inside >= IN_JAWS_MIN_POINTS:
             raise StageFailure("settle", f"the item came away with the tool: {inside} measured points are still between the "
                                          f"open fingers after the retreat", local_retry=False)
