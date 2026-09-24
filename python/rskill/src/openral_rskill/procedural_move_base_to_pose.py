@@ -66,7 +66,7 @@ class MoveBaseToPoseRskill(rSkillBase):
         max_linear_speed_m_s: default 0.15.  max_angular_speed_rad_s: default 0.3.
         decel_m_s2: stopping deceleration the speed profile assumes, default 0.2.
         approach_m: how far in front of the goal (along its own +X axis) the corridor entry sits,
-            default 1.5.
+            default 1.2.
         corridor_m: half-width of that corridor, default 0.35.
         settle_s: seconds the base must stay inside tolerance before finishing, default 0.5.
         timeout_s: default 60.  stall_timeout_s: default 8.
@@ -229,7 +229,7 @@ class MoveBaseToPoseRskill(rSkillBase):
         #
         # The approach corridor is kept: entering along the goal's own axis is what keeps the vehicle
         # clear of whatever the work pose serves, and it is the caller's declared free space.
-        approach_m = float(g.get("approach_m", 1.5))
+        approach_m = float(g.get("approach_m", 1.2))
         corridor_m = float(g.get("corridor_m", 0.35))
         d = (math.cos(float(g["yaw"])), math.sin(float(g["yaw"])))
         rel_x, rel_y = x - tx, y - ty
