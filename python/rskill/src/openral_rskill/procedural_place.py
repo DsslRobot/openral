@@ -32,6 +32,9 @@ from openral_rskill.procedural_pick import IN_JAWS_MIN_POINTS, in_jaws, tool_in_
 
 __all__ = ["PlaceRskill"]
 
+#: the withdrawal out of the released handle is solved as a straight line, one inverse-kinematics solution this far apart
+WITHDRAW_STEP_M = 0.03
+
 
 class PlaceRskill(EyeInHandSkill):
     def procedure(self) -> None:
@@ -90,6 +93,33 @@ class PlaceRskill(EyeInHandSkill):
                                       "deg short of its goal, and no joint is at its stop to explain why")
         entry["freed_joints"] = freed
         self.plan_to(np.array(q), stage)
+
+    def _withdraw_straight(self, p: np.ndarray, R: np.ndarray, back: np.ndarray, stage: str) -> None:
+        """The stroke out of the released handle, as a straight line the arm is solved along before it moves. The open
+        fingers are still round the handle's neck, and the local servo that took this stroke wandered off the line when
+        a joint met its stop: the tool left the line by 0.10 m sideways and 0.07 m up, the fingers took the container
+        with them to the stand's edge, and it fell when the rover left (research repo F138; every recorded place's first
+        retreat leg had stalled the same way). One inverse-kinematics solution every `WITHDRAW_STEP_M` along the line,
+        each seeded by the last (this arm's own configuration, no branch jump), followed in joint space; no solution on
+        the line is a failure that says so, the fingers left where they are."""
+        seg = back - p
+        length = float(np.linalg.norm(seg))
+        n = max(1, int(math.ceil(length / WITHDRAW_STEP_M)))
+        q, path = list(self.arm_q()), []
+        for k in range(1, n + 1):
+            q = self.ik(p + seg * (k / n), R, q)
+            if q is None:
+                self._evidence.setdefault("retreat_legs", []).append(
+                    {"target": back.tolist(), "straight": {"solved_m": round(length * (k - 1) / n, 3), "of_m": round(length, 3)}})
+                raise StageFailure(stage, f"the open fingers cannot withdraw straight out of the released handle: no arm "
+                                          f"configuration {length * k / n * 100:.0f} cm along the {length * 100:.0f} cm line "
+                                          f"({self._evidence.get('last_ik')})", local_retry=False)
+            path.append(q)
+        t0 = self._clock()
+        for q in path:
+            self.move_joints(q, stage, tol_rad=0.03, rate_rad_s=0.4, timeout_s=15.0)
+        self._evidence.setdefault("retreat_legs", []).append(
+            {"target": back.tolist(), "straight": {"waypoints": n, "sim_s": round(self._clock() - t0, 1)}})
 
     def _retreat_leg(self, target: np.ndarray, R: np.ndarray, stage: str, check_scene: bool) -> None:
         self._move_or_free_a_joint(lambda: (target, R), stage, "retreat_legs", extra={"target": target.tolist()},
@@ -214,9 +244,10 @@ class PlaceRskill(EyeInHandSkill):
         back = p + withdraw * float(g["retreat_m"])
         self._evidence["retreat"] = {"release_constraint": g["release_constraint"], "from": p.tolist(),
                                     "withdraw_to": back.tolist()}
-        # The open jaws start around the part they just released, which the live scene measures: the withdrawal stroke
-        # out of it is not tested against that measurement (the lift out of a grasp is not either); the stroke up is.
-        self._retreat_leg(back, R, "retreat", check_scene=False)
+        # The open jaws start around the part they just released: the withdrawal stroke out of it is a straight line the
+        # arm is solved along first (`_withdraw_straight`); the stroke up, clear of the item, is the local servo checked
+        # against the live scene.
+        self._withdraw_straight(p, R, back, "retreat")
         up = back + np.array([0.0, 0.0, float(g["retreat_up_m"])])
         self._retreat_leg(up, R, "retreat", check_scene=True)
 
