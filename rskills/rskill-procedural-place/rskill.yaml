@@ -26,6 +26,9 @@ actuators_required:
     control_mode_semantics:
       mode: "absolute"
       gripper_convention: "normalized_open_unit"
+  - kind: "body_twist"  # the base backs the held arm straight out of the released handle (the retreat stage)
+    control_mode_semantics:
+      mode: "absolute"
 
 chunk_size: 1
 

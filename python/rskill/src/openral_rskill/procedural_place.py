@@ -11,7 +11,8 @@ Stages:
               driven down (the support takes the load). The tool is driven to the low end of where the support should
               take the item, and reaching it without a stall is "no contact".
 3. release -- open the jaws.
-4. retreat -- withdraw under the interface's release constraint, then up, clear of the item.
+4. retreat -- the base backs the held arm straight out of the released handle (the interface's release constraint),
+              then the tool goes up, clear of the item.
 5. settle  -- two wrist images a moment apart after the retreat: the item stays where it was set (no image motion on
               the near foreground), and it is no longer in the jaws (jaw open, nothing between the fingers).
 
@@ -25,15 +26,15 @@ import math
 import cv2
 import numpy as np
 
-from openral_rskill._eye_in_hand import JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure, joints_off_their_stops
+from openral_rskill._eye_in_hand import BASE_FRAME_ID, JAW_OPEN_MIN_RAD, EyeInHandSkill, StageFailure, joints_off_their_stops
 from openral_rskill.grasp_perception import GripperGeometry
 from openral_rskill.interface_fit import fit_wall
 from openral_rskill.procedural_pick import IN_JAWS_MIN_POINTS, in_jaws, tool_in_view
 
 __all__ = ["PlaceRskill"]
 
-#: the withdrawal out of the released handle is solved as a straight line, one inverse-kinematics solution this far apart
-WITHDRAW_STEP_M = 0.03
+#: the base backs the held arm out of the released handle at this speed (m/s)
+WITHDRAW_SPEED_M_S = 0.05
 
 
 class PlaceRskill(EyeInHandSkill):
@@ -94,34 +95,36 @@ class PlaceRskill(EyeInHandSkill):
         entry["freed_joints"] = freed
         self.plan_to(np.array(q), stage)
 
-    def _withdraw_straight(self, p: np.ndarray, R: np.ndarray, back: np.ndarray, stage: str) -> None:
-        """The stroke out of the released handle, as a straight line the arm is solved along before it moves. The open
-        fingers are still round the handle's neck, and the local servo that took this stroke wandered off the line when
-        a joint met its stop: the tool left the line by 0.10 m sideways and 0.07 m up, the fingers took the container
-        with them to the stand's edge, and it fell when the rover left (research repo F138; every recorded place's first
-        retreat leg had stalled the same way). One inverse-kinematics solution every `WITHDRAW_STEP_M` along the line,
-        each seeded by the last (this arm's own configuration, no branch jump), followed in joint space; no solution on
-        the line is a failure that says so, the fingers left where they are. Solved against the joint limits alone: the
-        live scene has the handle the fingers are round measured as an obstacle, and with collisions avoided the
-        solution stopped 11 cm along the line, at the handle's head (resume43)."""
-        seg = back - p
-        length = float(np.linalg.norm(seg))
-        n = max(1, int(math.ceil(length / WITHDRAW_STEP_M)))
-        q, path = list(self.arm_q()), []
-        for k in range(1, n + 1):
-            q = self.ik(p + seg * (k / n), R, q, avoid_collisions=False)
-            if q is None:
-                self._evidence.setdefault("retreat_legs", []).append(
-                    {"target": back.tolist(), "straight": {"solved_m": round(length * (k - 1) / n, 3), "of_m": round(length, 3)}})
-                raise StageFailure(stage, f"the open fingers cannot withdraw straight out of the released handle: no arm "
-                                          f"configuration {length * k / n * 100:.0f} cm along the {length * 100:.0f} cm line "
-                                          f"({self._evidence.get('last_ik')})", local_retry=False)
-            path.append(q)
-        t0 = self._clock()
-        for q in path:
-            self.move_joints(q, stage, tol_rad=0.03, rate_rad_s=0.4, timeout_s=15.0)
+    def _withdraw_with_the_base(self, withdraw: np.ndarray, distance_m: float, stage: str) -> None:
+        """The stroke out of the released handle, driven by the base with the arm held: the open fingers are still round
+        the handle's neck, between its head and collar, and the stroke has to be a straight line. The arm cannot make
+        it one from where a place leaves it -- the elbow is at its stop, and the local servo that took this stroke
+        left the line by 0.10 m sideways and 0.07 m up and dragged the container to the stand's edge (research repo
+        F138); solved as a line for the arm it had no configuration 8-11 cm along. The vehicle is the straight-line
+        axis the fingers need: it backs along the withdrawal direction, measured on its own odometry, and the arm does
+        not move. Backing the rover straight off is exactly what freed the fingers in the run that found this."""
+        d = np.array([withdraw[0], withdraw[1], 0.0])
+        d /= np.linalg.norm(d)
+        self.hold_here()
+        T0 = self.T("odom", BASE_FRAME_ID)
+        axis = T0[:3, :3] @ d  # the withdrawal direction in odom, as it is at the start
+        t0, moved = self._clock(), 0.0
+        self.set_base_twist((WITHDRAW_SPEED_M_S * float(d[0]), WITHDRAW_SPEED_M_S * float(d[1])))
+        try:
+            while moved < distance_m:
+                self.wait(0.05)
+                moved = float((self.T("odom", BASE_FRAME_ID)[:3, 3] - T0[:3, 3]) @ axis)
+                if self._clock() - t0 > 3.0 * distance_m / WITHDRAW_SPEED_M_S + 5.0:
+                    raise StageFailure(stage, f"the base withdrew {moved * 100:.0f} cm of {distance_m * 100:.0f} along the release "
+                                              f"direction in {self._clock() - t0:.0f} s and stopped", local_retry=False)
+        finally:  # whatever ended the stroke, the base is told to stop before anything else happens
+            with self._cmd_lock:
+                self._base = (0.0, 0.0)
+            self.wait(0.5)
+            with self._cmd_lock:
+                self._base = None
         self._evidence.setdefault("retreat_legs", []).append(
-            {"target": back.tolist(), "straight": {"waypoints": n, "sim_s": round(self._clock() - t0, 1)}})
+            {"base_withdrew_m": round(moved, 3), "direction": [round(float(v), 3) for v in d], "sim_s": round(self._clock() - t0, 1)})
 
     def _retreat_leg(self, target: np.ndarray, R: np.ndarray, stage: str, check_scene: bool) -> None:
         self._move_or_free_a_joint(lambda: (target, R), stage, "retreat_legs", extra={"target": target.tolist()},
@@ -246,11 +249,11 @@ class PlaceRskill(EyeInHandSkill):
         back = p + withdraw * float(g["retreat_m"])
         self._evidence["retreat"] = {"release_constraint": g["release_constraint"], "from": p.tolist(),
                                     "withdraw_to": back.tolist()}
-        # The open jaws start around the part they just released: the withdrawal stroke out of it is a straight line the
-        # arm is solved along first (`_withdraw_straight`); the stroke up, clear of the item, is the local servo checked
-        # against the live scene.
-        self._withdraw_straight(p, R, back, "retreat")
-        up = back + np.array([0.0, 0.0, float(g["retreat_up_m"])])
+        # The open jaws start around the part they just released: the base backs the held arm straight out of it
+        # (`_withdraw_with_the_base`); the stroke up, clear of the item, is the tool's local servo checked against the
+        # live scene, from where the tool still is in the vehicle frame.
+        self._withdraw_with_the_base(withdraw, float(g["retreat_m"]), "retreat")
+        up = p + np.array([0.0, 0.0, float(g["retreat_up_m"])])
         self._retreat_leg(up, R, "retreat", check_scene=True)
 
         self.stage("settle")

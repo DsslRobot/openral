@@ -310,7 +310,7 @@ class EyeInHandSkill(rSkillBase):
         self._stop_requested.clear()
         self._evidence = {"stages": []}
         self._done, self._final_sent, self._q, self._twist = None, False, {}, None
-        self._jaw_open = None
+        self._jaw_open, self._base = None, None
         # the wrist camera belongs to the robot, not to one call: one subscriber per node, kept for its life. Creating
         # it per skill and destroying it on shutdown raced the executor -- a subscription destroyed while the executor
         # held it in its wait set killed the runner with InvalidHandle, and with it every later skill (F57).
@@ -342,6 +342,8 @@ class EyeInHandSkill(rSkillBase):
         with self._cmd_lock:
             self._stop_requested.set()
             self._joints, self._twist = tuple(self.arm_q()), None
+            if self._base is not None:  # a base under way stops where it is
+                self._base = (0.0, 0.0)
             actions = self._command_actions()
         self._evidence["stop"] = {"requested": True, "worker_stopped": False,
                                   "arm_hold_rad": list(self._joints),
@@ -396,8 +398,10 @@ class EyeInHandSkill(rSkillBase):
         return out
 
     def _command_actions(self) -> list[Action]:
-        joints, twist, jaw_open = self._joints, self._twist, self._jaw_open
+        joints, twist, jaw_open, base = self._joints, self._twist, self._jaw_open, self._base
         out = []
+        if base is not None:  # the base under the held arm: (vx, vy) in the vehicle frame, no turn
+            out.append(Action(control_mode=ControlMode.BODY_TWIST, horizon=1, body_twist=[(base[0], base[1], 0.0, 0.0, 0.0, 0.0)]))
         if jaw_open is not None:
             out.append(Action(control_mode=ControlMode.GRIPPER_BINARY, horizon=1, gripper=[1.0 if jaw_open else 0.0]))
         if joints is not None:  # planned paths and postures are commanded in joint space; the last target holds the arm
@@ -416,6 +420,12 @@ class EyeInHandSkill(rSkillBase):
     def hold_here(self) -> None:
         with self._cmd_lock:
             self._joints, self._twist = tuple(self.arm_q()), None
+
+    def set_base_twist(self, v: tuple[float, float] | None) -> None:
+        """Drive the base at (vx, vy) m/s in its own frame while the arm holds (None: no base command)."""
+        with self._cmd_lock:
+            self._check_stop()
+            self._base = v
 
     def wait_until_still(self, still_m: float = 0.0005, window_s: float = 0.3, timeout_s: float = 10.0) -> None:
         """Hold the arm where it is and wait until the tool stops moving, so that what a wrist camera sees moving
@@ -584,19 +594,17 @@ class EyeInHandSkill(rSkillBase):
         raise StageFailure(stage, f"arm stopped short of the posture: joint{worst + 1} {err[worst]:+.2f} rad off, tool at "
                                   f"{[round(float(v), 3) for v in tcp]} (blocked by contact or a joint limit)")
 
-    def ik(self, p: np.ndarray, R: np.ndarray, seed: list[float], planned: bool = False, avoid_collisions: bool = True) -> list[float] | None:
+    def ik(self, p: np.ndarray, R: np.ndarray, seed: list[float], planned: bool = False) -> list[float] | None:
         """Arm joints that put the TCP at (p, R) in chassis_base_link, nearest the seed (MoveIt IK on the robot's own
         model and planning scene); None when no collision-free configuration reaches it. With `planned` -- a move the
         planner makes, or a pose that is only being checked -- the seed is not the only place to start: the working-branch
         seeds are tried after it, and the first solution that is this arm's own configuration is taken. A servo step
         from where the arm is keeps the seed alone, because there a jump to another configuration is a hazard; the
         planner does not care how far the joints travel (mc3: a stand-off whose only solution was 1.41 rad from the view
-        pose, refused twice; gc2: a carry-in from an outstretched arm, refused, and the ORU slid out). `avoid_collisions`
-        off solves against the joint limits alone: for a stroke through what the live scene has measured as an obstacle
-        but is the part the fingers are round (the withdrawal out of a released handle)."""
+        pose, refused twice; gc2: a carry-in from an outstretched arm, refused, and the ORU slid out)."""
         ev = self._evidence
         if not planned:
-            q = self._ik_once(p, R, seed, avoid_collisions)
+            q = self._ik_once(p, R, seed)
             if q is None:
                 return None
             q = nearest_equivalent(q, seed)
@@ -622,7 +630,7 @@ class EyeInHandSkill(rSkillBase):
                 best = (key, q)
         return None if best is None else best[1]
 
-    def _ik_once(self, p: np.ndarray, R: np.ndarray, seed: list[float], avoid_collisions: bool = True) -> list[float] | None:
+    def _ik_once(self, p: np.ndarray, R: np.ndarray, seed: list[float]) -> list[float] | None:
         from moveit_msgs.srv import GetPositionIK
 
         if self._ik_client is None:
@@ -632,7 +640,7 @@ class EyeInHandSkill(rSkillBase):
                 raise StageFailure(self._evidence.get("stage", "?"), "the arm's inverse kinematics service is not available")
         req = GetPositionIK.Request()
         r = req.ik_request
-        r.group_name, r.ik_link_name, r.avoid_collisions = "rm_group", TCP_FRAME_ID, avoid_collisions
+        r.group_name, r.ik_link_name, r.avoid_collisions = "rm_group", TCP_FRAME_ID, True
         r.robot_state.joint_state.name = list(self._q)
         r.robot_state.joint_state.position = [float(self._q[j]) for j in self._q]
         for joint, value in zip(ARM_JOINT_NAMES, seed):
