@@ -101,13 +101,15 @@ class PlaceRskill(EyeInHandSkill):
         with them to the stand's edge, and it fell when the rover left (research repo F138; every recorded place's first
         retreat leg had stalled the same way). One inverse-kinematics solution every `WITHDRAW_STEP_M` along the line,
         each seeded by the last (this arm's own configuration, no branch jump), followed in joint space; no solution on
-        the line is a failure that says so, the fingers left where they are."""
+        the line is a failure that says so, the fingers left where they are. Solved against the joint limits alone: the
+        live scene has the handle the fingers are round measured as an obstacle, and with collisions avoided the
+        solution stopped 11 cm along the line, at the handle's head (resume43)."""
         seg = back - p
         length = float(np.linalg.norm(seg))
         n = max(1, int(math.ceil(length / WITHDRAW_STEP_M)))
         q, path = list(self.arm_q()), []
         for k in range(1, n + 1):
-            q = self.ik(p + seg * (k / n), R, q)
+            q = self.ik(p + seg * (k / n), R, q, avoid_collisions=False)
             if q is None:
                 self._evidence.setdefault("retreat_legs", []).append(
                     {"target": back.tolist(), "straight": {"solved_m": round(length * (k - 1) / n, 3), "of_m": round(length, 3)}})

@@ -584,17 +584,19 @@ class EyeInHandSkill(rSkillBase):
         raise StageFailure(stage, f"arm stopped short of the posture: joint{worst + 1} {err[worst]:+.2f} rad off, tool at "
                                   f"{[round(float(v), 3) for v in tcp]} (blocked by contact or a joint limit)")
 
-    def ik(self, p: np.ndarray, R: np.ndarray, seed: list[float], planned: bool = False) -> list[float] | None:
+    def ik(self, p: np.ndarray, R: np.ndarray, seed: list[float], planned: bool = False, avoid_collisions: bool = True) -> list[float] | None:
         """Arm joints that put the TCP at (p, R) in chassis_base_link, nearest the seed (MoveIt IK on the robot's own
         model and planning scene); None when no collision-free configuration reaches it. With `planned` -- a move the
         planner makes, or a pose that is only being checked -- the seed is not the only place to start: the working-branch
         seeds are tried after it, and the first solution that is this arm's own configuration is taken. A servo step
         from where the arm is keeps the seed alone, because there a jump to another configuration is a hazard; the
         planner does not care how far the joints travel (mc3: a stand-off whose only solution was 1.41 rad from the view
-        pose, refused twice; gc2: a carry-in from an outstretched arm, refused, and the ORU slid out)."""
+        pose, refused twice; gc2: a carry-in from an outstretched arm, refused, and the ORU slid out). `avoid_collisions`
+        off solves against the joint limits alone: for a stroke through what the live scene has measured as an obstacle
+        but is the part the fingers are round (the withdrawal out of a released handle)."""
         ev = self._evidence
         if not planned:
-            q = self._ik_once(p, R, seed)
+            q = self._ik_once(p, R, seed, avoid_collisions)
             if q is None:
                 return None
             q = nearest_equivalent(q, seed)
@@ -620,7 +622,7 @@ class EyeInHandSkill(rSkillBase):
                 best = (key, q)
         return None if best is None else best[1]
 
-    def _ik_once(self, p: np.ndarray, R: np.ndarray, seed: list[float]) -> list[float] | None:
+    def _ik_once(self, p: np.ndarray, R: np.ndarray, seed: list[float], avoid_collisions: bool = True) -> list[float] | None:
         from moveit_msgs.srv import GetPositionIK
 
         if self._ik_client is None:
@@ -630,7 +632,7 @@ class EyeInHandSkill(rSkillBase):
                 raise StageFailure(self._evidence.get("stage", "?"), "the arm's inverse kinematics service is not available")
         req = GetPositionIK.Request()
         r = req.ik_request
-        r.group_name, r.ik_link_name, r.avoid_collisions = "rm_group", TCP_FRAME_ID, True
+        r.group_name, r.ik_link_name, r.avoid_collisions = "rm_group", TCP_FRAME_ID, avoid_collisions
         r.robot_state.joint_state.name = list(self._q)
         r.robot_state.joint_state.position = [float(self._q[j]) for j in self._q]
         for joint, value in zip(ARM_JOINT_NAMES, seed):
