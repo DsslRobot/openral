@@ -12,7 +12,7 @@ Stages:
               take the item, and reaching it without a stall is "no contact".
 3. release -- open the jaws.
 4. retreat -- the base backs the held arm straight out of the released handle (the interface's release constraint),
-              then the tool goes up, clear of the item.
+              then the tool goes up, clear of the item; a lift that ends short is recorded, not a failed place.
 5. settle  -- two wrist images a moment apart after the retreat: the item stays where it was set (no image motion on
               the near foreground), and it is no longer in the jaws (jaw open, nothing between the fingers).
 
@@ -254,7 +254,14 @@ class PlaceRskill(EyeInHandSkill):
         # live scene, from where the tool still is in the vehicle frame.
         self._withdraw_with_the_base(withdraw, float(g["retreat_m"]), "retreat")
         up = p + np.array([0.0, 0.0, float(g["retreat_up_m"])])
-        self._retreat_leg(up, R, "retreat", check_scene=True)
+        # The lift is clearance, not part of putting the item down: the item is released and the fingers are already
+        # the full withdrawal away from it. A lift that ends short is recorded and the settle judges the place from
+        # where the tool is (resume43c: the container stood upright on the stand, the lift stalled 2.4 cm short with no
+        # joint at a stop, and the place reported a failure; research repo F138).
+        try:
+            self._retreat_leg(up, R, "retreat", check_scene=True)
+        except StageFailure as e:
+            self._evidence["retreat"]["lift_short"] = e.why
 
         self.stage("settle")
         self.wait_until_still()  # gb7r12: the frames were taken while the arm was still moving (0.1-0.5 rad/s), and the camera's own motion read as the item's
