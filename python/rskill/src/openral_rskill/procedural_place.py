@@ -35,8 +35,10 @@ __all__ = ["PlaceRskill"]
 
 #: the base backs the held arm out of the released handle at this speed (m/s)
 WITHDRAW_SPEED_M_S = 0.05
-#: turns of the tool about the vertical tried at each step off the support before the next step (put_it_down)
+#: turns of the tool about the vertical tried at each step off the support, past STEP_FIRST_M (put_it_down)
 OVER_TURNS_RAD = tuple(math.radians(a) for a in (0, 15, -15, 30, -30, 45, -45))
+#: how far off the support the item is stepped in the orientation it is carried in before any turn is tried (put_it_down)
+STEP_FIRST_M = 0.05
 
 
 class PlaceRskill(EyeInHandSkill):
@@ -166,12 +168,12 @@ class PlaceRskill(EyeInHandSkill):
         # approach stalled 5.5 cm out with no reason a caller could act on. Which way is *off* the surface is the
         # support's own outward normal, surveyed with it. Step along it until the robot's own collision check
         # passes, no further than half the item's depth -- past that the item is more off the surface than on it.
-        # At each step the tool may also turn about the vertical, the item with it, before the item is moved off the
-        # surface: the orientation the item is carried in is the one its pick happened to leave, and at a stand the arm
-        # works near the end of its reach -- one pick's wrist had no IK anywhere within 3.5 cm of the surveyed point and
-        # the place stepped 11.5 cm off it, set the container overhanging the front edge, and the withdrawal pulled it
-        # off the scored footprint (research repo F141, vf_north_corridor2). Which way round the item stands on a
-        # surface is nothing the place is asked to keep.
+        # Only when no step within STEP_FIRST_M passes may the tool also turn about the vertical, the item with it: at a
+        # stand the arm works near the end of its reach, and one pick's wrist had no IK anywhere within 3.5 cm of the
+        # surveyed point, so the place stepped 11.5 cm off it and set the container overhanging the front edge (research
+        # repo F141, vf_north_corridor2). Turning first is not free: the next pick of that item fits its interface
+        # facing the way the catalogue declares, and a container set down turned 13 deg agreed 37 % and could not be
+        # picked again (F142, exp1b ours_l2b_habitat_r2).
         off_by, turned = 0.0, 0.0
         if g.get("held_item"):
             n = T_bm[:3, :3] @ np.array(g.get("support_normal_map") or [0.0, 0.0, 0.0], float)
@@ -181,19 +183,20 @@ class PlaceRskill(EyeInHandSkill):
                 step = float(GripperGeometry().min_part_width_m)  # the smallest feature this perception resolves
                 limit = float(np.max(g["held_item"]["size_m"][:2])) / 2
                 tried = []
-                for k in range(int(limit / step) + 1):
+                n_first = int(round(STEP_FIRST_M / step))
+                order = [(k, 0.0) for k in range(n_first + 1)] + \
+                        [(k, t) for k in range(int(limit / step) + 1) for t in OVER_TURNS_RAD if t != 0.0 or k > n_first]
+                ok = False
+                for k, turn in order:
                     cand = over + n * (k * step)
-                    for turn in OVER_TURNS_RAD:
-                        c_, s_ = math.cos(turn), math.sin(turn)
-                        Rk = np.array([[c_, -s_, 0.0], [s_, c_, 0.0], [0.0, 0.0, 1.0]]) @ R0
-                        q = self.ik(cand, Rk, list(self.arm_q()))
-                        ok = q is not None and self.state_valid(np.asarray(q))
-                        tried.append({"off_support_m": round(k * step, 4), "turn_deg": round(math.degrees(turn)),
-                                      "reachable": q is not None, "clear": bool(ok)})
-                        if ok:
-                            over, off_by, turned, R0 = cand, k * step, turn, Rk
-                            break
+                    c_, s_ = math.cos(turn), math.sin(turn)
+                    Rk = np.array([[c_, -s_, 0.0], [s_, c_, 0.0], [0.0, 0.0, 1.0]]) @ R0
+                    q = self.ik(cand, Rk, list(self.arm_q()))
+                    ok = q is not None and self.state_valid(np.asarray(q))
+                    tried.append({"off_support_m": round(k * step, 4), "turn_deg": round(math.degrees(turn)),
+                                  "reachable": q is not None, "clear": bool(ok)})
                     if ok:
+                        over, off_by, turned, R0 = cand, k * step, turn, Rk
                         break
                 self._evidence["over_offset"] = {"outward_normal_rover": [round(float(v), 3) for v in n],
                                                  "limit_m": round(limit, 3), "chosen_m": round(off_by, 4),
